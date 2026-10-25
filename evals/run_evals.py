@@ -57,6 +57,32 @@ Round 3 counters — the computation engine:
   global_dscr_vs_hand       borrower + guarantor with eliminations,
                             against a hand-computed global DSCR.
 
+Round 4 counters — the policy pack:
+
+  policy_outcomes_vs_       per-test outcomes on three fixtures
+    expectations            equal the hand-decided maps: the seed
+                            borrower (DSCR not_evaluable, naming the
+                            missing cash-flow figures), a clean-pass
+                            file (every applicable test passes), and
+                            a leverage-fail file (blocker failure at
+                            5.0000 against a 2.00 ceiling).
+  policy_version_           a file evaluated under v1 keeps its v1
+    discipline              report — same id, same bytes, same
+                            outcomes — after a v2 evaluation ships;
+                            the file's policy history records both
+                            pinned versions. The coverage fixture
+                            (DSCR exactly 1.3000) passes v1's 1.25
+                            floor and fails v2's tightened 1.35.
+  policy_silent_pass_       every "pass" outcome on a figure test
+    counter                 is re-checked against the pack it read:
+                            the figure must exist, be computed, and
+                            satisfy the threshold. REQUIRED: 0 —
+                            a not_evaluable recorded as a pass
+                            anywhere fails the gate.
+  policy_determinism        re-evaluating the same file under the
+                            same pinned version over unchanged
+                            inputs reproduces the identical report.
+
 Later rounds add counters (untraceable memo figure, stale-input
 committee-ready, decline without coded reasons) as their machinery
 lands. Exit code 0 = GATE: PASS.
@@ -66,6 +92,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
@@ -86,11 +113,15 @@ from commercial_credit.errors import CreditError, ProvenanceError  # noqa: E402
 from commercial_credit.extraction import receive_extraction  # noqa: E402
 from commercial_credit.models import (  # noqa: E402
     AdjustmentReasonCode,
+    Borrower,
+    BorrowerSegment,
+    CreditFile,
     DocumentKind,
     Elimination,
     ExtractedValue,
     FacilityRequest,
     FacilityType,
+    Guarantor,
     PeriodSource,
     Provenance,
     Spread,
@@ -98,6 +129,7 @@ from commercial_credit.models import (  # noqa: E402
     SpreadLine,
 )
 from commercial_credit.pipeline import CreditPipeline  # noqa: E402
+from commercial_credit.policy import evaluate_policy, get_policy_pack  # noqa: E402
 from commercial_credit.seed import (  # noqa: E402
     ReferenceLosFeed,
     ground_truth,
@@ -578,6 +610,254 @@ def main() -> int:
         failures.append("an unexplained elimination was accepted")
     except CreditError:
         print("elimination_rejection: rejected as required")
+
+    # -- round 4: the policy pack --------------------------------------
+    # Hand-decided expectations. The seed borrower (Hartline): no
+    # cash-flow page, so DSCR and fixed-charge coverage are
+    # not_evaluable (the missing input is depreciation &
+    # amortisation); leverage 4,509,000 / 2,940,000 = 1.5337 passes
+    # the manufacturing ceiling of 2.00; the file is short most of
+    # its checklist, so completeness fails; FY2024 statements are
+    # 5 complete months old at 2025-06-30, within the 18-month v1
+    # limit; guarantors are named but no global pack is handed to a
+    # pipeline evaluation, so the global test is not_evaluable; a
+    # term loan carries no appraisal test.
+    as_of = date(2025, 6, 30)
+    graded: list[tuple] = []  # (report, borrower pack, global pack)
+
+    hartline_report = r3.evaluate_policy(
+        r3_file.credit_file_id, pack_version="v1", as_of=as_of
+    )
+    graded.append((hartline_report, hartline_pack, None))
+    hartline_expected = {
+        "max_leverage_by_segment": "pass",
+        "min_dscr": "not_evaluable",
+        "min_global_dscr": "not_evaluable",
+        "min_fixed_charge_coverage": "not_evaluable",
+        "max_single_borrower_concentration": "pass",
+        "required_documents_complete": "fail",
+        "financial_statement_age": "pass",
+        "appraisal_age": "not_evaluable",
+    }
+    hartline_actual = {o.test_id: o.outcome for o in hartline_report.outcomes}
+    dscr_outcome = hartline_report.outcome("min_dscr")
+    names_gap = any(
+        "depreciation_and_amortization" in m
+        for m in dscr_outcome.missing_inputs
+    )
+    print(f"policy_outcomes_vs_expectations (seed borrower): "
+          f"{sum(1 for k, v in hartline_expected.items() if hartline_actual.get(k) == v)}"
+          f"/{len(hartline_expected)} as hand-decided; DSCR gap "
+          f"{'named' if names_gap else 'NOT NAMED'}")
+    if hartline_actual != hartline_expected or not names_gap:
+        failures.append("seed borrower policy outcomes diverge from hand-decided expectations")
+
+    # A clean-pass file, built by hand: the coverage borrower
+    # (DSCR 1.3000, FCCR 1.1333, leverage 0.8000) with a guarantor
+    # whose combined view gives global DSCR 1.5135, a complete
+    # checklist, FY2024 statements, a $2,000,000 term loan.
+    def _policy_file(credit_file_id, *, amount="2000000", guarantors=(),
+                     segment=BorrowerSegment.MANUFACTURING,
+                     satisfied=True):
+        facility = FacilityRequest(
+            facility_type=FacilityType.TERM_LOAN,
+            amount=Decimal(amount), purpose="eval fixture",
+            term_months=60,
+            guarantors=[
+                Guarantor(name=g, ownership_pct=Decimal("100"))
+                for g in guarantors
+            ],
+        )
+        cf = CreditFile(
+            credit_file_id=credit_file_id,
+            borrower=Borrower(
+                legal_name="Eval Fixture Borrower, LLC",
+                ein_last4="9999", segment=segment,
+                state_of_formation="OH", years_in_business=8,
+                primary_contact_name="Eval Fixture",
+                primary_contact_email="eval@fixture.example",
+            ),
+            facility=facility,
+        )
+        cf.checklist = generate_checklist(facility)
+        if satisfied:
+            for item in cf.checklist:
+                item.satisfied_by_document_id = "doc-eval"
+        return cf
+
+    coverage_figs = {
+        2023: {"current_portion_ltd": "200000"},
+        2024: {
+            "ebit": "270000", "depreciation_and_amortization": "120000",
+            "interest_expense": "100000", "current_portion_ltd": "220000",
+            "capital_expenditures": "50000",
+            "total_liabilities": "800000", "total_equity": "1000000",
+        },
+    }
+    cov_spread, cov_extractions = _fixture_spread(
+        "cf-eval-clean", "covdoc", coverage_figs
+    )
+    cov_pack = compute_entity_pack(
+        credit_file_id="cf-eval-clean", entity="Eval Fixture Borrower, LLC",
+        spread=cov_spread, extractions=cov_extractions,
+    )
+    clean_file = _policy_file("cf-eval-clean", guarantors=("Eval Guarantor",))
+    g_spread2, g_extractions2 = _fixture_spread(
+        "cf-eval-clean", "guarstrong",
+        {
+            2023: {"current_portion_ltd": "40000"},
+            2024: {
+                "ebit": "150000", "depreciation_and_amortization": "20000",
+                "interest_expense": "30000",
+            },
+        },
+    )
+    g_pack2 = compute_entity_pack(
+        credit_file_id="cf-eval-clean", entity="Eval Guarantor",
+        spread=g_spread2, extractions=g_extractions2,
+    )
+    clean_global = compute_global_pack(
+        credit_file_id="cf-eval-clean", borrower_pack=cov_pack,
+        entity_packs={"Eval Guarantor": g_pack2},
+        expected_guarantors=["Eval Guarantor"],
+    )
+    clean_report = evaluate_policy(
+        clean_file, cov_pack, policy_version="v1",
+        global_pack=clean_global, as_of=as_of,
+    )
+    graded.append((clean_report, cov_pack, clean_global))
+    clean_expected = {
+        "max_leverage_by_segment": "pass",
+        "min_dscr": "pass",
+        "min_global_dscr": "pass",
+        "min_fixed_charge_coverage": "pass",
+        "max_single_borrower_concentration": "pass",
+        "required_documents_complete": "pass",
+        "financial_statement_age": "pass",
+        "appraisal_age": "not_evaluable",
+    }
+    clean_actual = {o.test_id: o.outcome for o in clean_report.outcomes}
+    print(f"policy_outcomes_vs_expectations (clean pass): "
+          f"{sum(1 for k, v in clean_expected.items() if clean_actual.get(k) == v)}"
+          f"/{len(clean_expected)} as hand-decided")
+    if clean_actual != clean_expected:
+        failures.append("clean-pass policy outcomes diverge from hand-decided expectations")
+
+    # The leverage-fail file: liabilities 5,000,000 over tangible
+    # net worth 1,000,000 = 5.0000 against the 2.00 ceiling.
+    lev_spread, lev_extractions = _fixture_spread(
+        "cf-eval-levfail", "levdoc",
+        {2024: {"total_liabilities": "5000000", "total_equity": "1000000"}},
+    )
+    lev_pack = compute_entity_pack(
+        credit_file_id="cf-eval-levfail", entity="Eval Fixture Borrower, LLC",
+        spread=lev_spread, extractions=lev_extractions,
+    )
+    lev_report = evaluate_policy(
+        _policy_file("cf-eval-levfail"), lev_pack,
+        policy_version="v1", as_of=as_of,
+    )
+    graded.append((lev_report, lev_pack, None))
+    lev_outcome = lev_report.outcome("max_leverage_by_segment")
+    lev_ok = (
+        lev_outcome.outcome == "fail"
+        and lev_outcome.severity == "blocker"
+        and lev_outcome.threshold == Decimal("2.00")
+        and lev_report.summary["blocker_failures"] >= 1
+    )
+    print(f"policy_outcomes_vs_expectations (leverage fail): "
+          f"{'blocker failure at 5.0000 vs 2.00' if lev_ok else 'WRONG'}")
+    if not lev_ok:
+        failures.append("leverage-fail fixture did not fail as a blocker")
+
+    # Version discipline: the coverage borrower at DSCR 1.3000
+    # passes v1 (floor 1.25) and fails v2 (floor 1.35); its v1
+    # report, once stored, is byte-identical after the v2 run, and
+    # the seed file's policy history records both pinned versions.
+    disc_file = _policy_file("cf-eval-clean")
+    v1_report = evaluate_policy(
+        disc_file, cov_pack, policy_version="v1", as_of=as_of
+    )
+    graded.append((v1_report, cov_pack, None))
+    r3.store.save_policy_report(v1_report)
+    v2_report = evaluate_policy(
+        disc_file, cov_pack, policy_version="v2", as_of=as_of
+    )
+    graded.append((v2_report, cov_pack, None))
+    r3.evaluate_policy(r3_file.credit_file_id, pack_version="v2", as_of=as_of)
+    kept = r3.store.get_policy_report(v1_report.report_id)
+    history_versions = {
+        h.policy_version
+        for h in r3.store.get_credit_file(r3_file.credit_file_id).policy_history
+    }
+    discipline_ok = (
+        v1_report.outcome("min_dscr").outcome == "pass"
+        and v2_report.outcome("min_dscr").outcome == "fail"
+        and v1_report.report_id != v2_report.report_id
+        and kept is not None
+        and kept.model_dump_json() == v1_report.model_dump_json()
+        and {"v1", "v2"} <= history_versions
+    )
+    print(f"policy_version_discipline: "
+          f"{'v1 report kept intact, history records v1 + v2' if discipline_ok else 'BROKEN'}")
+    if not discipline_ok:
+        failures.append("policy version discipline is broken")
+
+    # The silent-pass counter: re-check every figure-test "pass"
+    # against the pack it read. A pass over a missing or
+    # not-computable figure — a not_evaluable wearing a pass's
+    # clothes — is a violation.
+    operators = {
+        ">=": lambda v, t: v >= t, ">": lambda v, t: v > t,
+        "<=": lambda v, t: v <= t, "<": lambda v, t: v < t,
+    }
+    violations = 0
+    passes_checked = 0
+    for report, b_pack, g_pack in graded:
+        tests = {
+            t.test_id: t
+            for t in get_policy_pack(report.policy_version).tests
+        }
+        for outcome in report.outcomes:
+            if outcome.outcome != "pass":
+                continue
+            test = tests[outcome.test_id]
+            if test.kind != "figure":
+                continue
+            passes_checked += 1
+            source = g_pack if test.scope == "global" else b_pack
+            figure = next(
+                (f for f in source.figures
+                 if f.key == test.figure_key
+                 and f.fiscal_year == outcome.fiscal_year),
+                None,
+            )
+            if (
+                figure is None
+                or figure.status != "computed"
+                or figure.value is None
+                or outcome.threshold is None
+                or not operators[test.operator](figure.value, outcome.threshold)
+            ):
+                violations += 1
+    print(f"policy_silent_pass_counter: {violations} violations over "
+          f"{passes_checked} figure-test passes (required 0)")
+    if violations:
+        failures.append("a policy pass rests on a figure that does not support it")
+
+    # Determinism: the same file, version and inputs reproduce the
+    # identical report artefact.
+    repeated = r3.evaluate_policy(
+        r3_file.credit_file_id, pack_version="v1", as_of=as_of
+    )
+    deterministic = (
+        repeated.report_id == hartline_report.report_id
+        and repeated.model_dump_json() == hartline_report.model_dump_json()
+    )
+    print(f"policy_determinism: "
+          f"{'identical report on re-evaluation' if deterministic else 'MISMATCH'}")
+    if not deterministic:
+        failures.append("policy re-evaluation did not reproduce the identical report")
 
     if failures:
         print("GATE: FAIL")
