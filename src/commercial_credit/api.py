@@ -8,8 +8,10 @@ spread for a credit file, its adjustments, and the adjusted view.
 Round 3 adds computations: the deterministic engine's pack for a
 credit file (with supplemental figures and covenant definitions the
 caller hands in), stored packs by id, and the global cash-flow view
-combining the borrower with guarantor spreads. Every request
-carries a request id into the structured logs.
+combining the borrower with guarantor spreads. Round 4 adds the
+policy pack: the shipped pack versions, an evaluation of a file
+against one pinned version, and the stored policy reports. Every
+request carries a request id into the structured logs.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import base64
 import binascii
 import logging
 import uuid
+from datetime import date
 from decimal import Decimal
 
 from fastapi import FastAPI, Request
@@ -41,6 +44,7 @@ from .models import (
     SpreadAdjustment,
 )
 from .pipeline import CreditPipeline
+from .policy import get_policy_pack, list_policy_packs
 from .seed import ReferenceLosFeed
 from .wiring import build_pipeline
 
@@ -318,3 +322,49 @@ def compute_global(credit_file_id: str, body: GlobalComputeRequest) -> dict:
         view=body.view,
     )
     return pack.model_dump(mode="json")
+
+
+@app.get("/policy-packs")
+def list_packs() -> list[dict]:
+    return [p.model_dump(mode="json") for p in list_policy_packs()]
+
+
+@app.get("/policy-packs/{version}")
+def get_pack(version: str) -> dict:
+    return get_policy_pack(version).model_dump(mode="json")
+
+
+class EvaluatePolicyRequest(BaseModel):
+    pack_version: str | None = None
+    as_of: date | None = None
+
+
+@app.post(
+    "/applications/{credit_file_id}/policy-evaluations", status_code=201
+)
+def evaluate_policy(credit_file_id: str, body: EvaluatePolicyRequest) -> dict:
+    _file_or_404(credit_file_id)
+    report = pipeline.evaluate_policy(
+        credit_file_id,
+        pack_version=body.pack_version,
+        as_of=body.as_of,
+    )
+    return report.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/policy-reports")
+def list_policy_reports(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return [
+        r.model_dump(mode="json")
+        for r in store.list_policy_reports(credit_file_id)
+    ]
+
+
+@app.get("/applications/{credit_file_id}/policy-reports/{report_id}")
+def get_policy_report(credit_file_id: str, report_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    report = store.get_policy_report(report_id)
+    if report is None or report.credit_file_id != credit_file_id:
+        raise NotFoundError(f"policy report {report_id} not found")
+    return report.model_dump(mode="json")

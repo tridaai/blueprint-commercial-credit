@@ -3,18 +3,19 @@
 Topology (each round extends the right-hand side by one node):
 
     intake ──► checklist ──► document_intake ──► extraction ──► spreading
-        ──► computation ──► END
+        ──► computation ──► policy ──► END
 
 Each node does one thing and records an audit event; the graph is
 the auditable spine of the deployment, so the same compiled graph
-serves the API, the demo and the evals. Policy tests, memo drafting
-and the two human gates join this graph in their rounds — as
-interrupts, where a person decides.
+serves the API, the demo and the evals. Memo drafting and the two
+human gates join this graph in their rounds — as interrupts, where
+a person decides.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import date
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -39,10 +40,14 @@ from .models import (
     Elimination,
     ExtractedValue,
     FacilityRequest,
+    PolicyHistoryEntry,
+    PolicyReport,
     Spread,
     SpreadAdjustment,
     new_id,
 )
+from .policy import CURRENT_POLICY_VERSION
+from .policy import evaluate_policy as run_policy_evaluation
 from .ports import CreditFileStore, DocumentStore, Extractor
 from .spreading import build_spread as assemble_spread
 from .spreading import validate_adjustment
@@ -59,6 +64,7 @@ class PipelineState(TypedDict, total=False):
     extraction_count: int
     spread_id: str
     computation_pack_id: str
+    policy_report_id: str
 
 
 class CreditPipeline:
@@ -144,6 +150,10 @@ class CreditPipeline:
         pack = self.compute_metrics(state["credit_file_id"])
         return {"computation_pack_id": pack.pack_id}
 
+    def _node_policy(self, state: PipelineState) -> PipelineState:
+        report = self.evaluate_policy(state["credit_file_id"])
+        return {"policy_report_id": report.report_id}
+
     def _build(self):  # noqa: ANN202 - compiled LangGraph app
         graph = StateGraph(PipelineState)
         graph.add_node("intake", self._node_intake)
@@ -152,13 +162,15 @@ class CreditPipeline:
         graph.add_node("extraction", self._node_extraction)
         graph.add_node("spreading", self._node_spreading)
         graph.add_node("computation", self._node_computation)
+        graph.add_node("policy", self._node_policy)
         graph.add_edge(START, "intake")
         graph.add_edge("intake", "checklist")
         graph.add_edge("checklist", "document_intake")
         graph.add_edge("document_intake", "extraction")
         graph.add_edge("extraction", "spreading")
         graph.add_edge("spreading", "computation")
-        graph.add_edge("computation", END)
+        graph.add_edge("computation", "policy")
+        graph.add_edge("policy", END)
         return graph.compile()
 
     # -- public runs ---------------------------------------------------
@@ -169,7 +181,7 @@ class CreditPipeline:
         documents: list[dict] | None = None,
     ) -> CreditFile:
         """Run intake → checklist → documents → extraction → spreading
-        → computation."""
+        → computation → policy."""
         result = self._graph.invoke(
             {
                 "borrower": borrower,
@@ -298,6 +310,63 @@ class CreditPipeline:
             f"{len(pack.covenant_results)} covenant results, "
             f"engine {ENGINE_VERSION}, {pack.view} view",
         )
+
+    def evaluate_policy(
+        self,
+        credit_file_id: str,
+        *,
+        pack_version: str | None = None,
+        as_of: date | None = None,
+        global_pack: ComputationPack | None = None,
+    ) -> PolicyReport:
+        """Evaluate the file against ONE pinned policy pack version
+        and store the report.
+
+        The version is pinned by the caller (the pipeline's own runs
+        use the current version); nothing here reaches for a newer
+        pack on its own. The report is content-addressed: evaluating
+        unchanged inputs under the same version returns the stored
+        artefact, and the audit trail and the file's policy history
+        record the evaluation only the first time those inputs are
+        seen — a later version's evaluation appends its own report
+        and its own history entry, and never rewrites this one.
+        """
+        credit_file = self._load(credit_file_id)
+        pack = self.compute_metrics(credit_file_id)
+        report = run_policy_evaluation(
+            credit_file,
+            pack,
+            policy_version=pack_version or CURRENT_POLICY_VERSION,
+            global_pack=global_pack,
+            as_of=as_of or date.today(),
+        )
+        if self.store.get_policy_report(report.report_id) is not None:
+            return report
+        self.store.save_policy_report(report)
+        self._audit(
+            credit_file_id,
+            "policy_evaluated",
+            f"policy pack {report.policy_pack_id} {report.policy_version} "
+            f"report {report.report_id} as of {report.as_of}: "
+            f"{report.summary.get('pass', 0)} pass, "
+            f"{report.summary.get('fail', 0)} fail, "
+            f"{report.summary.get('not_evaluable', 0)} not evaluable "
+            f"({report.summary.get('blocker_failures', 0)} blocker failures)",
+        )
+        credit_file = self._load(credit_file_id)
+        if not any(
+            h.report_id == report.report_id for h in credit_file.policy_history
+        ):
+            credit_file.policy_history.append(
+                PolicyHistoryEntry(
+                    policy_pack_id=report.policy_pack_id,
+                    policy_version=report.policy_version,
+                    report_id=report.report_id,
+                    as_of=report.as_of,
+                )
+            )
+            self.store.save_credit_file(credit_file)
+        return report
 
     def add_adjustment(
         self, credit_file_id: str, adjustment: SpreadAdjustment
