@@ -119,6 +119,8 @@ from .models import (
     PolicyHistoryEntry,
     PolicyOutcomeDifference,
     PolicyReport,
+    RatingAssignment,
+    RatingOverride,
     ReadinessReport,
     ReviewBlocker,
     ReviewSummary,
@@ -127,7 +129,7 @@ from .models import (
     new_id,
     utcnow,
 )
-from .memo import MemoInputs, _canonical_hash, verify_memo
+from .memo import MemoInputs, RatingFacts, _canonical_hash, verify_memo
 from .memo import compose_memo as draft_memo
 from .memo import get_composer
 from .officer_gate import (
@@ -159,6 +161,13 @@ from .reviews import (
     locked_fact_paragraphs,
     validate_review_outcome,
     verify_review_summary,
+)
+from .scorecard import (
+    build_rating_assignment,
+    final_grade_of,
+    get_scorecard,
+    grade_band_label,
+    validate_override,
 )
 from .spreading import build_spread as assemble_spread
 from .spreading import validate_adjustment
@@ -602,6 +611,7 @@ class CreditPipeline:
             report,
             global_pack=global_artefact,
             composer=get_composer(profile),
+            rating=self._current_rating_facts(credit_file_id),
         )
         if self.store.get_memo(memo.memo_id) is not None:
             return memo
@@ -1172,6 +1182,7 @@ class CreditPipeline:
             report,
             global_pack=global_pack,
             composer=get_composer(old.composer_profile),
+            rating=self._current_rating_facts(credit_file_id),
         )
         sequence = 1 + sum(
             1
@@ -2949,6 +2960,7 @@ class CreditPipeline:
             ),
             key=lambda b: (b.test_date, b.breach_id),
         )
+        rating_pair = self._current_rating_pair(credit_file_id)
         return ReviewInputs(
             credit_file=credit_file,
             covenant_set=covenant_set,
@@ -2968,6 +2980,8 @@ class CreditPipeline:
             breaches=breaches,
             open_breaches=open_breaches,
             blockers=readiness.blockers,
+            rating=rating_pair[0] if rating_pair else None,
+            rating_override=rating_pair[1] if rating_pair else None,
         )
 
     def assemble_review_pack(
@@ -3046,8 +3060,22 @@ class CreditPipeline:
             "pinned_policy_report_id": inputs.pinned_report.report_id,
             "current_policy_report_id": inputs.current_report.report_id,
             "readiness_report_id": inputs.readiness.report_id,
+            "rating_assignment_id": (
+                inputs.rating.assignment_id if inputs.rating else None
+            ),
+            "rating_override_id": (
+                inputs.rating_override.override_id
+                if inputs.rating_override else None
+            ),
             "summary": summary.model_dump(mode="json"),
         }
+        rating_final = (
+            inputs.rating_override.new_grade
+            if inputs.rating_override is not None
+            else inputs.rating.assigned_grade
+            if inputs.rating is not None
+            else None
+        )
         pack = AnnualReviewPack(
             pack_id=f"reviewpack-{_canonical_hash(descriptor)[:16]}",
             credit_file_id=credit_file_id,
@@ -3100,6 +3128,34 @@ class CreditPipeline:
                 d.disagreement_id
                 for d in inputs.spread.disagreements if d.material
             ],
+            rating_assignment_id=(
+                inputs.rating.assignment_id if inputs.rating else None
+            ),
+            rating_scorecard_id=(
+                inputs.rating.scorecard_id if inputs.rating else None
+            ),
+            rating_scorecard_version=(
+                inputs.rating.scorecard_version if inputs.rating else None
+            ),
+            rating_assigned_grade=(
+                inputs.rating.assigned_grade if inputs.rating else None
+            ),
+            rating_assigned_band=(
+                inputs.rating.assigned_band if inputs.rating else None
+            ),
+            rating_grade=rating_final,
+            rating_band=(
+                self._band_label_for(inputs.rating, rating_final)
+                if inputs.rating is not None and rating_final is not None
+                else None
+            ),
+            rating_override_id=(
+                inputs.rating_override.override_id
+                if inputs.rating_override else None
+            ),
+            rating_factors=(
+                list(inputs.rating.factors) if inputs.rating else []
+            ),
             summary=summary,
         )
         is_new = self.store.get_review_pack(pack.pack_id) is None
@@ -3236,6 +3292,16 @@ class CreditPipeline:
             )
             if breach is not None
         ]
+        rating = (
+            self.store.get_rating_assignment(pack.rating_assignment_id)
+            if pack.rating_assignment_id
+            else None
+        )
+        rating_override = (
+            self.store.get_rating_override(pack.rating_override_id)
+            if pack.rating_override_id
+            else None
+        )
         return ReviewInputs(
             credit_file=credit_file,
             covenant_set=covenant_set,
@@ -3257,6 +3323,8 @@ class CreditPipeline:
             breaches=breaches,
             open_breaches=open_breaches,
             blockers=readiness.blockers,
+            rating=rating,
+            rating_override=rating_override,
         )
 
     def record_review_outcome(
@@ -3436,6 +3504,283 @@ class CreditPipeline:
     ) -> list[CommitteeReferral]:
         self._load(credit_file_id)
         return self.store.list_committee_referrals(credit_file_id)
+
+    # -- Risk ratings (round 13) ------------------------------------
+    # The coded scorecard assigns; a named officer may override
+    # the final grade under the scorecard module's discipline;
+    # the memo and the review pack carry the result as an input.
+    # Nothing in this section decides anything: there is no path
+    # from a rating to a gate, and the gates do not import it.
+
+    def assign_rating(
+        self,
+        credit_file_id: str,
+        *,
+        as_of: date,
+        scorecard_version: str | None = None,
+    ) -> RatingAssignment:
+        """Assign the file's risk rating under one scorecard
+        version, over the file's current computation pack.
+
+        The pack is recomputed through the existing engine over
+        the current spread (content-addressed, so an unchanged
+        file re-reads the stored pack); the covenant results are
+        read with their restatement standing against that spread,
+        and the breach cases as they stand. The assignment is
+        content-addressed too: assigning the same file over the
+        same artefacts at the same date returns the stored
+        artefact, and the audit records only the first assignment
+        of each distinct rating."""
+        credit_file = self._load(credit_file_id)
+        definition = get_scorecard(scorecard_version)
+        pack = self.compute_metrics(credit_file_id)
+        spread = next(
+            (
+                s
+                for s in self.store.list_spreads(credit_file_id)
+                if s.spread_id == pack.spread_id
+            ),
+            None,
+        ) or self.store.get_latest_spread(credit_file_id)
+        if spread is None or not spread.periods:
+            raise ValidationError(
+                f"credit file {credit_file_id} has no spread "
+                "periods: a rating is scored over spread figures, "
+                "and there are none on file"
+            )
+        results = self.store.list_covenant_test_results(credit_file_id)
+        standings = {
+            r.result_id: result_standing(r, spread) for r in results
+        }
+        breaches = self.store.list_breach_cases(credit_file_id)
+        assignment = build_rating_assignment(
+            definition,
+            credit_file=credit_file,
+            spread=spread,
+            pack=pack,
+            test_results=results,
+            result_standings=standings,
+            breaches=breaches,
+            as_of=as_of,
+        )
+        is_new = (
+            self.store.get_rating_assignment(assignment.assignment_id)
+            is None
+        )
+        self.store.save_rating_assignment(assignment)
+        if is_new:
+            self._audit(
+                credit_file_id,
+                "risk_rating_assigned",
+                f"risk rating {assignment.assignment_id}: grade "
+                f"{assignment.assigned_grade} "
+                f"({assignment.assigned_band}), composite "
+                f"{assignment.composite_score} under scorecard "
+                f"{assignment.scorecard_id} version "
+                f"{assignment.scorecard_version}, over computation "
+                f"pack {assignment.computation_pack_id} at "
+                f"{as_of.isoformat()}",
+            )
+        return assignment
+
+    def get_rating_assignment(
+        self, credit_file_id: str, assignment_id: str
+    ) -> RatingAssignment:
+        self._load(credit_file_id)
+        assignment = self.store.get_rating_assignment(assignment_id)
+        if assignment is None or assignment.credit_file_id != credit_file_id:
+            raise NotFoundError(
+                f"rating assignment {assignment_id} not found on "
+                f"credit file {credit_file_id}"
+            )
+        return assignment
+
+    def list_rating_assignments(
+        self, credit_file_id: str
+    ) -> list[RatingAssignment]:
+        self._load(credit_file_id)
+        return self.store.list_rating_assignments(credit_file_id)
+
+    def list_rating_overrides(
+        self, credit_file_id: str
+    ) -> list[RatingOverride]:
+        self._load(credit_file_id)
+        return self.store.list_rating_overrides(credit_file_id)
+
+    def _overrides_for(
+        self, assignment: RatingAssignment
+    ) -> list[RatingOverride]:
+        return [
+            o
+            for o in self.store.list_rating_overrides(
+                assignment.credit_file_id
+            )
+            if o.assignment_id == assignment.assignment_id
+        ]
+
+    def _band_label_for(
+        self, assignment: RatingAssignment, grade: int
+    ) -> str:
+        if grade == assignment.assigned_grade:
+            return assignment.assigned_band
+        try:
+            return grade_band_label(
+                get_scorecard(assignment.scorecard_version), grade
+            )
+        except ValidationError:
+            return assignment.assigned_band
+
+    def rating_view(self, assignment: RatingAssignment) -> dict:
+        """One assignment as its readers see it: the assigned
+        grade AND the final grade (after the override chain),
+        the head override that produced it, and the full chain.
+        Both grades, always — a moved grade is never shown
+        without the grade it was moved from."""
+        overrides = self._overrides_for(assignment)
+        final, head = final_grade_of(assignment, overrides)
+        return {
+            "assignment": assignment,
+            "assigned_grade": assignment.assigned_grade,
+            "assigned_band": assignment.assigned_band,
+            "final_grade": final,
+            "final_band": self._band_label_for(assignment, final),
+            "override": head,
+            "overrides": overrides,
+        }
+
+    def current_rating(
+        self, credit_file_id: str
+    ) -> dict | None:
+        """The rating view that stands current on the file: the
+        latest stored assignment, or None when none exists."""
+        assignments = self.list_rating_assignments(credit_file_id)
+        if not assignments:
+            return None
+        return self.rating_view(assignments[-1])
+
+    def _current_rating_pair(
+        self, credit_file_id: str
+    ) -> tuple[RatingAssignment, RatingOverride | None] | None:
+        assignments = self.store.list_rating_assignments(credit_file_id)
+        if not assignments:
+            return None
+        assignment = assignments[-1]
+        _final, head = final_grade_of(
+            assignment, self._overrides_for(assignment)
+        )
+        return assignment, head
+
+    def _current_rating_facts(
+        self, credit_file_id: str
+    ) -> RatingFacts | None:
+        pair = self._current_rating_pair(credit_file_id)
+        if pair is None:
+            return None
+        assignment, head = pair
+        final, _ = final_grade_of(
+            assignment, self._overrides_for(assignment)
+        )
+        return RatingFacts(
+            assignment_id=assignment.assignment_id,
+            scorecard_id=assignment.scorecard_id,
+            scorecard_version=assignment.scorecard_version,
+            assigned_grade=assignment.assigned_grade,
+            assigned_band=assignment.assigned_band,
+            final_grade=final,
+            final_band=self._band_label_for(assignment, final),
+            override_id=head.override_id if head else None,
+        )
+
+    def rating_history(self, credit_file_id: str) -> list[dict]:
+        """The file's rating trend: every assignment in stored
+        order, each with its scorecard version and both grades.
+
+        A version change never rewrites this history — earlier
+        assignments stand under the version that produced them —
+        and the view labels the comparison honestly: an entry
+        whose version differs from its predecessor's is marked
+        cross-version, because grades from two definitions are
+        not directly comparable."""
+        self._load(credit_file_id)
+        history: list[dict] = []
+        previous_version: str | None = None
+        for assignment in self.store.list_rating_assignments(
+            credit_file_id
+        ):
+            view = self.rating_view(assignment)
+            cross_version = (
+                previous_version is not None
+                and assignment.scorecard_version != previous_version
+            )
+            view.update({
+                "scorecard_version": assignment.scorecard_version,
+                "cross_version": cross_version,
+                "comparison_basis": (
+                    "cross-version — grades from two scorecard "
+                    "versions are not directly comparable"
+                    if cross_version
+                    else "same scorecard version as the prior entry"
+                    if previous_version is not None
+                    else "first recorded assignment"
+                ),
+            })
+            history.append(view)
+            previous_version = assignment.scorecard_version
+        return history
+
+    def override_rating(
+        self,
+        credit_file_id: str,
+        assignment_id: str,
+        *,
+        officer_id: str,
+        officer_role: str,
+        new_grade: int,
+        reason_code: str,
+        countersigner_id: str | None = None,
+        countersigner_role: str | None = None,
+        note: str = "",
+    ) -> RatingOverride:
+        """Record a coded officer override of a rating's final
+        grade. The scorecard module's validation disposes: the
+        bound (±1 from the ASSIGNED grade), the coded reason, and
+        the countersigning second officer are all refused or
+        allowed there, in code. The assignment artefact is never
+        touched — the override is stored beside it and the audit
+        records the move with both grades."""
+        self._load(credit_file_id)
+        assignment = self.get_rating_assignment(
+            credit_file_id, assignment_id
+        )
+        override = validate_override(
+            assignment=assignment,
+            overrides=self._overrides_for(assignment),
+            new_grade=new_grade,
+            reason_code=reason_code,
+            note=note,
+            officer_id=officer_id,
+            officer_role=officer_role,
+            countersigner_id=countersigner_id,
+            countersigner_role=countersigner_role,
+        )
+        is_new = (
+            self.store.get_rating_override(override.override_id) is None
+        )
+        self.store.save_rating_override(override)
+        if is_new:
+            self._audit(
+                credit_file_id,
+                "risk_rating_overridden",
+                f"risk rating {assignment.assignment_id}: final "
+                f"grade moved {override.previous_grade} → "
+                f"{override.new_grade} by {officer_id} "
+                f"({officer_role}), reason {reason_code} under "
+                f"{override.reason_vocabulary}, countersigned by "
+                f"{countersigner_id}; the assigned grade "
+                f"{assignment.assigned_grade} stands on the "
+                "assignment unchanged",
+            )
+        return override
 
     def review_due_work(self, *, as_of: date) -> list[dict]:
         """The annual review queue at `as_of`: every review

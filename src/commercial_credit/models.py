@@ -1036,6 +1036,7 @@ class CreditMemo(BaseModel):
     rating_scorecard_id: str | None = None
     rating_scorecard_version: str | None = None
     rating_assigned_grade: int | None = None
+    rating_assigned_band: str | None = None
     rating_grade: int | None = None
     rating_band: str | None = None
     rating_override_id: str | None = None
@@ -1819,6 +1820,7 @@ class AnnualReviewPack(BaseModel):
     rating_scorecard_id: str | None = None
     rating_scorecard_version: str | None = None
     rating_assigned_grade: int | None = None
+    rating_assigned_band: str | None = None
     rating_grade: int | None = None
     rating_band: str | None = None
     rating_override_id: str | None = None

@@ -176,6 +176,26 @@ class MemoInputs:
     global_pack: ComputationPack | None = None
 
 
+@dataclass(frozen=True)
+class RatingFacts:
+    """The rating that stands current at a memo's composition
+    (round 13): the assignment it came from, the grade the
+    scorecard assigned, and the final grade after any override —
+    both grades, always, so the header never shows a moved grade
+    without the grade it was moved from. Assembled by the
+    pipeline from the stored assignment + override chain; the
+    memo states these facts, it does not compute them."""
+
+    assignment_id: str
+    scorecard_id: str
+    scorecard_version: str
+    assigned_grade: int
+    assigned_band: str
+    final_grade: int
+    final_band: str
+    override_id: str | None = None
+
+
 def build_trace_universe(inputs: MemoInputs) -> dict[Decimal, str]:
     universe: dict[Decimal, str] = {}
 
@@ -452,6 +472,26 @@ def _render_header(memo: CreditMemo) -> str:
         # Code-spanned like every artefact id: an identifier, not
         # a figure, and never read as one by the verifier.
         lines.append(f"Reviewed by: `{memo.reviewed_by}`")
+    if memo.rating_assignment_id:
+        # Round 13: the rating the scorecard assigned, stated as
+        # an artefact citation — grades and versions code-spanned
+        # like the ids, because the assignment artefact is where
+        # the numbers live and are graded. An override is stated
+        # on its own line: both grades stay visible, always.
+        lines.append(
+            f"Risk rating (assigned): grade "
+            f"`{memo.rating_assigned_grade}` "
+            f"({memo.rating_assigned_band}) under scorecard "
+            f"`{memo.rating_scorecard_id}` version "
+            f"`{memo.rating_scorecard_version}` — assignment "
+            f"`{memo.rating_assignment_id}`"
+        )
+        if memo.rating_override_id:
+            lines.append(
+                f"Risk rating (final, after override "
+                f"`{memo.rating_override_id}`): grade "
+                f"`{memo.rating_grade}` ({memo.rating_band})"
+            )
     return "\n".join(lines)
 
 
@@ -1313,6 +1353,7 @@ def compose_memo(
     *,
     global_pack: ComputationPack | None = None,
     composer: MemoComposer | None = None,
+    rating: RatingFacts | None = None,
 ) -> CreditMemo:
     """Compose a draft memo from pinned artefacts and verify it.
 
@@ -1320,6 +1361,13 @@ def compose_memo(
     composer profile reproduce the identical memo, id included.
     Raises MemoVerificationError — and produces nothing storable —
     when the draft cannot be fully traced or drops an exception.
+
+    `rating` (round 13) is the rating standing current at
+    composition: the memo states it in its header facts and pins
+    it in its content hash, so a memo composed after a rating was
+    assigned — or after an override moved it — is a different
+    artefact from one composed before. The rating is stated, not
+    used: no section, verdict or recommendation reads it.
     """
     composer = composer or OfflineMemoComposer()
     inputs = MemoInputs(
@@ -1347,6 +1395,16 @@ def compose_memo(
         verification=MemoVerification(
             composer_profile=composer.name, figure_count=0
         ),
+        rating_assignment_id=rating.assignment_id if rating else None,
+        rating_scorecard_id=rating.scorecard_id if rating else None,
+        rating_scorecard_version=(
+            rating.scorecard_version if rating else None
+        ),
+        rating_assigned_grade=rating.assigned_grade if rating else None,
+        rating_assigned_band=rating.assigned_band if rating else None,
+        rating_grade=rating.final_grade if rating else None,
+        rating_band=rating.final_band if rating else None,
+        rating_override_id=rating.override_id if rating else None,
     )
     verification = verify_memo(draft, inputs)
     descriptor = {
@@ -1356,6 +1414,9 @@ def compose_memo(
         "global_pack_id": draft.global_pack_id,
         "policy_report_id": draft.policy_report_id,
         "composer_profile": draft.composer_profile,
+        "rating_assignment_id": draft.rating_assignment_id,
+        "rating_grade": draft.rating_grade,
+        "rating_override_id": draft.rating_override_id,
         "sections": [s.model_dump(mode="json") for s in draft.sections],
         "verification": verification.model_dump(mode="json"),
     }

@@ -1340,6 +1340,123 @@ class OpenDueReviewsRequest(BaseModel):
     credit_file_id: str | None = None
 
 
+# ------------------------------------------------------------------
+# Round 13: risk ratings. The coded scorecard assigns over the
+# file's current computation pack; a named officer may override
+# the final grade under the scorecard's discipline (at most one
+# grade from the assigned grade, coded reason, countersigned);
+# the history view labels cross-version comparisons honestly.
+# The rating is an input to the memo and the review pack — no
+# endpoint here decides anything, and no gate reads these.
+# ------------------------------------------------------------------
+
+
+def _rating_view_json(view: dict) -> dict:
+    return {
+        "assignment": view["assignment"].model_dump(mode="json"),
+        "assigned_grade": view["assigned_grade"],
+        "assigned_band": view["assigned_band"],
+        "final_grade": view["final_grade"],
+        "final_band": view["final_band"],
+        "override": (
+            view["override"].model_dump(mode="json")
+            if view["override"] else None
+        ),
+        "overrides": [
+            o.model_dump(mode="json") for o in view["overrides"]
+        ],
+    }
+
+
+class AssignRatingRequest(BaseModel):
+    as_of: date
+    scorecard_version: str | None = None
+
+
+@app.post(
+    "/applications/{credit_file_id}/risk-rating", status_code=201
+)
+def assign_rating(
+    credit_file_id: str, body: AssignRatingRequest
+) -> dict:
+    _file_or_404(credit_file_id)
+    assignment = pipeline.assign_rating(
+        credit_file_id,
+        as_of=body.as_of,
+        scorecard_version=body.scorecard_version,
+    )
+    return _rating_view_json(pipeline.rating_view(assignment))
+
+
+@app.get("/applications/{credit_file_id}/risk-ratings")
+def list_ratings(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return [
+        _rating_view_json(pipeline.rating_view(assignment))
+        for assignment in pipeline.list_rating_assignments(
+            credit_file_id
+        )
+    ]
+
+
+@app.get(
+    "/applications/{credit_file_id}/risk-ratings/{assignment_id}"
+)
+def get_rating(credit_file_id: str, assignment_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    assignment = pipeline.get_rating_assignment(
+        credit_file_id, assignment_id
+    )
+    return _rating_view_json(pipeline.rating_view(assignment))
+
+
+@app.get("/applications/{credit_file_id}/risk-rating-history")
+def get_rating_history(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    history = []
+    for view in pipeline.rating_history(credit_file_id):
+        entry = _rating_view_json(view)
+        entry["scorecard_version"] = view["scorecard_version"]
+        entry["cross_version"] = view["cross_version"]
+        entry["comparison_basis"] = view["comparison_basis"]
+        history.append(entry)
+    return history
+
+
+class OverrideRatingRequest(BaseModel):
+    officer_id: str
+    officer_role: str
+    new_grade: int
+    reason_code: str
+    countersigner_id: str | None = None
+    countersigner_role: str | None = None
+    note: str = ""
+
+
+@app.post(
+    "/applications/{credit_file_id}/risk-ratings/{assignment_id}"
+    "/override",
+    status_code=201,
+)
+def override_rating(
+    credit_file_id: str, assignment_id: str,
+    body: OverrideRatingRequest,
+) -> dict:
+    _file_or_404(credit_file_id)
+    override = pipeline.override_rating(
+        credit_file_id,
+        assignment_id,
+        officer_id=body.officer_id,
+        officer_role=body.officer_role,
+        new_grade=body.new_grade,
+        reason_code=body.reason_code,
+        countersigner_id=body.countersigner_id,
+        countersigner_role=body.countersigner_role,
+        note=body.note,
+    )
+    return override.model_dump(mode="json")
+
+
 @app.post("/annual-reviews/open-due")
 def open_due_reviews(body: OpenDueReviewsRequest) -> dict:
     if body.credit_file_id is not None:

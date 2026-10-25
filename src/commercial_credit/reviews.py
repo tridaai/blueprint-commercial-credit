@@ -91,6 +91,8 @@ from .models import (
     CreditMemo,
     FigureTrace,
     PolicyReport,
+    RatingAssignment,
+    RatingOverride,
     ReadinessEntry,
     ReadinessReport,
     ReviewSummaryVerification,
@@ -277,6 +279,11 @@ class ReviewInputs:
     breaches: list[BreachCase] = field(default_factory=list)
     open_breaches: list[BreachCase] = field(default_factory=list)
     blockers: list[ReadinessEntry] = field(default_factory=list)
+    # Round 13: the rating standing current at assembly (or the
+    # one a stored pack pinned), with the head of its override
+    # chain. Carried as an input; never a stance input.
+    rating: RatingAssignment | None = None
+    rating_override: RatingOverride | None = None
 
     @property
     def complete(self) -> bool:
@@ -431,6 +438,37 @@ def locked_fact_paragraphs(inputs: ReviewInputs) -> list[str]:
     for record in inputs.spread.disagreements:
         if record.material:
             paragraphs.append(render_disagreement_paragraph(record))
+
+    if inputs.rating is not None:
+        # Round 13: the rating stated as the artefact citation it
+        # is — grades and versions code-spanned like the ids, the
+        # factor record riding on the pack itself. The sentence
+        # that follows it is part of the locked fact: the rating
+        # is an input to the review, and the record says so, so
+        # no reader mistakes it for the review's stance.
+        rating = inputs.rating
+        final_grade = (
+            inputs.rating_override.new_grade
+            if inputs.rating_override is not None
+            else rating.assigned_grade
+        )
+        moved = (
+            f", moved to a final grade of `{final_grade}` by "
+            f"override `{inputs.rating_override.override_id}` "
+            f"(reason `{inputs.rating_override.reason_code}`)"
+            if inputs.rating_override is not None
+            else ""
+        )
+        paragraphs.append(
+            f"Risk rating: assignment `{rating.assignment_id}` "
+            f"under scorecard `{rating.scorecard_id}` version "
+            f"`{rating.scorecard_version}` rates this credit "
+            f"grade `{rating.assigned_grade}` "
+            f"({rating.assigned_band}) as of "
+            f"{rating.as_of.isoformat()}{moved}. The rating is a "
+            "coded input carried into this review — it is not "
+            "the review's stance, and it decides nothing."
+        )
 
     if inputs.blockers:
         keys = ", ".join(f"`{b.input_key}`" for b in inputs.blockers)
