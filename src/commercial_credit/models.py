@@ -245,6 +245,15 @@ class CreditFile(BaseModel):
     borrower: Borrower
     facility: FacilityRequest
     status: CreditFileStatus = CreditFileStatus.INTAKE
+    # Round 10: the facility's closing date, recorded as a file
+    # fact when the loan closes. It is the anchor every covenant
+    # test date is computed from — a set built before it exists is
+    # created in the named `awaiting_closing_date` state rather
+    # than dated by invention. Recorded via the pipeline (named
+    # actor, audit event); never edited once set — a corrected
+    # closing date is a new recording that supersedes in the audit
+    # trail, and covenant sets pin the date they were built from.
+    closing_date: date | None = None
     checklist: list[ChecklistItem] = Field(default_factory=list)
     documents: list[SourceDocument] = Field(default_factory=list)
     policy_history: list[PolicyHistoryEntry] = Field(default_factory=list)
@@ -1315,3 +1324,204 @@ class CommitteeDecision(BaseModel):
     representment_requirements: list[str] = Field(default_factory=list)
     note: str = ""
     decided_at: datetime = Field(default_factory=utcnow)
+
+
+# ---------------------------------------------------------------------
+# Round 10: covenants — clocks + math (design law 6). An approval
+# (plain or conditional) creates a CovenantSet for the credit file:
+# the financial covenants the committee imposed as conditions
+# (round 7 — thresholds already traced) plus the policy pack's
+# standard covenant template for the facility type, as data. Every
+# covenant carries a schedule computed in code from the facility's
+# closing date: test dates over the facility's life, each test
+# instance derived with its state and the inputs it needs.
+#
+# Integrity rule of this section: a covenant is NEVER edited in
+# place. Its threshold, operator, frequency and grace live on a
+# versioned record; changing any of them is an amendment — a NEW
+# Covenant record (version + 1) that supersedes the old one, with
+# a named author, a coded reason from the versioned vocabulary in
+# covenants.py, and the committee decision that authorised it.
+# The store enforces the same rule the model states: there is no
+# update path for a covenant set, only append.
+# ---------------------------------------------------------------------
+
+# Covenant sources: where a covenant in a set came from.
+COVENANT_SOURCE_CONDITION = "committee_condition"
+COVENANT_SOURCE_TEMPLATE = "policy_template"
+
+# Test frequencies, as data on the covenant.
+FREQUENCY_QUARTERLY = "quarterly"
+FREQUENCY_SEMIANNUAL = "semiannual"
+FREQUENCY_ANNUAL = "annual"
+
+# What a scheduled item is: a financial covenant test, or a dated
+# reporting deliverable (a round 7 reporting condition).
+ITEM_COVENANT_TEST = "covenant_test"
+ITEM_REPORTING_DELIVERABLE = "reporting_deliverable"
+
+# Derived schedule states (never stored on an artefact).
+SCHEDULE_SCHEDULED = "scheduled"
+SCHEDULE_DUE_SOON = "due_soon"
+SCHEDULE_DUE = "due"
+SCHEDULE_AWAITING_INPUTS = "awaiting_inputs"
+SCHEDULE_OVERDUE = "overdue"
+
+
+class Covenant(BaseModel):
+    """One financial covenant of a covenant set: a metric, an
+    operator, a threshold, a test schedule, and a grace period.
+
+    `metric_key` must be a figure key of the computation engine's
+    vocabulary — a covenant over a figure the engine cannot
+    produce is refused at set creation, because it could never be
+    tested. `basis` says how the tested period is chosen:
+    `fiscal_period_end` tests the fiscal period ending on the
+    test date; `point_in_time` tests the borrower's position at
+    the test date itself (the latest spread period at that date).
+
+    `origin` names where the covenant came from: a committee
+    condition (by id) or a policy template entry (by id). The
+    version lineage fields implement the amendment rule: version 1
+    is born with the set; an amendment mints version n+1 naming
+    the covenant it supersedes, its author, its coded reason, and
+    the committee decision that authorised the change.
+    """
+
+    covenant_id: str
+    set_id: str
+    credit_file_id: str
+    name: str = Field(min_length=1)
+    metric_key: str = Field(min_length=1)
+    operator: str = Field(pattern=r"^(>=|<=|>|<)$")
+    threshold: Decimal
+    threshold_trace: str | None = None
+    frequency: str  # quarterly | semiannual | annual
+    basis: str = "fiscal_period_end"  # fiscal_period_end | point_in_time
+    grace_days: int = Field(default=0, ge=0)
+    source: str  # committee_condition | policy_template
+    origin_id: str = Field(min_length=1)
+    version: int = Field(default=1, ge=1)
+    supersedes_covenant_id: str | None = None
+    amended_by: str | None = None
+    amendment_reason_code: str | None = None
+    amendment_decision_id: str | None = None
+    amendment_note: str = ""
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class ReportingDeliverable(BaseModel):
+    """A dated reporting obligation on the same schedule as the
+    covenant tests: a round 7 reporting_requirement condition
+    (what must be reported, on the cadence it names), or the
+    standard annual financial-statements deliverable the covenant
+    template carries for every facility. Round 11 tracks receipt;
+    this round schedules it and names what satisfies it."""
+
+    deliverable_id: str
+    set_id: str
+    credit_file_id: str
+    name: str = Field(min_length=1)
+    report_what: str = Field(min_length=1)
+    frequency: str  # quarterly | semiannual | annual
+    source: str  # committee_condition | policy_template
+    origin_id: str = Field(min_length=1)
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class CovenantSet(BaseModel):
+    """The covenant set of one approved credit file.
+
+    Content-addressed like the artefacts it derives from: the set
+    id derives from the credit file, the decision that created it,
+    the policy pack version it pins, the facility facts it reads
+    (closing date, term, fiscal year end) and the covenant and
+    deliverable records it holds at creation. Amendments do NOT
+    rewrite the set: an amendment is its own Covenant record
+    (version n+1) stored against the set, and the set's current
+    covenants are derived — the latest version of each lineage.
+
+    `state` is `active` when the closing date is on file and the
+    schedule is fully computable; `awaiting_closing_date` when it
+    is not — a named incomplete state, never a silently guessed
+    anchor. The set pins the policy pack version and the decision
+    id it came from, so a later policy refresh or a later decision
+    never silently re-judges this facility's covenants (law 2's
+    discipline, carried into law 6).
+    """
+
+    set_id: str
+    credit_file_id: str
+    decision_id: str
+    memo_id: str
+    policy_pack_id: str
+    policy_version: str
+    state: str  # active | awaiting_closing_date
+    closing_date: date | None = None
+    term_months: int = Field(gt=0)
+    fiscal_year_end_month: int = Field(default=12, ge=1, le=12)
+    fiscal_year_end_day: int = Field(default=31, ge=1, le=31)
+    covenants: list[Covenant] = Field(default_factory=list)
+    deliverables: list[ReportingDeliverable] = Field(default_factory=list)
+    created_by: str
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class CovenantAmendment(BaseModel):
+    """The stored record of one covenant amendment: the new
+    Covenant version it minted, and the version it superseded.
+
+    Kept as its own artefact so the amendment history of a set
+    reads without reconstructing it from the covenant records —
+    and so the store has an append-only home for the act itself.
+    """
+
+    amendment_id: str
+    credit_file_id: str
+    set_id: str
+    superseded_covenant_id: str
+    covenant: Covenant
+    author_id: str
+    author_role: str
+    reason_code: str
+    decision_id: str
+    note: str = ""
+    at: datetime = Field(default_factory=utcnow)
+
+
+class CovenantTestInstance(BaseModel):
+    """One scheduled item, derived — never stored as an artefact.
+
+    A test instance is a pure function of its covenant (or
+    deliverable), the set's anchor facts, the credit file's
+    current periods, and the as_of date: the same inputs always
+    derive the same instance, id included. The scheduler tick does
+    not create instances; it records the moment a derived instance
+    is first SEEN standing at due or overdue, on the credit file's
+    audit trail. Re-running the tick can therefore never duplicate
+    an instance or an audit entry.
+
+    `state` is one of the SCHEDULE_* states. An instance whose
+    period's spread figures are not yet on file stands at
+    `awaiting_inputs` and names them — the exact spread inputs the
+    round 11 re-spread will need — from the moment its period ends
+    until they arrive; its deadline state (due / overdue) resumes
+    the moment they do.
+    """
+
+    instance_id: str
+    credit_file_id: str
+    set_id: str
+    kind: str  # covenant_test | reporting_deliverable
+    covenant_id: str | None = None
+    deliverable_id: str | None = None
+    name: str
+    metric_key: str | None = None
+    operator: str | None = None
+    threshold: Decimal | None = None
+    test_date: date
+    period_label: str
+    fiscal_year: int | None = None
+    state: str
+    days_until_due: int
+    required_inputs: list[str] = Field(default_factory=list)
