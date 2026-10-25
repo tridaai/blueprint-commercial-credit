@@ -1024,6 +1024,21 @@ class CreditMemo(BaseModel):
     supersedes_memo_id: str | None = None
     reviewed_by: str | None = None
     committee_flags: list[MemoCommitteeFlag] = Field(default_factory=list)
+    # Round 13 (risk rating): the header facts of the rating that
+    # stood current when this memo was composed — the assignment
+    # it came from, the scorecard and version that produced it,
+    # the grade the scorecard assigned and, when a coded officer
+    # override had moved it by the time of composition, the final
+    # grade and the override's id. The rating is an input the
+    # memo states in its header; it decides nothing, and a memo
+    # composed before any rating exists carries none of this.
+    rating_assignment_id: str | None = None
+    rating_scorecard_id: str | None = None
+    rating_scorecard_version: str | None = None
+    rating_assigned_grade: int | None = None
+    rating_grade: int | None = None
+    rating_band: str | None = None
+    rating_override_id: str | None = None
 
     def section(self, key: str) -> MemoSection | None:
         for section in self.sections:
@@ -1794,6 +1809,20 @@ class AnnualReviewPack(BaseModel):
     breach_ids: list[str] = Field(default_factory=list)
     open_breach_ids: list[str] = Field(default_factory=list)
     material_disagreement_ids: list[str] = Field(default_factory=list)
+    # Round 13: the risk rating that stood current at assembly —
+    # the assignment, its scorecard, the assigned grade and the
+    # final grade after any override, and the full factor
+    # breakdown. An input the review reads; never a stance it
+    # takes. A pack assembled before any rating exists carries
+    # none of this.
+    rating_assignment_id: str | None = None
+    rating_scorecard_id: str | None = None
+    rating_scorecard_version: str | None = None
+    rating_assigned_grade: int | None = None
+    rating_grade: int | None = None
+    rating_band: str | None = None
+    rating_override_id: str | None = None
+    rating_factors: list["RatingFactorScore"] = Field(default_factory=list)
     summary: ReviewSummary
     created_at: datetime = Field(default_factory=utcnow)
 
@@ -1860,3 +1889,189 @@ class CommitteeReferral(BaseModel):
     note: str = ""
     status: str = "open"
     created_at: datetime = Field(default_factory=utcnow)
+
+
+# ---------------------------------------------------------------------
+# Round 13: the risk-rating scorecard. The bank's obligor rating
+# in a real deployment comes out of the bank's own rating model,
+# governed as a model (SR 11-7-style: inventory, validation,
+# ongoing monitoring). This blueprint ships a CODED STAND-IN for
+# that model — a versioned scorecard definition held as data,
+# whose factors read only figures the computation engine produced
+# and coded facts of the file, so every grade it assigns can be
+# walked back factor by factor to a computation step or a named
+# record. The stand-in's honesty rule is the same as the rest of
+# the system's: it is an INPUT. A rating is carried into the memo
+# header and the annual review pack; no gate reads it, no
+# decision path consults it, and nothing in this system approves
+# or declines on its authority.
+# ---------------------------------------------------------------------
+
+
+class ScorecardBand(BaseModel):
+    """One band of one scorecard factor: the inputs that land in
+    it, and the factor score it earns (1 strongest, 10 weakest —
+    the same direction as the grade scale).
+
+    A numeric band matches a figure value inside [at_least,
+    at_most] (either bound may be open). A categorical band
+    matches the category string a file-fact factor derives. A
+    band flagged `is_missing_data` is the factor's named answer
+    to an input that could not be computed: the assignment
+    records the band and the missing inputs — the value is never
+    zero-filled or quietly dropped from the factor set."""
+
+    band_id: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+    score: int = Field(ge=1, le=10)
+    at_least: Decimal | None = None
+    at_most: Decimal | None = None
+    category: str | None = None
+    is_missing_data: bool = False
+
+
+class ScorecardFactorDef(BaseModel):
+    """One factor of the scorecard, as definition data.
+
+    `kind` says where the factor's input lives:
+      figure    — a ComputedFigure of the borrower's computation
+                  pack, read at the pack's latest period (or, for
+                  the trend factor, the change across its periods);
+                  `figure_key` names it;
+      file_fact — a coded fact of the credit file itself, derived
+                  in code from stored records (covenant test
+                  results, breach cases, the spread's period
+                  sources and disagreements); `fact` names it.
+
+    The bands are listed strongest first; the first band whose
+    bounds (or category) match the input is the band hit. The
+    factor set of a scorecard version is fixed: every assignment
+    under that version scores every factor, with a missing input
+    landing in the factor's named missing-data band."""
+
+    factor_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    kind: str = Field(pattern=r"^(figure|file_fact)$")
+    figure_key: str | None = None
+    # latest — the figure at the pack's latest period;
+    # period_change — the figure at the latest period less the
+    # figure at the earliest (the trend factor's input).
+    figure_mode: str = "latest"  # latest | period_change
+    fact: str | None = None  # covenant_compliance | breach_history | statement_quality
+    weight: Decimal = Field(gt=Decimal("0"))
+    bands: list[ScorecardBand] = Field(min_length=1)
+
+
+class ScorecardGradeBand(BaseModel):
+    """One named stretch of the 1–10 grade scale."""
+
+    grade_from: int = Field(ge=1, le=10)
+    grade_to: int = Field(ge=1, le=10)
+    label: str = Field(min_length=1)
+
+
+class ScorecardDefinition(BaseModel):
+    """One version of the coded scorecard: an identified, dated
+    set of factors and the grade scale their weighted composite
+    maps onto. Immutable once shipped — a change to a factor, a
+    band or a weight is a new version, and assignments made under
+    the earlier version keep it (history is never re-based)."""
+
+    scorecard_id: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+    note: str = Field(min_length=1)
+    factors: list[ScorecardFactorDef] = Field(min_length=1)
+    grade_bands: list[ScorecardGradeBand] = Field(min_length=1)
+
+
+class RatingFactorScore(BaseModel):
+    """One factor's scored contribution to one rating assignment.
+
+    The trace is the point: `input_value` (or `input_category`
+    for a file-fact factor) is what the factor read; `trace`
+    names the artefact and field it came from — for a figure
+    factor, the computation pack, the figure key and period, and
+    `derivation_steps` carries the step keys of that figure's
+    recorded derivation in the pack, so the walk from grade to
+    arithmetic is mechanical. A factor whose input could not be
+    computed carries no value: it names the missing inputs and
+    lands in its missing-data band."""
+
+    factor_id: str
+    factor_name: str
+    kind: str  # figure | file_fact
+    weight: Decimal
+    input_value: Decimal | None = None
+    input_category: str | None = None
+    figure_key: str | None = None
+    fiscal_year: int | None = None
+    trace: str = ""
+    derivation_steps: list[str] = Field(default_factory=list)
+    band_id: str
+    band_label: str
+    score: int = Field(ge=1, le=10)
+    weighted_contribution: Decimal
+    missing_inputs: list[str] = Field(default_factory=list)
+
+
+class RatingAssignment(BaseModel):
+    """One assignment of a risk rating to one credit file.
+
+    Content-addressed like the artefacts it reads: the assignment
+    id derives from the scorecard id + version, the computation
+    pack and spread it read, the as-of date (breach recency is
+    read at a date, so the date is part of the artefact), and
+    every factor's scored result — recomputing over the same
+    inputs at the same date reproduces the identical assignment.
+    The composite is the weighted sum of the factor scores,
+    recorded to two decimals; the grade is the composite rounded
+    half-up to the 1–10 scale; the band is the grade's name in
+    the scorecard's own scale. An assignment is never edited: an
+    officer who disagrees records a RatingOverride beside it,
+    and both grades stay on the record."""
+
+    assignment_id: str
+    credit_file_id: str
+    borrower_name: str
+    scorecard_id: str
+    scorecard_version: str
+    as_of: date
+    spread_id: str
+    computation_pack_id: str
+    latest_period: int | None = None
+    factors: list[RatingFactorScore] = Field(default_factory=list)
+    composite_score: Decimal
+    assigned_grade: int = Field(ge=1, le=10)
+    assigned_band: str
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class RatingOverride(BaseModel):
+    """A named credit officer's coded move of a rating's final
+    grade — the only way a grade changes after assignment.
+
+    Bounded by construction: the new grade stands at most one
+    grade from the ASSIGNED grade, the reason is a code from the
+    versioned vocabulary (scorecard.OVERRIDE_REASON_CODES), and a
+    second officer — a different person, in an officer role —
+    countersigns. The override is its own artefact beside the
+    assignment, never an edit to it: the assignment keeps the
+    grade the scorecard gave, the override chain records each
+    move and the grade it moved from, and every surface that
+    shows the rating shows both grades."""
+
+    override_id: str
+    assignment_id: str
+    credit_file_id: str
+    assigned_grade: int = Field(ge=1, le=10)
+    previous_grade: int = Field(ge=1, le=10)
+    new_grade: int = Field(ge=1, le=10)
+    reason_code: str
+    reason_vocabulary: str
+    officer_id: str
+    officer_role: str
+    countersigner_id: str
+    countersigner_role: str
+    supersedes_override_id: str | None = None
+    note: str = ""
+    at: datetime = Field(default_factory=utcnow)
