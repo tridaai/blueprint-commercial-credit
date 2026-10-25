@@ -3,13 +3,15 @@
 Topology (each round extends the right-hand side by one node):
 
     intake ──► checklist ──► document_intake ──► extraction ──► spreading
-        ──► computation ──► policy ──► END
+        ──► computation ──► policy ──► memo ──► END
 
 Each node does one thing and records an audit event; the graph is
 the auditable spine of the deployment, so the same compiled graph
-serves the API, the demo and the evals. Memo drafting and the two
-human gates join this graph in their rounds — as interrupts, where
-a person decides.
+serves the API, the demo and the evals. The memo node drafts the
+credit memo and runs the figure verifier over it — a memo that
+cannot be fully traced is refused, and the refusal fails the run
+rather than storing a bad draft. The two human gates join this
+graph in their rounds — as interrupts, where a person decides.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from .models import (
     CovenantDefinition,
     CreditFile,
     CreditFileStatus,
+    CreditMemo,
     DocumentKind,
     Elimination,
     ExtractedValue,
@@ -46,6 +49,8 @@ from .models import (
     SpreadAdjustment,
     new_id,
 )
+from .memo import compose_memo as draft_memo
+from .memo import get_composer
 from .policy import CURRENT_POLICY_VERSION
 from .policy import evaluate_policy as run_policy_evaluation
 from .ports import CreditFileStore, DocumentStore, Extractor
@@ -65,6 +70,7 @@ class PipelineState(TypedDict, total=False):
     spread_id: str
     computation_pack_id: str
     policy_report_id: str
+    memo_id: str
 
 
 class CreditPipeline:
@@ -154,6 +160,12 @@ class CreditPipeline:
         report = self.evaluate_policy(state["credit_file_id"])
         return {"policy_report_id": report.report_id}
 
+    def _node_memo(self, state: PipelineState) -> PipelineState:
+        memo = self.compose_memo(
+            state["credit_file_id"], report_id=state["policy_report_id"]
+        )
+        return {"memo_id": memo.memo_id}
+
     def _build(self):  # noqa: ANN202 - compiled LangGraph app
         graph = StateGraph(PipelineState)
         graph.add_node("intake", self._node_intake)
@@ -163,6 +175,7 @@ class CreditPipeline:
         graph.add_node("spreading", self._node_spreading)
         graph.add_node("computation", self._node_computation)
         graph.add_node("policy", self._node_policy)
+        graph.add_node("memo", self._node_memo)
         graph.add_edge(START, "intake")
         graph.add_edge("intake", "checklist")
         graph.add_edge("checklist", "document_intake")
@@ -170,7 +183,8 @@ class CreditPipeline:
         graph.add_edge("extraction", "spreading")
         graph.add_edge("spreading", "computation")
         graph.add_edge("computation", "policy")
-        graph.add_edge("policy", END)
+        graph.add_edge("policy", "memo")
+        graph.add_edge("memo", END)
         return graph.compile()
 
     # -- public runs ---------------------------------------------------
@@ -367,6 +381,109 @@ class CreditPipeline:
             )
             self.store.save_credit_file(credit_file)
         return report
+
+    def compose_memo(
+        self,
+        credit_file_id: str,
+        *,
+        report_id: str | None = None,
+        pack_version: str | None = None,
+        profile: str = "offline",
+        global_pack: ComputationPack | None = None,
+    ) -> CreditMemo:
+        """Compose the draft credit memo for a file and store it.
+
+        The memo pins the artefacts it was composed from: the
+        policy report named by `report_id`, or evaluated under
+        `pack_version`, or — the default — the file's most recent
+        report (evaluating under the current version when none
+        exists yet); the computation pack that report read; the
+        spread that pack ran over. Composition runs the composer
+        profile's draft through the figure verifier: a draft with
+        an untraceable figure or a dropped policy exception raises
+        MemoVerificationError and is never stored. The stored memo
+        is content-addressed — composing over unchanged inputs
+        returns the stored artefact and audits only the first time.
+        """
+        credit_file = self._load(credit_file_id)
+        if report_id is not None:
+            report = self.store.get_policy_report(report_id)
+            if report is None or report.credit_file_id != credit_file_id:
+                raise NotFoundError(
+                    f"policy report {report_id} not found on credit "
+                    f"file {credit_file_id}"
+                )
+        elif pack_version is not None:
+            report = self.evaluate_policy(
+                credit_file_id,
+                pack_version=pack_version,
+                global_pack=global_pack,
+            )
+        else:
+            reports = self.store.list_policy_reports(credit_file_id)
+            report = (
+                reports[-1]
+                if reports
+                else self.evaluate_policy(
+                    credit_file_id, global_pack=global_pack
+                )
+            )
+        pack = self.store.get_computation_pack(report.computation_pack_id)
+        if pack is None:
+            raise NotFoundError(
+                f"computation pack {report.computation_pack_id} not found"
+            )
+        spread = next(
+            (
+                s
+                for s in self.store.list_spreads(credit_file_id)
+                if s.spread_id == pack.spread_id
+            ),
+            None,
+        ) or self.store.get_latest_spread(credit_file_id)
+        if spread is None:
+            raise NotFoundError(f"no spread on credit file {credit_file_id}")
+        global_artefact = global_pack
+        if global_artefact is None and report.global_pack_id:
+            global_artefact = self.store.get_computation_pack(
+                report.global_pack_id
+            )
+        memo = draft_memo(
+            credit_file,
+            spread,
+            pack,
+            report,
+            global_pack=global_artefact,
+            composer=get_composer(profile),
+        )
+        if self.store.get_memo(memo.memo_id) is not None:
+            return memo
+        self.store.save_memo(memo)
+        self._audit(
+            credit_file_id,
+            "memo_composed",
+            f"draft memo {memo.memo_id}: composed from spread "
+            f"{memo.spread_id}, computation pack {memo.computation_pack_id}, "
+            f"policy report {memo.policy_report_id} (pack "
+            f"{memo.policy_version}) by profile {memo.composer_profile}; "
+            f"{memo.verification.figure_count} figures traced, "
+            f"{len(memo.verification.exceptions_listed)} policy "
+            f"exceptions carried; status draft",
+        )
+        return memo
+
+    def get_memo(self, credit_file_id: str, memo_id: str) -> CreditMemo:
+        self._load(credit_file_id)
+        memo = self.store.get_memo(memo_id)
+        if memo is None or memo.credit_file_id != credit_file_id:
+            raise NotFoundError(
+                f"memo {memo_id} not found on credit file {credit_file_id}"
+            )
+        return memo
+
+    def list_memos(self, credit_file_id: str) -> list[CreditMemo]:
+        self._load(credit_file_id)
+        return self.store.list_memos(credit_file_id)
 
     def add_adjustment(
         self, credit_file_id: str, adjustment: SpreadAdjustment

@@ -43,6 +43,7 @@ from .models import (
     Spread,
     SpreadAdjustment,
 )
+from .memo import render_memo
 from .pipeline import CreditPipeline
 from .policy import get_policy_pack, list_policy_packs
 from .seed import ReferenceLosFeed
@@ -368,3 +369,49 @@ def get_policy_report(credit_file_id: str, report_id: str) -> dict:
     if report is None or report.credit_file_id != credit_file_id:
         raise NotFoundError(f"policy report {report_id} not found")
     return report.model_dump(mode="json")
+
+
+class ComposeMemoRequest(BaseModel):
+    report_id: str | None = None
+    pack_version: str | None = None
+    profile: str = "offline"
+
+
+@app.post("/applications/{credit_file_id}/memos", status_code=201)
+def compose_memo(credit_file_id: str, body: ComposeMemoRequest) -> dict:
+    _file_or_404(credit_file_id)
+    memo = pipeline.compose_memo(
+        credit_file_id,
+        report_id=body.report_id,
+        pack_version=body.pack_version,
+        profile=body.profile,
+    )
+    return memo.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/memos")
+def list_memos(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return [
+        m.model_dump(mode="json") for m in store.list_memos(credit_file_id)
+    ]
+
+
+@app.get("/applications/{credit_file_id}/memos/{memo_id}")
+def get_memo(credit_file_id: str, memo_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    return pipeline.get_memo(credit_file_id, memo_id).model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/memos/{memo_id}/verification")
+def get_memo_verification(credit_file_id: str, memo_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    memo = pipeline.get_memo(credit_file_id, memo_id)
+    return memo.verification.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/memos/{memo_id}/text")
+def get_memo_text(credit_file_id: str, memo_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    memo = pipeline.get_memo(credit_file_id, memo_id)
+    return {"memo_id": memo.memo_id, "text": render_memo(memo)}
