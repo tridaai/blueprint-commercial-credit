@@ -317,11 +317,23 @@ def build_trace_universe(inputs: MemoInputs) -> dict[Decimal, str]:
 
 
 def _render_header(memo: CreditMemo) -> str:
+    if memo.status == "officer_approved":
+        title = "CREDIT MEMORANDUM — OFFICER APPROVED"
+        status_line = "Status: officer approved — committee-ready"
+    elif memo.status == "returned":
+        title = "CREDIT MEMORANDUM — DRAFT"
+        status_line = "Status: returned for rework by the credit officer"
+    elif memo.status == "in_officer_review":
+        title = "CREDIT MEMORANDUM — DRAFT"
+        status_line = "Status: in credit officer review"
+    else:
+        title = "CREDIT MEMORANDUM — DRAFT"
+        status_line = "Status: draft — awaiting credit officer review"
     lines = [
-        "CREDIT MEMORANDUM — DRAFT",
+        title,
         f"Borrower: {memo.borrower_name}",
         f"Facility: {memo.facility_type.replace('_', ' ')}",
-        "Status: draft — awaiting credit officer review",
+        status_line,
         f"As of: {memo.as_of.isoformat()}",
         f"Spread: `{memo.spread_id}`",
         f"Computation pack: `{memo.computation_pack_id}`",
@@ -333,6 +345,12 @@ def _render_header(memo: CreditMemo) -> str:
         f"(pack `{memo.policy_pack_id}`, version `{memo.policy_version}`)",
         f"Drafted by profile: {memo.composer_profile}",
     ]
+    if memo.supersedes_memo_id:
+        lines.append(f"Supersedes: `{memo.supersedes_memo_id}`")
+    if memo.reviewed_by:
+        # Code-spanned like every artefact id: an identifier, not
+        # a figure, and never read as one by the verifier.
+        lines.append(f"Reviewed by: `{memo.reviewed_by}`")
     return "\n".join(lines)
 
 

@@ -10,8 +10,12 @@ the auditable spine of the deployment, so the same compiled graph
 serves the API, the demo and the evals. The memo node drafts the
 credit memo and runs the figure verifier over it — a memo that
 cannot be fully traced is refused, and the refusal fails the run
-rather than storing a bad draft. The two human gates join this
-graph in their rounds — as interrupts, where a person decides.
+rather than storing a bad draft. The human gates act on the
+stored memo rather than inside the intake graph: the credit
+officer gate (round 6) is the workflow at the bottom of this
+module — named-officer review over the draft, edits re-verified,
+returns coded, diffs recorded — and the committee gate joins it
+in round 7.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ from .computations import (
     compute_global_pack,
 )
 from .documents import read_document_verified, register_document
-from .errors import NotFoundError
+from .errors import NotFoundError, ValidationError
 from .extraction import OfflineReferenceExtractor, receive_extraction
 from .models import (
     AuditEvent,
@@ -43,14 +47,34 @@ from .models import (
     Elimination,
     ExtractedValue,
     FacilityRequest,
+    MemoCommitteeFlag,
+    MemoDiff,
+    MemoReviewEvent,
+    MemoVerification,
     PolicyHistoryEntry,
     PolicyReport,
     Spread,
     SpreadAdjustment,
     new_id,
+    utcnow,
 )
+from .memo import MemoInputs, _canonical_hash, verify_memo
 from .memo import compose_memo as draft_memo
 from .memo import get_composer
+from .officer_gate import (
+    FLAG_KINDS,
+    RETURN_REASONS_VERSION,
+    STATUS_APPROVED,
+    STATUS_DRAFT,
+    STATUS_IN_REVIEW,
+    STATUS_RETURNED,
+    apply_edits,
+    compute_memo_diff,
+    derive_status,
+    require_identity,
+    require_officer,
+    validate_return_reasons,
+)
 from .policy import CURRENT_POLICY_VERSION
 from .policy import evaluate_policy as run_policy_evaluation
 from .ports import CreditFileStore, DocumentStore, Extractor
@@ -472,7 +496,10 @@ class CreditPipeline:
         )
         return memo
 
-    def get_memo(self, credit_file_id: str, memo_id: str) -> CreditMemo:
+    def _get_memo_raw(self, credit_file_id: str, memo_id: str) -> CreditMemo:
+        """The stored artefact, exactly as stored — no status
+        overlay. The gate works on artefacts; readers get the
+        derived review status via get_memo / list_memos."""
         self._load(credit_file_id)
         memo = self.store.get_memo(memo_id)
         if memo is None or memo.credit_file_id != credit_file_id:
@@ -481,9 +508,514 @@ class CreditPipeline:
             )
         return memo
 
+    def _status_of(self, memo: CreditMemo) -> str:
+        events = self.store.list_memo_review_events(
+            memo.credit_file_id, memo.memo_id
+        )
+        return derive_status(memo, events)
+
+    def _with_status(self, memo: CreditMemo) -> CreditMemo:
+        return memo.model_copy(update={"status": self._status_of(memo)})
+
+    def get_memo(self, credit_file_id: str, memo_id: str) -> CreditMemo:
+        return self._with_status(self._get_memo_raw(credit_file_id, memo_id))
+
     def list_memos(self, credit_file_id: str) -> list[CreditMemo]:
         self._load(credit_file_id)
-        return self.store.list_memos(credit_file_id)
+        return [
+            self._with_status(memo)
+            for memo in self.store.list_memos(credit_file_id)
+        ]
+
+    def memo_status(self, credit_file_id: str, memo_id: str) -> str:
+        """A memo's derived review status (officer gate, round 6)."""
+        return self._status_of(self._get_memo_raw(credit_file_id, memo_id))
+
+    # -- the credit officer gate (round 6) ---------------------------
+    def _memo_inputs(self, memo: CreditMemo) -> MemoInputs:
+        """The artefacts a memo pins, loaded back from the store —
+        the inputs its edits are re-verified against."""
+        credit_file = self._load(memo.credit_file_id)
+        report = self.store.get_policy_report(memo.policy_report_id)
+        if report is None:
+            raise NotFoundError(
+                f"policy report {memo.policy_report_id} not found"
+            )
+        pack = self.store.get_computation_pack(memo.computation_pack_id)
+        if pack is None:
+            raise NotFoundError(
+                f"computation pack {memo.computation_pack_id} not found"
+            )
+        spread = next(
+            (
+                s
+                for s in self.store.list_spreads(memo.credit_file_id)
+                if s.spread_id == memo.spread_id
+            ),
+            None,
+        ) or self.store.get_latest_spread(memo.credit_file_id)
+        if spread is None:
+            raise NotFoundError(
+                f"no spread on credit file {memo.credit_file_id}"
+            )
+        global_pack = (
+            self.store.get_computation_pack(memo.global_pack_id)
+            if memo.global_pack_id
+            else None
+        )
+        return MemoInputs(
+            credit_file=credit_file,
+            spread=spread,
+            pack=pack,
+            policy_report=report,
+            global_pack=global_pack,
+        )
+
+    def _record_review_event(self, event: MemoReviewEvent) -> MemoReviewEvent:
+        self.store.save_memo_review_event(event)
+        return event
+
+    def submit_memo_for_review(
+        self,
+        credit_file_id: str,
+        memo_id: str,
+        *,
+        actor: str,
+        actor_role: str,
+    ) -> CreditMemo:
+        """Open the officer review of a draft memo.
+
+        Any named actor may submit (the relationship manager who
+        prepared the file, say); deciding is reserved to officers.
+        A memo that is not a draft — already in review, returned,
+        approved — cannot be submitted again.
+        """
+        require_identity(actor, actor_role, what="submission for review")
+        memo = self._get_memo_raw(credit_file_id, memo_id)
+        status = self._status_of(memo)
+        if status != STATUS_DRAFT:
+            raise ValidationError(
+                f"memo {memo_id} is {status}; only a draft can be "
+                "submitted for officer review"
+            )
+        self._record_review_event(MemoReviewEvent(
+            credit_file_id=credit_file_id,
+            memo_id=memo_id,
+            action="submitted_for_review",
+            actor_id=actor,
+            actor_role=actor_role,
+        ))
+        self._audit(
+            credit_file_id,
+            "memo_submitted_for_review",
+            f"draft memo {memo_id} submitted for credit officer "
+            f"review by {actor} ({actor_role})",
+            actor=actor,
+        )
+        return self.get_memo(credit_file_id, memo_id)
+
+    def approve_memo(
+        self,
+        credit_file_id: str,
+        memo_id: str,
+        *,
+        officer_id: str,
+        officer_role: str,
+        edits: dict[str, list[str]] | None = None,
+        note: str = "",
+    ) -> CreditMemo:
+        """The officer's approval: as-is, or with paragraph edits.
+
+        Approval mints the officer-final memo — a new artefact
+        that supersedes the draft, names the approving officer and
+        carries the memo's committee flags — plus a MemoDiff
+        recording exactly what changed. Edited text faces the
+        figure verifier over the full memo before anything is
+        stored: one untraceable figure, or an exceptions section
+        that no longer accounts for the pinned report, refuses
+        the approval and stores nothing. An officer who declared
+        a conflict of interest on this memo cannot approve it.
+        """
+        require_officer(officer_id, officer_role, what="an approval")
+        memo = self._get_memo_raw(credit_file_id, memo_id)
+        status = self._status_of(memo)
+        if status != STATUS_IN_REVIEW:
+            raise ValidationError(
+                f"memo {memo_id} is {status}; only a memo in "
+                "officer review can be approved"
+            )
+        events = self.store.list_memo_review_events(credit_file_id, memo_id)
+        own_conflict = next(
+            (
+                e.flag
+                for e in events
+                if e.action == "flagged"
+                and e.flag is not None
+                and e.flag.kind == "conflict_of_interest"
+                and e.flag.officer_id == officer_id
+            ),
+            None,
+        )
+        if own_conflict is not None:
+            raise ValidationError(
+                f"officer {officer_id} recorded a conflict of "
+                f"interest on memo {memo_id} (flag "
+                f"{own_conflict.flag_id}); the memo must be "
+                "approved by a different officer"
+            )
+        edits = dict(edits or {})
+        sections = (
+            apply_edits(memo, edits)
+            if edits
+            else [s.model_copy(deep=True) for s in memo.sections]
+        )
+        flags = [
+            e.flag for e in events if e.action == "flagged" and e.flag
+        ]
+        candidate = memo.model_copy(update={
+            "memo_id": "memo-pending",
+            "status": STATUS_APPROVED,
+            "sections": sections,
+            "supersedes_memo_id": memo.memo_id,
+            "reviewed_by": officer_id,
+            "committee_flags": flags,
+            "verification": MemoVerification(
+                composer_profile=memo.composer_profile, figure_count=0
+            ),
+            "created_at": utcnow(),
+        })
+        # The verifier decides — over the final rendered text,
+        # exactly as it decided for the draft. A refusal raises
+        # MemoVerificationError and nothing below runs.
+        verification = verify_memo(candidate, self._memo_inputs(memo))
+        descriptor = {
+            "supersedes_memo_id": memo.memo_id,
+            "reviewed_by": officer_id,
+            "credit_file_id": candidate.credit_file_id,
+            "spread_id": candidate.spread_id,
+            "computation_pack_id": candidate.computation_pack_id,
+            "global_pack_id": candidate.global_pack_id,
+            "policy_report_id": candidate.policy_report_id,
+            "composer_profile": candidate.composer_profile,
+            "sections": [s.model_dump(mode="json") for s in sections],
+            "verification": verification.model_dump(mode="json"),
+        }
+        final = candidate.model_copy(update={
+            "memo_id": f"memo-{_canonical_hash(descriptor)[:16]}",
+            "verification": verification,
+        })
+        action = "approved_with_edits" if edits else "approved_as_is"
+        diff = compute_memo_diff(
+            memo,
+            final,
+            officer_id=officer_id,
+            officer_role=officer_role,
+            action=action,
+            note=note,
+        )
+        self.store.save_memo(final)
+        self.store.save_memo_diff(diff)
+        self._record_review_event(MemoReviewEvent(
+            credit_file_id=credit_file_id,
+            memo_id=memo_id,
+            action=action,
+            actor_id=officer_id,
+            actor_role=officer_role,
+            resulting_memo_id=final.memo_id,
+            note=note,
+        ))
+        self._audit(
+            credit_file_id,
+            "memo_approved",
+            f"memo {memo_id} {action.replace('_', ' ')} by "
+            f"{officer_id} ({officer_role}); officer-final memo "
+            f"{final.memo_id}, diff {diff.diff_id}: "
+            f"{len(diff.section_changes)} section(s) and "
+            f"{len(diff.figure_changes)} figure(s) changed",
+            actor=officer_id,
+        )
+        return final
+
+    def return_memo(
+        self,
+        credit_file_id: str,
+        memo_id: str,
+        *,
+        officer_id: str,
+        officer_role: str,
+        reason_codes: list[str],
+        note: str = "",
+    ) -> CreditMemo:
+        """Return a memo in review for rework, with coded reasons.
+
+        The codes come from the versioned return vocabulary; the
+        version is recorded on the event, so a later vocabulary
+        change never reinterprets this return. A returned memo
+        cannot be approved — it must be recomposed into a new
+        draft (see recompose_memo).
+        """
+        require_officer(officer_id, officer_role, what="a return for rework")
+        memo = self._get_memo_raw(credit_file_id, memo_id)
+        status = self._status_of(memo)
+        if status != STATUS_IN_REVIEW:
+            raise ValidationError(
+                f"memo {memo_id} is {status}; only a memo in "
+                "officer review can be returned"
+            )
+        validate_return_reasons(reason_codes, note)
+        self._record_review_event(MemoReviewEvent(
+            credit_file_id=credit_file_id,
+            memo_id=memo_id,
+            action="returned_for_rework",
+            actor_id=officer_id,
+            actor_role=officer_role,
+            reason_codes=list(reason_codes),
+            reason_vocabulary=RETURN_REASONS_VERSION,
+            note=note,
+        ))
+        self._audit(
+            credit_file_id,
+            "memo_returned_for_rework",
+            f"memo {memo_id} returned for rework by {officer_id} "
+            f"({officer_role}); reasons ({RETURN_REASONS_VERSION}): "
+            f"{', '.join(reason_codes)}",
+            actor=officer_id,
+        )
+        return self.get_memo(credit_file_id, memo_id)
+
+    def flag_memo(
+        self,
+        credit_file_id: str,
+        memo_id: str,
+        *,
+        officer_id: str,
+        officer_role: str,
+        kind: str,
+        section_key: str | None = None,
+        note: str = "",
+    ) -> MemoReviewEvent:
+        """Flag an item on a memo in review for the committee, or
+        declare a conflict of interest on it.
+
+        Flags do not move the memo's status. Committee-attention
+        flags are carried onto the officer-final memo at approval;
+        a conflict-of-interest flag bars the flagging officer from
+        approving the memo (approve_memo enforces it).
+        """
+        require_officer(officer_id, officer_role, what="a flag")
+        if kind not in FLAG_KINDS:
+            raise ValidationError(
+                f"unknown flag kind {kind!r}; kinds are "
+                f"{sorted(FLAG_KINDS)}"
+            )
+        memo = self._get_memo_raw(credit_file_id, memo_id)
+        status = self._status_of(memo)
+        if status != STATUS_IN_REVIEW:
+            raise ValidationError(
+                f"memo {memo_id} is {status}; only a memo in "
+                "officer review can be flagged"
+            )
+        if section_key is not None and memo.section(section_key) is None:
+            raise ValidationError(
+                f"flag names section {section_key!r}, which memo "
+                f"{memo_id} does not have"
+            )
+        flag = MemoCommitteeFlag(
+            flag_id=new_id("flag"),
+            kind=kind,
+            section_key=section_key,
+            note=note,
+            officer_id=officer_id,
+            officer_role=officer_role,
+        )
+        event = self._record_review_event(MemoReviewEvent(
+            credit_file_id=credit_file_id,
+            memo_id=memo_id,
+            action="flagged",
+            actor_id=officer_id,
+            actor_role=officer_role,
+            flag=flag,
+            note=note,
+        ))
+        self._audit(
+            credit_file_id,
+            "memo_flagged",
+            f"memo {memo_id} flagged {kind} by {officer_id} "
+            f"({officer_role})"
+            + (f" on section {section_key}" if section_key else "")
+            + (f": {note}" if note else ""),
+            actor=officer_id,
+        )
+        return event
+
+    def recompose_memo(
+        self,
+        credit_file_id: str,
+        *,
+        supersedes_memo_id: str,
+        actor: str,
+        actor_role: str,
+    ) -> CreditMemo:
+        """Recompose a returned memo into a NEW draft version.
+
+        The new draft is composed from the file's current pinned
+        artefacts (latest policy report and the pack and spread it
+        read), names the returned memo it supersedes, and starts
+        its own review life as a draft. The returned memo itself
+        is never reopened or edited.
+        """
+        require_identity(actor, actor_role, what="recomposition")
+        old = self._get_memo_raw(credit_file_id, supersedes_memo_id)
+        status = self._status_of(old)
+        if status != STATUS_RETURNED:
+            raise ValidationError(
+                f"memo {supersedes_memo_id} is {status}; only a "
+                "returned memo is recomposed"
+            )
+        credit_file = self._load(credit_file_id)
+        reports = self.store.list_policy_reports(credit_file_id)
+        report = (
+            reports[-1]
+            if reports
+            else self.evaluate_policy(credit_file_id)
+        )
+        pack = self.store.get_computation_pack(report.computation_pack_id)
+        if pack is None:
+            raise NotFoundError(
+                f"computation pack {report.computation_pack_id} not found"
+            )
+        spread = next(
+            (
+                s
+                for s in self.store.list_spreads(credit_file_id)
+                if s.spread_id == pack.spread_id
+            ),
+            None,
+        ) or self.store.get_latest_spread(credit_file_id)
+        if spread is None:
+            raise NotFoundError(f"no spread on credit file {credit_file_id}")
+        global_pack = (
+            self.store.get_computation_pack(report.global_pack_id)
+            if report.global_pack_id
+            else None
+        )
+        composed = draft_memo(
+            credit_file,
+            spread,
+            pack,
+            report,
+            global_pack=global_pack,
+            composer=get_composer(old.composer_profile),
+        )
+        sequence = 1 + sum(
+            1
+            for m in self.store.list_memos(credit_file_id)
+            if m.supersedes_memo_id == old.memo_id and m.status == STATUS_DRAFT
+        )
+        descriptor = {
+            "recomposes_memo_id": old.memo_id,
+            "sequence": sequence,
+            "credit_file_id": composed.credit_file_id,
+            "spread_id": composed.spread_id,
+            "computation_pack_id": composed.computation_pack_id,
+            "global_pack_id": composed.global_pack_id,
+            "policy_report_id": composed.policy_report_id,
+            "composer_profile": composed.composer_profile,
+            "sections": [s.model_dump(mode="json") for s in composed.sections],
+            "verification": composed.verification.model_dump(mode="json"),
+        }
+        draft = composed.model_copy(update={
+            "memo_id": f"memo-{_canonical_hash(descriptor)[:16]}",
+            "supersedes_memo_id": old.memo_id,
+            "created_at": utcnow(),
+        })
+        self.store.save_memo(draft)
+        self._record_review_event(MemoReviewEvent(
+            credit_file_id=credit_file_id,
+            memo_id=draft.memo_id,
+            action="recomposed",
+            actor_id=actor,
+            actor_role=actor_role,
+            note=f"recomposition of returned memo {old.memo_id}",
+        ))
+        self._audit(
+            credit_file_id,
+            "memo_recomposed",
+            f"returned memo {old.memo_id} recomposed into draft "
+            f"{draft.memo_id} by {actor} ({actor_role})",
+            actor=actor,
+        )
+        return draft
+
+    def get_memo_diff(self, credit_file_id: str, memo_id: str) -> MemoDiff:
+        """The diff recorded when `memo_id` was approved — the
+        draft-vs-final record of its officer gate."""
+        self._get_memo_raw(credit_file_id, memo_id)
+        diff = self.store.get_memo_diff_by_final(memo_id)
+        if diff is None or diff.credit_file_id != credit_file_id:
+            raise NotFoundError(
+                f"no officer diff recorded for memo {memo_id}"
+            )
+        return diff
+
+    def memo_history(self, credit_file_id: str, memo_id: str) -> dict:
+        """A memo's version lineage and its review events.
+
+        Versions: the chain of memo artefacts containing this one
+        (the memo it supersedes, up to the root draft, and every
+        artefact that supersedes it in turn), each with its
+        derived review status. Events: the gate actions recorded
+        on this memo, in order. Diff: the approval diff, when this
+        memo is an officer-final artefact.
+        """
+        memo = self._get_memo_raw(credit_file_id, memo_id)
+        all_memos = self.store.list_memos(credit_file_id)
+        by_id = {m.memo_id: m for m in all_memos}
+        root = memo
+        seen: set[str] = set()
+        while (
+            root.supersedes_memo_id
+            and root.supersedes_memo_id in by_id
+            and root.supersedes_memo_id not in seen
+        ):
+            seen.add(root.memo_id)
+            root = by_id[root.supersedes_memo_id]
+        chain = {root.memo_id}
+        frontier = [root.memo_id]
+        while frontier:
+            nxt = [
+                m.memo_id
+                for m in all_memos
+                if m.supersedes_memo_id in frontier
+                and m.memo_id not in chain
+            ]
+            chain.update(nxt)
+            frontier = nxt
+        versions = [
+            {
+                "memo_id": m.memo_id,
+                "status": self._status_of(m),
+                "supersedes_memo_id": m.supersedes_memo_id,
+                "reviewed_by": m.reviewed_by,
+                "composer_profile": m.composer_profile,
+                "created_at": m.created_at,
+            }
+            for m in all_memos
+            if m.memo_id in chain
+        ]
+        events = self.store.list_memo_review_events(credit_file_id, memo_id)
+        diff = self.store.get_memo_diff_by_final(memo_id)
+        return {
+            "memo_id": memo_id,
+            "status": self._status_of(memo),
+            "versions": versions,
+            "events": events,
+            "diff": (
+                diff
+                if diff is not None and diff.credit_file_id == credit_file_id
+                else None
+            ),
+        }
 
     def add_adjustment(
         self, credit_file_id: str, adjustment: SpreadAdjustment
@@ -513,11 +1045,18 @@ class CreditPipeline:
             raise NotFoundError(f"credit file {credit_file_id} not found")
         return credit_file
 
-    def _audit(self, credit_file_id: str, action: str, detail: str) -> None:
+    def _audit(
+        self,
+        credit_file_id: str,
+        action: str,
+        detail: str,
+        *,
+        actor: str | None = None,
+    ) -> None:
         self.store.append_audit(
             AuditEvent(
                 credit_file_id=credit_file_id,
-                actor=self.actor,
+                actor=actor or self.actor,
                 action=action,
                 detail=detail,
             )
