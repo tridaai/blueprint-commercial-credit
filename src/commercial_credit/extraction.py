@@ -18,8 +18,10 @@ from __future__ import annotations
 import json
 from decimal import Decimal, InvalidOperation
 
+from .disagreements import SOURCE_TAX, source_type_for_document
 from .errors import ProvenanceError
 from .models import (
+    DocumentKind,
     ExtractedValue,
     Provenance,
     SourceDocument,
@@ -91,8 +93,23 @@ class OfflineReferenceExtractor:
             payload = json.loads(content.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return []
-        if payload.get("document_type") != "financial_statement":
+        if payload.get("document_type") not in ("financial_statement", "tax_return"):
             return []
+        # Round 8: every value is stamped with the kind of source
+        # it was read from — the audited statements, the tax
+        # return, or the management statements. The stamp is what
+        # lets the spreading engine hold the sources apart: values
+        # from different kinds never supersede each other, and
+        # where they differ the spread records the disagreement.
+        if (
+            document.kind == DocumentKind.TAX_RETURN
+            or payload.get("document_type") == "tax_return"
+        ):
+            source_type = SOURCE_TAX
+        else:
+            source_type = source_type_for_document(
+                document.kind.value, payload.get("basis")
+            )
         period_label = payload.get("period_label") or document.period_label or ""
         fiscal_year = payload.get("fiscal_year")
         values: list[ExtractedValue] = []
@@ -119,6 +136,7 @@ class OfflineReferenceExtractor:
                             line=f"L{int(line['line'])}",
                         ),
                         source_label=label,
+                        source_type=source_type,
                     )
                 )
         require_complete_provenance(values)
