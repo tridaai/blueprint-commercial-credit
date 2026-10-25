@@ -71,11 +71,39 @@ hangs on:
   and `/readiness`** — the readiness payload names the live store
   profile so a test double is never mistaken for the real store.
 
-Later rounds add the spreading engine, the deterministic ratio and
-covenant computation engine, the versioned policy pack, cited memo
-drafting with a figure verifier, the credit-officer and committee
-gates with coded adverse-action reasons, and the covenant monitoring
-loop. The round map is in `docs/architecture.md`.
+## What round 2 adds
+
+The spreading engine — the deterministic heart of the workflow:
+
+- **The bank's template as data** — a standard line taxonomy for the
+  balance sheet, income statement and cash-flow statement
+  (`spreading.py`); every extracted value is mapped onto its template
+  line by field, across all periods at once.
+- **Unmapped lines are carried, never dropped** — a statement line
+  the taxonomy does not map enters the spread as a named unmapped
+  entry, with its values and provenance, instead of vanishing or
+  being silently folded into a line it does not belong to.
+- **Multi-period spreads** — FY2022–FY2024 for the sample borrower,
+  built end to end from the round-1 extractions, with
+  period-over-period change data per line. Money is Decimal
+  throughout, and the build is deterministic: the same extractions
+  and adjustments rebuild the same spread byte for byte, under the
+  same content-derived spread id.
+- **Adjustments as first-class records** — an add-back names the
+  spread line and period, its amount, a coded reason *and* a
+  free-text reason, the document provenance that justifies it, and
+  who proposed it. An adjustment missing any of those is rejected.
+  The unadjusted view is never touched; the adjusted view is derived.
+- **Restatements supersede cleanly** — when a corrected statement
+  version is filed for a period, the spread for that period rests on
+  the new version and records it (document, SHA-256, version number);
+  the superseded extraction stays in the store, retrievable.
+
+Later rounds add the deterministic ratio and covenant computation
+engine, the versioned policy pack, cited memo drafting with a figure
+verifier, the credit-officer and committee gates with coded
+adverse-action reasons, and the covenant monitoring loop. The round
+map is in `docs/architecture.md`.
 
 ## The laws (enforced in code, never in prompts)
 

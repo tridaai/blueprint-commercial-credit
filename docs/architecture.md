@@ -3,17 +3,16 @@
 ## Shape
 
 ```
-LOS ──► intake ──► checklist ──► document intake ──► extraction ──► [later rounds:
-        (LangGraph pipeline)        (S3 port,          (port: values    spreading →
-                                     SHA-256 recorded)   + provenance)   computation →
-                                                                          policy → memo →
+LOS ──► intake ──► checklist ──► document intake ──► extraction ──► spreading ──► [later rounds:
+        (LangGraph pipeline)        (S3 port,          (port: values    (template,     computation →
+                                     SHA-256 recorded)   + provenance)   adjustments)   policy → memo →
                                                                           officer gate →
                                                                           committee gate →
                                                                           covenant loop]
 ```
 
-The pipeline is a LangGraph graph (`pipeline.py`). Round 1 wires the
-first four nodes end to end; later rounds extend the graph to the
+The pipeline is a LangGraph graph (`pipeline.py`). Rounds 1–2 wire
+the first five nodes end to end; later rounds extend the graph to the
 right, with the two human gates as graph interrupts. The same
 compiled graph serves the API, the demo and the evals — there is one
 spine, not three near-copies.
@@ -54,6 +53,23 @@ credit file. Reads go through `read_document_verified`, which
 re-hashes the stored bytes and raises `DocumentIntegrityError` on a
 mismatch. The digest lives in the system of record, the bytes in
 object storage; neither alone can quietly rewrite history.
+
+## Spreading (round 2)
+
+`spreading.py` holds the bank's template as data — a line taxonomy
+over the balance-sheet, income-statement and cash-flow sections, each
+line keyed to the extraction field that feeds it — and a pure builder
+that turns a credit file's extractions + adjustments into a `Spread`.
+Determinism is a design constraint, not a hope: inputs are canonically
+sorted, the spread carries no timestamps or random ids, and its id is
+a hash of its canonical content, so rebuilds converge byte-identically
+(the eval gate rebuilds and compares). Within a period, the latest
+filed statement version supplies every value; earlier versions are
+named in `period_sources.superseded_document_ids` and their
+extractions remain in the store. Adjustments are validated on receipt
+(`require_valid_adjustment` + taxonomy membership) before they are
+stored, and the spread carries both the unadjusted values and the
+derived adjusted view per line and period.
 
 ## Storage
 
