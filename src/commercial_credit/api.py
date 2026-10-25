@@ -3,8 +3,9 @@
 Round 1 surface: health/readiness, application intake (LOS reference
 or inline borrower + facility), the generated checklist, document
 registration with hash recording, verified reads, the extraction
-pass, and the audit trail. Every request carries a request id into
-the structured logs.
+pass, and the audit trail. Round 2 adds the spread: the multi-period
+spread for a credit file, its adjustments, and the adjusted view.
+Every request carries a request id into the structured logs.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import base64
 import binascii
 import logging
 import uuid
+from decimal import Decimal
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -22,7 +24,14 @@ from .config import load_settings
 from .documents import read_document_verified, register_document
 from .errors import CreditError, NotFoundError, ValidationError
 from .logging_setup import configure_logging, request_id_var
-from .models import Borrower, DocumentKind, FacilityRequest
+from .models import (
+    AdjustmentReasonCode,
+    Borrower,
+    DocumentKind,
+    FacilityRequest,
+    Provenance,
+    SpreadAdjustment,
+)
 from .pipeline import CreditPipeline
 from .seed import ReferenceLosFeed
 from .wiring import build_pipeline
@@ -181,3 +190,48 @@ def extract(credit_file_id: str) -> dict:
 def get_audit(credit_file_id: str) -> list[dict]:
     _file_or_404(credit_file_id)
     return [e.model_dump(mode="json") for e in store.list_audit(credit_file_id)]
+
+
+class AddAdjustmentRequest(BaseModel):
+    line_key: str
+    fiscal_year: int
+    amount: Decimal
+    reason_code: AdjustmentReasonCode
+    reason: str
+    source: Provenance
+    proposed_by: str
+
+
+@app.get("/applications/{credit_file_id}/spread")
+def get_spread(credit_file_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    spread = pipeline.get_spread(credit_file_id)
+    return spread.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/adjustments")
+def list_adjustments(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return [
+        a.model_dump(mode="json") for a in store.list_adjustments(credit_file_id)
+    ]
+
+
+@app.post("/applications/{credit_file_id}/adjustments", status_code=201)
+def add_adjustment(credit_file_id: str, body: AddAdjustmentRequest) -> dict:
+    _file_or_404(credit_file_id)
+    adjustment = SpreadAdjustment(
+        credit_file_id=credit_file_id,
+        line_key=body.line_key,
+        fiscal_year=body.fiscal_year,
+        amount=body.amount,
+        reason_code=body.reason_code,
+        reason=body.reason,
+        source=body.source,
+        proposed_by=body.proposed_by,
+    )
+    spread = pipeline.add_adjustment(credit_file_id, adjustment)
+    return {
+        "adjustment": adjustment.model_dump(mode="json"),
+        "spread": spread.model_dump(mode="json"),
+    }
