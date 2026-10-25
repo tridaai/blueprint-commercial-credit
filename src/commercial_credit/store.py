@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 
 from .errors import StoreUnavailableError
-from .models import AuditEvent, CreditFile, ExtractedValue
+from .models import AuditEvent, CreditFile, ExtractedValue, Spread, SpreadAdjustment
 
 
 class InMemoryCreditStore:
@@ -22,6 +22,9 @@ class InMemoryCreditStore:
         self._files: dict[str, CreditFile] = {}
         self._extractions: dict[str, list[ExtractedValue]] = {}
         self._audit: dict[str, list[AuditEvent]] = {}
+        self._adjustments: dict[str, list[SpreadAdjustment]] = {}
+        self._spreads: dict[str, dict[str, Spread]] = {}
+        self._spread_order: dict[str, list[str]] = {}
 
     def save_credit_file(self, credit_file: CreditFile) -> None:
         self._files[credit_file.credit_file_id] = credit_file.model_copy(deep=True)
@@ -45,6 +48,38 @@ class InMemoryCreditStore:
     def list_audit(self, credit_file_id: str) -> list[AuditEvent]:
         return list(self._audit.get(credit_file_id, []))
 
+    def save_adjustment(self, adjustment: SpreadAdjustment) -> None:
+        self._adjustments.setdefault(adjustment.credit_file_id, []).append(
+            adjustment.model_copy(deep=True)
+        )
+
+    def list_adjustments(self, credit_file_id: str) -> list[SpreadAdjustment]:
+        return [
+            a.model_copy(deep=True) for a in self._adjustments.get(credit_file_id, [])
+        ]
+
+    def save_spread(self, spread: Spread) -> None:
+        by_id = self._spreads.setdefault(spread.credit_file_id, {})
+        if spread.spread_id not in by_id:
+            self._spread_order.setdefault(spread.credit_file_id, []).append(
+                spread.spread_id
+            )
+        by_id[spread.spread_id] = spread.model_copy(deep=True)
+
+    def get_latest_spread(self, credit_file_id: str) -> Spread | None:
+        order = self._spread_order.get(credit_file_id, [])
+        if not order:
+            return None
+        spread = self._spreads[credit_file_id][order[-1]]
+        return spread.model_copy(deep=True)
+
+    def list_spreads(self, credit_file_id: str) -> list[Spread]:
+        by_id = self._spreads.get(credit_file_id, {})
+        return [
+            by_id[spread_id].model_copy(deep=True)
+            for spread_id in self._spread_order.get(credit_file_id, [])
+        ]
+
     def ping(self) -> bool:
         return True
 
@@ -67,6 +102,12 @@ class SqliteCreditStore:
                 credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS audit_events (
                 event_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS adjustments (
+                adjustment_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS spreads (
+                spread_id TEXT PRIMARY KEY,
                 credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
             """
         )
@@ -118,6 +159,47 @@ class SqliteCreditStore:
             (credit_file_id,),
         ).fetchall()
         return [AuditEvent.model_validate_json(r[0]) for r in rows]
+
+    def save_adjustment(self, adjustment: SpreadAdjustment) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO adjustments (adjustment_id, credit_file_id, payload) VALUES (?, ?, ?) "
+                "ON CONFLICT(adjustment_id) DO NOTHING",
+                (
+                    adjustment.adjustment_id,
+                    adjustment.credit_file_id,
+                    adjustment.model_dump_json(),
+                ),
+            )
+
+    def list_adjustments(self, credit_file_id: str) -> list[SpreadAdjustment]:
+        rows = self._conn.execute(
+            "SELECT payload FROM adjustments WHERE credit_file_id = ? ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [SpreadAdjustment.model_validate_json(r[0]) for r in rows]
+
+    def save_spread(self, spread: Spread) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO spreads (spread_id, credit_file_id, payload) VALUES (?, ?, ?) "
+                "ON CONFLICT(spread_id) DO UPDATE SET payload = excluded.payload",
+                (spread.spread_id, spread.credit_file_id, spread.model_dump_json()),
+            )
+
+    def get_latest_spread(self, credit_file_id: str) -> Spread | None:
+        row = self._conn.execute(
+            "SELECT payload FROM spreads WHERE credit_file_id = ? ORDER BY rowid DESC LIMIT 1",
+            (credit_file_id,),
+        ).fetchone()
+        return Spread.model_validate_json(row[0]) if row else None
+
+    def list_spreads(self, credit_file_id: str) -> list[Spread]:
+        rows = self._conn.execute(
+            "SELECT payload FROM spreads WHERE credit_file_id = ? ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [Spread.model_validate_json(r[0]) for r in rows]
 
     def ping(self) -> bool:
         try:
@@ -236,6 +318,73 @@ class PostgresCreditStore:
             payload = row["payload"]
             out.append(
                 AuditEvent.model_validate(
+                    payload if isinstance(payload, dict) else json.loads(payload)
+                )
+            )
+        return out
+
+    def save_adjustment(self, adjustment: SpreadAdjustment) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO adjustments (adjustment_id, credit_file_id, line_key, fiscal_year, payload) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb) ON CONFLICT (adjustment_id) DO NOTHING",
+                (
+                    adjustment.adjustment_id,
+                    adjustment.credit_file_id,
+                    adjustment.line_key,
+                    adjustment.fiscal_year,
+                    adjustment.model_dump_json(),
+                ),
+            )
+
+    def list_adjustments(self, credit_file_id: str) -> list[SpreadAdjustment]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM adjustments WHERE credit_file_id = %s ORDER BY recorded_at, adjustment_id",
+                (credit_file_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append(
+                SpreadAdjustment.model_validate(
+                    payload if isinstance(payload, dict) else json.loads(payload)
+                )
+            )
+        return out
+
+    def save_spread(self, spread: Spread) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO spreads (spread_id, credit_file_id, payload) "
+                "VALUES (%s, %s, %s::jsonb) ON CONFLICT (spread_id) DO NOTHING",
+                (spread.spread_id, spread.credit_file_id, spread.model_dump_json()),
+            )
+
+    def get_latest_spread(self, credit_file_id: str) -> Spread | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM spreads WHERE credit_file_id = %s ORDER BY id DESC LIMIT 1",
+                (credit_file_id,),
+            ).fetchone()
+        if not row:
+            return None
+        payload = row["payload"]
+        return Spread.model_validate(
+            payload if isinstance(payload, dict) else json.loads(payload)
+        )
+
+    def list_spreads(self, credit_file_id: str) -> list[Spread]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM spreads WHERE credit_file_id = %s ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append(
+                Spread.model_validate(
                     payload if isinstance(payload, dict) else json.loads(payload)
                 )
             )
