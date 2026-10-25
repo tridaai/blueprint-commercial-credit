@@ -27,14 +27,23 @@ reasons renders an adverse-action notice generated from those
 reasons; a deferral names its requirements and the memo is
 re-presented and decided on the same artefact.
 
-Hand-decided anchors (rounds 3–5): Hartline's pinned v1 report
-passes leverage (1.5337 vs the 2.00 ceiling) and concentration,
-fails required_documents_complete (7 of 9 items outstanding:
-chk-03…chk-09), and cannot evaluate DSCR, global DSCR, fixed
-charge coverage or appraisal age. FY2024 working capital is
-$2,202,000.00, traced in the memo's verification record.
+Fixtures: since round 9 a memo reaches the committee only on a
+committee-ready file (design law 7) — every required document on
+file and fresh, every figure computable — so the committee
+fixtures below use a purpose-built borrower, Calloway Precision
+Manufacturing, whose file is complete by construction. Its
+hand-decided anchors under the pinned v1 report (as of
+2026-06-30): leverage FAILS at 5.0000 against the 2.00
+manufacturing ceiling (the decline anchor); DSCR passes at 1.3125
+(EBITDA $420,000 over debt service $320,000); global DSCR cannot
+be evaluated (the facility names no guarantors); working capital
+is $900,000.00 in FY2023 and $1,000,000.00 in FY2025, traced in
+the memo's verification record. The readiness gate's own refusals — including what it
+does to an incomplete Hartline file — are graded in
+tests/test_readiness.py.
 """
 
+import json
 from datetime import date
 from decimal import Decimal
 
@@ -53,9 +62,12 @@ from commercial_credit.errors import NotFoundError, ValidationError
 from commercial_credit.memo import render_memo
 from commercial_credit.models import (
     AdverseActionReason,
+    Borrower,
     CommitteeCondition,
     CommitteeMember,
     DocumentKind,
+    FacilityRequest,
+    FacilityType,
 )
 from commercial_credit.pipeline import CreditPipeline
 from commercial_credit.seed import ReferenceLosFeed, statement_document
@@ -96,11 +108,209 @@ def open_hartline(pipeline: CreditPipeline):
     return pipeline.open_application(borrower, facility, documents=docs)
 
 
+# ---------------------------------------------------------------------
+# The committee-ready borrower (round 9 fixture). Statements carry
+# all three sections per year, so every figure computes; the
+# checklist is satisfied in full; the one designed weakness is
+# leverage — a credit judgment for the committee, not a readiness
+# blocker.
+# ---------------------------------------------------------------------
+
+_BS_FIELDS = (
+    "cash_and_equivalents", "accounts_receivable", "inventory",
+    "total_current_assets", "net_fixed_assets", "total_assets",
+    "accounts_payable", "current_portion_ltd",
+    "total_current_liabilities", "long_term_debt",
+    "total_liabilities", "total_equity",
+)
+_IS_FIELDS = (
+    "revenue", "cost_of_goods_sold", "gross_profit",
+    "operating_expenses", "ebit", "interest_expense", "net_income",
+)
+_CF_FIELDS = (
+    "depreciation_and_amortization", "change_in_receivables",
+    "change_in_inventory", "change_in_payables",
+    "net_cash_from_operations", "capital_expenditures",
+    "net_cash_from_investing", "debt_proceeds", "debt_repayments",
+    "net_cash_from_financing", "net_change_in_cash",
+)
+
+# Hand-set so the balance sheet foots every year, FY2025 EBITDA is
+# $420,000 (EBIT $300,000 + D&A $120,000), FY2025 debt service is
+# $320,000 (FY2024 CPLTD $220,000 + interest $100,000), and FY2025
+# leverage is exactly 5.0000.
+CALLOWAY_FIGURES: dict[int, dict[str, int]] = {
+    2023: dict(zip(_BS_FIELDS, (
+        200000, 800000, 1000000, 2000000, 3000000, 5000000,
+        650000, 200000, 1100000, 2900000, 4000000, 1000000,
+    )), **dict(zip(_IS_FIELDS, (
+        7500000, 5250000, 2250000, 1970000, 280000, 90000, 145000,
+    ))), **dict(zip(_CF_FIELDS, (
+        100000, -40000, -50000, 30000, 300000, 50000, -50000,
+        50000, -180000, -130000, 120000,
+    )))),
+    2024: dict(zip(_BS_FIELDS, (
+        250000, 840000, 1110000, 2200000, 3300000, 5500000,
+        700000, 220000, 1200000, 3300000, 4500000, 1000000,
+    )), **dict(zip(_IS_FIELDS, (
+        8200000, 5740000, 2460000, 2140000, 320000, 95000, 170000,
+    ))), **dict(zip(_CF_FIELDS, (
+        110000, -40000, -110000, 50000, 350000, 55000, -55000,
+        80000, -200000, -120000, 175000,
+    )))),
+    2025: dict(zip(_BS_FIELDS, (
+        300000, 900000, 1200000, 2400000, 3600000, 6000000,
+        800000, 240000, 1400000, 3600000, 5000000, 1000000,
+    )), **dict(zip(_IS_FIELDS, (
+        9000000, 6300000, 2700000, 2400000, 300000, 100000, 150000,
+    ))), **dict(zip(_CF_FIELDS, (
+        120000, -60000, -90000, 100000, 380000, 60000, -60000,
+        100000, -220000, -120000, 200000,
+    )))),
+}
+
+
+def calloway_statement_document(year: int) -> bytes:
+    """One fiscal year in the reference extractor's document shape:
+    label-keyed lines on three pages (balance sheet, income
+    statement, cash-flow statement) — the cash-flow page is what
+    Hartline never had, and why its DSCR could not compute."""
+    from commercial_credit.spreading import TEMPLATE_BY_FIELD
+
+    figures = CALLOWAY_FIGURES[year]
+
+    def page(number: int, title: str, fields) -> dict:
+        return {
+            "page": number,
+            "title": title,
+            "lines": [
+                {
+                    "line": idx,
+                    "label": TEMPLATE_BY_FIELD[field].label,
+                    "value": figures[field],
+                }
+                for idx, field in enumerate(fields, start=1)
+            ],
+        }
+
+    payload = {
+        "document_type": "financial_statement",
+        "borrower": "Calloway Precision Manufacturing, Inc.",
+        "fiscal_year": year,
+        "period_label": f"FY{year}",
+        "basis": "audited",
+        "pages": [
+            page(1, "Balance Sheet", _BS_FIELDS),
+            page(2, "Income Statement", _IS_FIELDS),
+            page(3, "Cash Flow Statement", _CF_FIELDS),
+        ],
+    }
+    return json.dumps(payload, indent=2).encode()
+
+
+def calloway_tax_document() -> bytes:
+    """The FY2025 business tax return: income lines exactly as the
+    audited statements report them, so round 8 records no
+    disagreement on this file."""
+    from commercial_credit.spreading import TEMPLATE_BY_FIELD
+
+    figures = CALLOWAY_FIGURES[2025]
+    payload = {
+        "document_type": "tax_return",
+        "borrower": "Calloway Precision Manufacturing, Inc.",
+        "fiscal_year": 2025,
+        "period_label": "FY2025",
+        "pages": [{
+            "page": 1,
+            "title": "Income Statement (as filed)",
+            "lines": [
+                {
+                    "line": idx,
+                    "label": TEMPLATE_BY_FIELD[field].label,
+                    "value": figures[field],
+                }
+                for idx, field in enumerate(_IS_FIELDS, start=1)
+            ],
+        }],
+    }
+    return json.dumps(payload, indent=2).encode()
+
+
+def calloway_borrower() -> Borrower:
+    return Borrower(
+        legal_name="Calloway Precision Manufacturing, Inc.",
+        ein_last4="4417",
+        segment="manufacturing",
+        state_of_formation="NC",
+        years_in_business=14,
+        primary_contact_name="Dana Whitfield",
+        primary_contact_email="dana.whitfield@example.com",
+    )
+
+
+def calloway_facility() -> FacilityRequest:
+    return FacilityRequest(
+        facility_type=FacilityType.TERM_LOAN,
+        amount=Decimal("1500000"),
+        purpose="CNC machining line expansion",
+        term_months=60,
+        collateral_description="Machining equipment and receivables",
+        guarantors=[],
+    )
+
+
+def calloway_documents() -> list[dict]:
+    docs = [
+        {
+            "kind": DocumentKind.FINANCIAL_STATEMENT.value,
+            "filename": f"calloway-fy{year}-statements.json",
+            "data_hex": calloway_statement_document(year).hex(),
+            "period_label": f"FY{year}",
+        }
+        for year in (2023, 2024, 2025)
+    ]
+    docs.append({
+        "kind": DocumentKind.TAX_RETURN.value,
+        "filename": "calloway-business-tax-fy2025.json",
+        "data_hex": calloway_tax_document().hex(),
+        "period_label": "FY2025",
+    })
+    docs.append({
+        "kind": DocumentKind.TAX_RETURN.value,
+        "filename": "guarantor-personal-tax.json",
+        "data_hex": json.dumps(
+            {"document_type": "tax_return", "pages": [{"page": 1, "lines": []}]}
+        ).encode().hex(),
+        "period_label": "FY2025",
+    })
+    for kind, filename in (
+        (DocumentKind.PERSONAL_FINANCIAL_STATEMENT, "guarantor-pfs.json"),
+        (DocumentKind.ORG_DOCUMENT, "articles-of-incorporation.json"),
+        (DocumentKind.DEBT_SCHEDULE, "debt-schedule.json"),
+        (DocumentKind.INSURANCE_CERTIFICATE, "insurance-certificate.json"),
+        (DocumentKind.PROJECTIONS, "projections-fy2026.json"),
+    ):
+        docs.append({
+            "kind": kind.value,
+            "filename": filename,
+            "data_hex": json.dumps({}).encode().hex(),
+        })
+    return docs
+
+
+def open_ready_file(pipeline: CreditPipeline):
+    return pipeline.open_application(
+        calloway_borrower(), calloway_facility(),
+        documents=calloway_documents(),
+    )
+
+
 def officer_final(pipeline: CreditPipeline):
-    """The Hartline officer-final memo under the pinned v1 report."""
-    credit_file = open_hartline(pipeline)
+    """The Calloway officer-final memo under the pinned v1 report —
+    a committee-ready file (round 9) whose leverage fails policy."""
+    credit_file = open_ready_file(pipeline)
     report = pipeline.evaluate_policy(
-        credit_file.credit_file_id, pack_version="v1", as_of=date(2025, 6, 30)
+        credit_file.credit_file_id, pack_version="v1", as_of=date(2026, 6, 30)
     )
     memo = pipeline.compose_memo(
         credit_file.credit_file_id, report_id=report.report_id
@@ -354,7 +564,7 @@ REPORTING = CommitteeCondition(
 DOCUMENTATION = CommitteeCondition(
     condition_id="",
     type="documentation",
-    checklist_item_id="chk-03",  # business tax returns — outstanding
+    checklist_item_id="chk-03",  # business tax returns
     due_cadence="before_closing",
 )
 
@@ -446,20 +656,15 @@ def test_an_untraceable_condition_threshold_is_refused():
 # Decline: coded reasons, tied to evidence — or no decline
 # ---------------------------------------------------------------------
 
-DOCS_REASON = AdverseActionReason(
-    code="required_documentation_missing",
+LEVERAGE_REASON = AdverseActionReason(
+    code="leverage_above_policy_limit",
     tie_kind="policy_test",
-    test_id="required_documents_complete",
-)
-DOCS_FACT_REASON = AdverseActionReason(
-    code="required_documentation_missing",
-    tie_kind="file_fact",
-    checklist_item_id="chk-03",
+    test_id="max_leverage_by_segment",
 )
 INFO_REASON = AdverseActionReason(
     code="financial_information_insufficient",
     tie_kind="policy_test",
-    test_id="min_dscr",
+    test_id="min_global_dscr",
 )
 
 
@@ -470,26 +675,28 @@ def test_decline_with_tied_reasons_lands_and_renders_the_notice():
     decision = decide(
         pipeline, cf, fid,
         outcome="decline",
-        adverse_reasons=[DOCS_REASON, DOCS_FACT_REASON, INFO_REASON],
+        adverse_reasons=[LEVERAGE_REASON, INFO_REASON],
     )
     assert pipeline.memo_status(cf, fid) == "declined"
     assert decision.reason_vocabulary == ADVERSE_REASONS_VERSION
     assert [r.code for r in decision.adverse_reasons] == [
-        "required_documentation_missing",
-        "required_documentation_missing",
+        "leverage_above_policy_limit",
         "financial_information_insufficient",
     ]
     notice = pipeline.get_adverse_action_notice(cf, fid)
     assert "NOTICE OF ACTION TAKEN" in notice
-    assert "Hartline Manufacturing" in notice
-    assert "Required documentation is missing from the credit file" in notice
-    assert "Required documents on file, by facility type" in notice
-    assert "chk-03 (Business tax returns) is not on file" in notice
+    assert "Calloway Precision Manufacturing" in notice
+    assert (
+        "Leverage exceeds the bank's policy limit for the "
+        "borrower's segment" in notice
+    )
+    assert "Maximum leverage by borrower segment" in notice
+    assert "5.0000" in notice
     assert (
         "The financial information provided does not allow the bank "
         "to evaluate the application" in notice
     )
-    assert "depreciation_and_amortization" in notice
+    assert "names no guarantors" in notice
     assert ADVERSE_REASONS_VERSION in notice
     # Nothing in the notice is a hand-typed reason: every sentence
     # of substance comes from the vocabulary or the evidence.
@@ -512,7 +719,7 @@ def test_a_decline_without_coded_reasons_is_refused():
     with pytest.raises(ValidationError, match="carries no adverse-action"):
         decide(
             pipeline, cf, fid, outcome="approve",
-            adverse_reasons=[DOCS_REASON],
+            adverse_reasons=[LEVERAGE_REASON],
         )
     assert pipeline.store.list_committee_decisions(cf) == []
 
@@ -521,18 +728,18 @@ def test_a_reason_citing_a_passed_test_is_refused_and_named():
     pipeline = hartline_pipeline()
     credit_file, draft, final = convened_final(pipeline)
     cf, fid = credit_file.credit_file_id, final.memo_id
-    # Leverage PASSED at 1.5337 against the 2.00 ceiling.
+    # DSCR PASSED at 1.3125 against the 1.25 floor.
     passed = AdverseActionReason(
-        code="leverage_above_policy_limit",
+        code="debt_service_coverage_below_policy",
         tie_kind="policy_test",
-        test_id="max_leverage_by_segment",
+        test_id="min_dscr",
     )
     with pytest.raises(ValidationError, match="PASS"):
         decide(
             pipeline, cf, fid, outcome="decline",
             adverse_reasons=[passed],
         )
-    assert "max_leverage_by_segment" in str(
+    assert "min_dscr" in str(
         _decline_error(pipeline, cf, fid, passed)
     )
     assert pipeline.store.list_committee_decisions(cf) == []
@@ -552,12 +759,12 @@ def test_reasons_wearing_the_wrong_evidence_are_refused():
     pipeline = hartline_pipeline()
     credit_file, draft, final = convened_final(pipeline)
     cf, fid = credit_file.credit_file_id, final.memo_id
-    # DSCR could not be evaluated: a coverage FAILURE claim over a
-    # not_evaluable test is inaccurate — refused by name.
+    # Global DSCR could not be evaluated: a coverage FAILURE claim
+    # over a not_evaluable test is inaccurate — refused by name.
     miscast = AdverseActionReason(
         code="debt_service_coverage_below_policy",
         tie_kind="policy_test",
-        test_id="min_dscr",
+        test_id="min_global_dscr",
     )
     assert "financial_information_insufficient" in str(
         _decline_error(pipeline, cf, fid, miscast)
@@ -599,7 +806,7 @@ def test_a_decline_tied_to_a_traced_figure_lands():
     cf, fid = credit_file.credit_file_id, final.memo_id
     traced = next(
         t for t in final.verification.figures
-        if t.text == "$2,202,000.00"
+        if t.text == "$900,000.00" and "working_capital" in t.source
     )
     reason = AdverseActionReason(
         code="key_figure_shortfall",
@@ -611,9 +818,9 @@ def test_a_decline_tied_to_a_traced_figure_lands():
     decision = decide(
         pipeline, cf, fid, outcome="decline", adverse_reasons=[reason]
     )
-    assert decision.adverse_reasons[0].figure_text == "$2,202,000.00"
+    assert decision.adverse_reasons[0].figure_text == "$900,000.00"
     notice = pipeline.get_adverse_action_notice(cf, fid)
-    assert "$2,202,000.00" in notice
+    assert "$900,000.00" in notice
     assert "working_capital" in notice
 
 
@@ -707,7 +914,7 @@ def test_sqlite_store_round_trips_committee_records(tmp_path):
     )
     decision = decide(
         pipeline, cf, fid, outcome="decline",
-        adverse_reasons=[DOCS_REASON, INFO_REASON],
+        adverse_reasons=[LEVERAGE_REASON, INFO_REASON],
     )
     reopened = SqliteCreditStore(tmp_path / "credit.db")
     pipeline2 = CreditPipeline(store=reopened, documents=LocalDocumentStore())
@@ -715,7 +922,7 @@ def test_sqlite_store_round_trips_committee_records(tmp_path):
     stored = reopened.get_committee_decision(decision.decision_id)
     assert stored is not None and stored.outcome == "decline"
     assert [r.code for r in stored.adverse_reasons] == [
-        "required_documentation_missing",
+        "leverage_above_policy_limit",
         "financial_information_insufficient",
     ]
     notice = pipeline2.get_adverse_action_notice(cf, fid)
@@ -745,13 +952,50 @@ def client():
 
 
 def _officer_final_via_api(client) -> tuple[str, str]:
+    """The Calloway file, built end-to-end through the API: open,
+    register every document, extract, spread, compute, evaluate
+    under v1, compose, submit, approve. (Since round 9 the
+    committee can only be reached on a committee-ready file, so
+    the API committee tests build one.)"""
+    import base64
+
     resp = client.post(
-        "/applications/from-los", json={"application_ref": "LOS-2026-0117"}
+        "/applications",
+        json={
+            "borrower": calloway_borrower().model_dump(mode="json"),
+            "facility": calloway_facility().model_dump(mode="json"),
+        },
     )
     assert resp.status_code == 201
     cf = resp.json()["credit_file_id"]
-    memos = client.get(f"/applications/{cf}/memos").json()
-    draft_id = memos[0]["memo_id"]
+    for doc in calloway_documents():
+        data = bytes.fromhex(doc["data_hex"])
+        posted = client.post(
+            f"/applications/{cf}/documents",
+            json={
+                "kind": doc["kind"],
+                "filename": doc["filename"],
+                "content_b64": base64.b64encode(data).decode("ascii"),
+                "period_label": doc.get("period_label"),
+            },
+        )
+        assert posted.status_code == 201, posted.text
+    assert client.post(f"/applications/{cf}/extract").status_code == 200
+    assert client.get(f"/applications/{cf}/spread").status_code == 200
+    assert client.post(
+        f"/applications/{cf}/computations", json={}
+    ).status_code == 201
+    evaluated = client.post(
+        f"/applications/{cf}/policy-evaluations",
+        json={"pack_version": "v1", "as_of": "2026-06-30"},
+    )
+    assert evaluated.status_code == 201, evaluated.text
+    composed = client.post(
+        f"/applications/{cf}/memos",
+        json={"report_id": evaluated.json()["report_id"]},
+    )
+    assert composed.status_code == 201, composed.text
+    draft_id = composed.json()["memo_id"]
     base = f"/applications/{cf}/memos/{draft_id}"
     client.post(f"{base}/submit", json={"actor": RM, "actor_role": RM_ROLE})
     approved = client.post(
@@ -859,18 +1103,16 @@ def test_api_committee_decline_and_notice_flow(client):
             "recorder_id": CHAIR, "recorder_role": CHAIR_ROLE,
             "members": MEMBERS_JSON, "outcome": "decline",
             "adverse_reasons": [{
-                "code": "leverage_above_policy_limit",
+                "code": "debt_service_coverage_below_policy",
                 "tie_kind": "policy_test",
-                "test_id": "max_leverage_by_segment",
+                "test_id": "min_dscr",
             }],
         },
     )
     assert passed_test.status_code == 422
-    # The offender is named. (On the API's from-LOS path the memo
-    # pins the current-version report over a document-less intake,
-    # where leverage is not_evaluable rather than passed — either
-    # way the reason is refused: the test it cites did not fail.)
-    assert "max_leverage_by_segment" in passed_test.json()["detail"]
+    # The offender is named: DSCR passed at 1.3125, so a coverage
+    # decline reason citing it is refused.
+    assert "min_dscr" in passed_test.json()["detail"]
 
     declined = client.post(
         f"{base}/decide",
@@ -879,14 +1121,14 @@ def test_api_committee_decline_and_notice_flow(client):
             "members": MEMBERS_JSON, "outcome": "decline",
             "adverse_reasons": [
                 {
-                    "code": "required_documentation_missing",
-                    "tie_kind": "file_fact",
-                    "checklist_item_id": "chk-03",
+                    "code": "leverage_above_policy_limit",
+                    "tie_kind": "policy_test",
+                    "test_id": "max_leverage_by_segment",
                 },
                 {
                     "code": "financial_information_insufficient",
                     "tie_kind": "policy_test",
-                    "test_id": "min_dscr",
+                    "test_id": "min_global_dscr",
                 },
             ],
         },
@@ -899,7 +1141,8 @@ def test_api_committee_decline_and_notice_flow(client):
     body = notice.json()
     assert body["decision_id"] == declined.json()["decision_id"]
     assert "NOTICE OF ACTION TAKEN" in body["text"]
-    assert "chk-03 (Business tax returns) is not on file" in body["text"]
+    assert "Leverage exceeds the bank's policy limit" in body["text"]
+    assert "5.0000" in body["text"]
 
     state = client.get(base)
     assert state.json()["status"] == "declined"
