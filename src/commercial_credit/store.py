@@ -19,6 +19,7 @@ from .models import (
     ComputationPack,
     CreditFile,
     ExtractedValue,
+    PolicyReport,
     Spread,
     SpreadAdjustment,
 )
@@ -34,6 +35,8 @@ class InMemoryCreditStore:
         self._spread_order: dict[str, list[str]] = {}
         self._packs: dict[str, ComputationPack] = {}
         self._pack_order: dict[str, list[str]] = {}
+        self._reports: dict[str, PolicyReport] = {}
+        self._report_order: dict[str, list[str]] = {}
 
     def save_credit_file(self, credit_file: CreditFile) -> None:
         self._files[credit_file.credit_file_id] = credit_file.model_copy(deep=True)
@@ -107,6 +110,27 @@ class InMemoryCreditStore:
             for pack_id in self._pack_order.get(credit_file_id, [])
         ]
 
+    def save_policy_report(self, report: PolicyReport) -> None:
+        # Content-addressed: the same report id is the same artefact.
+        # Storing it twice records it once — a re-evaluation under a
+        # newer pack version is a NEW report, never an overwrite.
+        if report.report_id in self._reports:
+            return
+        self._reports[report.report_id] = report.model_copy(deep=True)
+        self._report_order.setdefault(report.credit_file_id, []).append(
+            report.report_id
+        )
+
+    def get_policy_report(self, report_id: str) -> PolicyReport | None:
+        report = self._reports.get(report_id)
+        return report.model_copy(deep=True) if report else None
+
+    def list_policy_reports(self, credit_file_id: str) -> list[PolicyReport]:
+        return [
+            self._reports[report_id].model_copy(deep=True)
+            for report_id in self._report_order.get(credit_file_id, [])
+        ]
+
     def ping(self) -> bool:
         return True
 
@@ -138,6 +162,9 @@ class SqliteCreditStore:
                 credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS computation_packs (
                 pack_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS policy_reports (
+                report_id TEXT PRIMARY KEY,
                 credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
             """
         )
@@ -253,6 +280,29 @@ class SqliteCreditStore:
             (credit_file_id,),
         ).fetchall()
         return [ComputationPack.model_validate_json(r[0]) for r in rows]
+
+    def save_policy_report(self, report: PolicyReport) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO policy_reports (report_id, credit_file_id, payload) "
+                "VALUES (?, ?, ?) ON CONFLICT(report_id) DO NOTHING",
+                (report.report_id, report.credit_file_id, report.model_dump_json()),
+            )
+
+    def get_policy_report(self, report_id: str) -> PolicyReport | None:
+        row = self._conn.execute(
+            "SELECT payload FROM policy_reports WHERE report_id = ?",
+            (report_id,),
+        ).fetchone()
+        return PolicyReport.model_validate_json(row[0]) if row else None
+
+    def list_policy_reports(self, credit_file_id: str) -> list[PolicyReport]:
+        rows = self._conn.execute(
+            "SELECT payload FROM policy_reports WHERE credit_file_id = ? "
+            "ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [PolicyReport.model_validate_json(r[0]) for r in rows]
 
     def ping(self) -> bool:
         try:
@@ -476,6 +526,49 @@ class PostgresCreditStore:
             payload = row["payload"]
             out.append(
                 ComputationPack.model_validate(
+                    payload if isinstance(payload, dict) else json.loads(payload)
+                )
+            )
+        return out
+
+    def save_policy_report(self, report: PolicyReport) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO policy_reports (report_id, credit_file_id, policy_version, payload) "
+                "VALUES (%s, %s, %s, %s::jsonb) ON CONFLICT (report_id) DO NOTHING",
+                (
+                    report.report_id,
+                    report.credit_file_id,
+                    report.policy_version,
+                    report.model_dump_json(),
+                ),
+            )
+
+    def get_policy_report(self, report_id: str) -> PolicyReport | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM policy_reports WHERE report_id = %s",
+                (report_id,),
+            ).fetchone()
+        if not row:
+            return None
+        payload = row["payload"]
+        return PolicyReport.model_validate(
+            payload if isinstance(payload, dict) else json.loads(payload)
+        )
+
+    def list_policy_reports(self, credit_file_id: str) -> list[PolicyReport]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM policy_reports WHERE credit_file_id = %s "
+                "ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append(
+                PolicyReport.model_validate(
                     payload if isinstance(payload, dict) else json.loads(payload)
                 )
             )

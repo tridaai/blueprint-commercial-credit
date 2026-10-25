@@ -19,6 +19,7 @@ from .models import (
     CreditFile,
     ExtractedValue,
     FacilityRequest,
+    PolicyReport,
     SourceDocument,
     Spread,
     SpreadAdjustment,
@@ -97,5 +98,13 @@ class CreditFileStore(Protocol):
     def list_computation_packs(
         self, credit_file_id: str
     ) -> list[ComputationPack]: ...
+
+    def save_policy_report(self, report: PolicyReport) -> None: ...
+
+    def get_policy_report(self, report_id: str) -> PolicyReport | None: ...
+
+    def list_policy_reports(
+        self, credit_file_id: str
+    ) -> list[PolicyReport]: ...
 
     def ping(self) -> bool: ...
