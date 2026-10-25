@@ -80,6 +80,7 @@ from .models import (
     BREACH_CURED,
     BREACH_DEFAULTED,
     BREACH_ESCALATED,
+    BREACH_TERMINAL_STATES,
     BREACH_UNDER_REVIEW,
     BREACH_WAIVED,
     RESULT_SUPERSEDED_BY_RESTATEMENT,
@@ -88,6 +89,8 @@ from .models import (
     TEST_NOT_EVALUABLE,
     TEST_PASS,
     AdverseActionReason,
+    AnnualReviewOutcome,
+    AnnualReviewPack,
     AuditEvent,
     Borrower,
     BreachCase,
@@ -95,6 +98,7 @@ from .models import (
     CommitteeCondition,
     CommitteeDecision,
     CommitteeMember,
+    CommitteeReferral,
     ComputationPack,
     CovenantAmendment,
     CovenantDefinition,
@@ -113,8 +117,11 @@ from .models import (
     MemoReviewEvent,
     MemoVerification,
     PolicyHistoryEntry,
+    PolicyOutcomeDifference,
     PolicyReport,
     ReadinessReport,
+    ReviewBlocker,
+    ReviewSummary,
     Spread,
     SpreadAdjustment,
     new_id,
@@ -142,6 +149,17 @@ from .ports import CreditFileStore, DocumentStore, Extractor
 from .readiness import build_readiness_report
 from .readiness import readiness_refusal_message
 from .readiness import render_outstanding_items
+from .reviews import (
+    REVIEW_VOCABULARY_VERSION,
+    REVIEW_WORK_STATES,
+    ReviewInputs,
+    ReviewInstance,
+    derive_review_instances,
+    get_review_composer,
+    locked_fact_paragraphs,
+    validate_review_outcome,
+    verify_review_summary,
+)
 from .spreading import build_spread as assemble_spread
 from .spreading import validate_adjustment
 
@@ -1883,6 +1901,7 @@ class CreditPipeline:
                 queue.append({
                     "borrower": credit_file.borrower.legal_name,
                     "credit_file_id": credit_file.credit_file_id,
+                    "kind": "covenant_schedule",
                     "instance": instance,
                 })
         order = {"overdue": 0, "due": 1, "awaiting_inputs": 2, "due_soon": 3}
@@ -1891,6 +1910,19 @@ class CreditPipeline:
             entry["instance"].test_date,
             entry["instance"].name,
         ))
+        # Round 12: annual review instances standing at work join
+        # the same queue surface — the monitoring desk reads one
+        # list of what is owed. They ride after the covenant
+        # entries, worst review first, each naming its review.
+        queue.extend(
+            {
+                "borrower": entry["borrower"],
+                "credit_file_id": entry["credit_file_id"],
+                "kind": "annual_review",
+                "review_instance": entry["instance"],
+            }
+            for entry in self.review_due_work(as_of=as_of)
+        )
         return queue
 
     def tick_covenants(
@@ -1965,12 +1997,23 @@ class CreditPipeline:
             ran = self._run_due_tests(credit_file, as_of=as_of)
             tests_recorded.extend(ran["results"])
             breaches_opened.extend(ran["breaches"])
+        # Round 12: the tick also opens the annual reviews that
+        # stand due — assembling each one's pack from the stored
+        # artefacts, so the officer's work is waiting, evidenced.
+        # Idempotent the same way: an instance with a pack already
+        # assembled is not opened twice.
+        reviews_opened: list[dict] = []
+        for credit_file in files:
+            reviews_opened.extend(
+                self._open_due_reviews_for(credit_file, as_of=as_of)
+            )
         return {
             "as_of": as_of,
             "sets_checked": checked,
             "crossings_recorded": recorded,
             "tests_recorded": tests_recorded,
             "breaches_opened": breaches_opened,
+            "reviews_opened": reviews_opened,
         }
 
     # ------------------------------------------------------------------
@@ -2646,6 +2689,832 @@ class CreditPipeline:
             actor_id=actor_id, actor_role=actor_role,
             reason_code=reason_code, note=note,
         )
+
+    # ------------------------------------------------------------------
+    # Round 12: annual review packs. Round 10 set the covenant
+    # clocks running and round 11 executes their tests; this
+    # section is the periodic judgement over the whole credit.
+    # The obligation derives from the covenant set's anchor (its
+    # closing date, or the approval date when no closing is
+    # recorded); the pack is assembled in code from stored
+    # artefacts only — fresh spread and computation pack through
+    # the existing engines, the period's covenant history and
+    # breaches, the policy report under BOTH the pinned and the
+    # current pack versions, readiness recomputed at the date —
+    # and the officer's stance is a coded act that closes the
+    # instance. Nothing here approves credit either: a stance
+    # affirms a review, attaches conditions, watches, or refers
+    # the credit back to the committee machinery.
+    # ------------------------------------------------------------------
+
+    def _review_anchor(
+        self, credit_file: CreditFile, covenant_set: CovenantSet
+    ) -> tuple[date, str]:
+        """The date annual reviews count from, and its basis —
+        named, never guessed silently: the closing date when one
+        is recorded (the set's own, or the file's applied at read
+        time, exactly as the covenant schedule reads it), else
+        the date of the committee decision that created the set."""
+        effective = self._effective_set(credit_file, covenant_set)
+        if effective.closing_date is not None:
+            return effective.closing_date, "closing_date"
+        decision = self.store.get_committee_decision(
+            covenant_set.decision_id
+        )
+        if decision is None:  # pragma: no cover - set provenance
+            raise NotFoundError(
+                f"committee decision {covenant_set.decision_id} "
+                f"not found: the covenant set {covenant_set.set_id} "
+                "has no anchor to derive its reviews from"
+            )
+        return decision.decided_at.date(), "approval_date"
+
+    def _review_set_for(
+        self, credit_file_id: str, set_id: str | None
+    ) -> CovenantSet:
+        """The covenant set a review act names — or the file's
+        only set. A file with several sets must name its set: a
+        review attached to the wrong set would judge the wrong
+        facility's year."""
+        if set_id is not None:
+            return self.get_covenant_set(credit_file_id, set_id)
+        sets = self.store.list_covenant_sets(credit_file_id)
+        if not sets:
+            raise NotFoundError(
+                f"credit file {credit_file_id} has no covenant "
+                "set: annual reviews attach to an approved "
+                "facility's covenant set"
+            )
+        if len(sets) > 1:
+            raise ValidationError(
+                f"credit file {credit_file_id} carries "
+                f"{len(sets)} covenant sets; name the set the "
+                "review belongs to (set_id)"
+            )
+        return sets[0]
+
+    def _review_instances(
+        self,
+        credit_file: CreditFile,
+        covenant_set: CovenantSet,
+        *,
+        as_of: date,
+    ) -> list[ReviewInstance]:
+        """The set's derived review instances at `as_of`, each
+        carrying the latest pack assembled for it, if any."""
+        anchor, _basis = self._review_anchor(credit_file, covenant_set)
+        outcomes = [
+            o for o in self.store.list_review_outcomes(
+                credit_file.credit_file_id
+            )
+            if o.set_id == covenant_set.set_id
+        ]
+        instances = derive_review_instances(
+            credit_file.credit_file_id,
+            covenant_set,
+            anchor=anchor,
+            as_of=as_of,
+            outcomes=outcomes,
+        )
+        latest_pack: dict[int, str] = {}
+        for pack in self.store.list_review_packs(credit_file.credit_file_id):
+            if pack.set_id == covenant_set.set_id:
+                latest_pack[pack.review_number] = pack.pack_id
+        return [
+            ReviewInstance(
+                credit_file_id=instance.credit_file_id,
+                set_id=instance.set_id,
+                review_number=instance.review_number,
+                anchor_date=instance.anchor_date,
+                period_start=instance.period_start,
+                due_date=instance.due_date,
+                state=instance.state,
+                days_until_due=instance.days_until_due,
+                outcome_id=instance.outcome_id,
+                pack_id=latest_pack.get(instance.review_number),
+            )
+            for instance in instances
+        ]
+
+    def annual_review_schedule(
+        self,
+        credit_file_id: str,
+        *,
+        as_of: date,
+        set_id: str | None = None,
+    ) -> dict:
+        """One file's annual review obligations at `as_of`: per
+        covenant set, the anchor (and which basis it stands on)
+        and every derived instance — its window, its due date,
+        its state, and the pack and outcome it carries, if any."""
+        credit_file = self._load(credit_file_id)
+        sets = self.store.list_covenant_sets(credit_file_id)
+        if set_id is not None:
+            sets = [s for s in sets if s.set_id == set_id]
+            if not sets:
+                raise NotFoundError(
+                    f"covenant set {set_id} not found on credit "
+                    f"file {credit_file_id}"
+                )
+        views = []
+        for covenant_set in sets:
+            anchor, basis = self._review_anchor(credit_file, covenant_set)
+            views.append({
+                "covenant_set": self._effective_set(
+                    credit_file, covenant_set
+                ),
+                "anchor_date": anchor,
+                "anchor_basis": basis,
+                "instances": self._review_instances(
+                    credit_file, covenant_set, as_of=as_of
+                ),
+            })
+        return {
+            "credit_file_id": credit_file_id,
+            "borrower": credit_file.borrower.legal_name,
+            "as_of": as_of,
+            "sets": views,
+        }
+
+    def _review_instance_for(
+        self,
+        credit_file: CreditFile,
+        covenant_set: CovenantSet,
+        review_number: int,
+        *,
+        as_of: date,
+    ) -> ReviewInstance:
+        instances = self._review_instances(
+            credit_file, covenant_set, as_of=as_of
+        )
+        instance = next(
+            (i for i in instances if i.review_number == review_number),
+            None,
+        )
+        if instance is None:
+            raise NotFoundError(
+                f"annual review {review_number} does not exist "
+                f"on covenant set {covenant_set.set_id}: the "
+                f"facility's term carries {len(instances)} annual "
+                "review(s)"
+            )
+        return instance
+
+    def _build_review_inputs(
+        self,
+        credit_file: CreditFile,
+        covenant_set: CovenantSet,
+        instance: ReviewInstance,
+        anchor: date,
+        basis: str,
+        *,
+        as_of: date,
+    ) -> ReviewInputs:
+        """Assemble everything a review pack pins, through the
+        existing engines only: the spread rebuilt, the
+        computation pack recomputed with the set's current
+        covenants as definitions over the latest period, the
+        policy report under the pinned version and under the
+        current one, readiness recomputed at the review date,
+        and the period's recorded covenant history and breaches
+        read with their restatement standing."""
+        credit_file_id = credit_file.credit_file_id
+        spread = self._current_spread(credit_file_id)
+        if spread is None:
+            raise ValidationError(
+                f"credit file {credit_file_id} has no spread: an "
+                "annual review pack is assembled from spread "
+                "figures, and there are none on file"
+            )
+        effective = self._effective_set(credit_file, covenant_set)
+        current = current_covenants(
+            effective,
+            self.store.list_covenant_amendments(credit_file_id),
+        )
+        definitions: list[CovenantDefinition] = []
+        if spread.periods:
+            latest = max(spread.periods)
+            definitions = [
+                CovenantDefinition(
+                    name=covenant.name,
+                    metric_key=covenant.metric_key,
+                    operator=covenant.operator,
+                    threshold=covenant.threshold,
+                    fiscal_year=latest,
+                )
+                for covenant in current
+            ]
+        pack = self.compute_metrics(
+            credit_file_id, covenant_definitions=definitions
+        )
+        spread = next(
+            s for s in self.store.list_spreads(credit_file_id)
+            if s.spread_id == pack.spread_id
+        )
+        pinned_report = self.evaluate_policy(
+            credit_file_id,
+            pack_version=covenant_set.policy_version,
+            as_of=as_of,
+        )
+        current_report = self.evaluate_policy(
+            credit_file_id,
+            pack_version=CURRENT_POLICY_VERSION,
+            as_of=as_of,
+        )
+        readiness = self.compute_readiness(credit_file_id, as_of=as_of)
+        in_window = (
+            lambda day: instance.period_start < day <= instance.due_date
+        )
+        results = sorted(
+            (
+                r for r in self.store.list_covenant_test_results(
+                    credit_file_id
+                )
+                if in_window(r.test_date)
+            ),
+            key=lambda r: (r.test_date, r.result_id),
+        )
+        standings = {
+            r.result_id: result_standing(r, spread) for r in results
+        }
+        all_breaches = self.store.list_breach_cases(credit_file_id)
+        breaches = sorted(
+            (b for b in all_breaches if in_window(b.test_date)),
+            key=lambda b: (b.test_date, b.breach_id),
+        )
+        open_breaches = [
+            b for b in all_breaches
+            if b.state not in BREACH_TERMINAL_STATES
+        ]
+        return ReviewInputs(
+            credit_file=credit_file,
+            covenant_set=covenant_set,
+            review_number=instance.review_number,
+            anchor_date=anchor,
+            anchor_basis=basis,
+            period_start=instance.period_start,
+            due_date=instance.due_date,
+            as_of=as_of,
+            spread=spread,
+            pack=pack,
+            pinned_report=pinned_report,
+            current_report=current_report,
+            readiness=readiness,
+            results=results,
+            standings=standings,
+            breaches=breaches,
+            open_breaches=open_breaches,
+            blockers=readiness.blockers,
+        )
+
+    def assemble_review_pack(
+        self,
+        credit_file_id: str,
+        *,
+        as_of: date,
+        review_number: int | None = None,
+        set_id: str | None = None,
+        profile: str = "offline",
+    ) -> AnnualReviewPack:
+        """Assemble the pack for one annual review instance.
+
+        The instance defaults to the earliest review without a
+        recorded outcome. The summary is composed through the
+        model port and verified before the pack exists — a
+        summary that cannot be fully traced, drops a locked
+        fact, or softens the record refuses the assembly, and
+        nothing is stored. The pack is content-addressed:
+        assembling the same review over the same inputs at the
+        same date reproduces it, and the audit records only the
+        first assembly of each distinct pack."""
+        credit_file = self._load(credit_file_id)
+        covenant_set = self._review_set_for(credit_file_id, set_id)
+        anchor, basis = self._review_anchor(credit_file, covenant_set)
+        if review_number is None:
+            instances = self._review_instances(
+                credit_file, covenant_set, as_of=as_of
+            )
+            if not instances:
+                raise ValidationError(
+                    f"covenant set {covenant_set.set_id} carries "
+                    "no annual review instances: the facility's "
+                    "term ends before its first anniversary"
+                )
+            open_instances = [
+                i for i in instances if i.outcome_id is None
+            ]
+            if not open_instances:
+                raise ValidationError(
+                    f"every annual review on covenant set "
+                    f"{covenant_set.set_id} is completed: there "
+                    "is no open instance to assemble a pack for"
+                )
+            instance = open_instances[0]
+        else:
+            instance = self._review_instance_for(
+                credit_file, covenant_set, review_number, as_of=as_of
+            )
+        inputs = self._build_review_inputs(
+            credit_file, covenant_set, instance, anchor, basis,
+            as_of=as_of,
+        )
+        composer = get_review_composer(profile)
+        paragraphs = composer.compose(inputs)
+        locked = locked_fact_paragraphs(inputs)
+        verification = verify_review_summary(
+            paragraphs=paragraphs,
+            locked_facts=locked,
+            inputs=inputs,
+            composer_profile=composer.name,
+        )
+        summary = ReviewSummary(
+            composer_profile=composer.name,
+            paragraphs=paragraphs,
+            locked_facts=locked,
+            verification=verification,
+        )
+        descriptor = {
+            "credit_file_id": credit_file_id,
+            "set_id": covenant_set.set_id,
+            "review_number": instance.review_number,
+            "as_of": as_of.isoformat(),
+            "spread_id": inputs.spread.spread_id,
+            "computation_pack_id": inputs.pack.pack_id,
+            "pinned_policy_report_id": inputs.pinned_report.report_id,
+            "current_policy_report_id": inputs.current_report.report_id,
+            "readiness_report_id": inputs.readiness.report_id,
+            "summary": summary.model_dump(mode="json"),
+        }
+        pack = AnnualReviewPack(
+            pack_id=f"reviewpack-{_canonical_hash(descriptor)[:16]}",
+            credit_file_id=credit_file_id,
+            set_id=covenant_set.set_id,
+            review_number=instance.review_number,
+            anchor_date=anchor,
+            period_start=instance.period_start,
+            due_date=instance.due_date,
+            as_of=as_of,
+            borrower_name=credit_file.borrower.legal_name,
+            memo_id=covenant_set.memo_id,
+            spread_id=inputs.spread.spread_id,
+            computation_pack_id=inputs.pack.pack_id,
+            latest_period=(
+                max(inputs.spread.periods)
+                if inputs.spread.periods else None
+            ),
+            periods_covered=list(inputs.spread.periods),
+            pinned_policy_pack_id=inputs.pinned_report.policy_pack_id,
+            pinned_policy_version=inputs.pinned_report.policy_version,
+            pinned_policy_report_id=inputs.pinned_report.report_id,
+            current_policy_version=inputs.current_report.policy_version,
+            current_policy_report_id=inputs.current_report.report_id,
+            policy_differences=[
+                PolicyOutcomeDifference(
+                    test_id=test_id,
+                    pinned_outcome=pinned_outcome,
+                    current_outcome=current_outcome,
+                )
+                for test_id, pinned_outcome, current_outcome
+                in inputs.differences
+            ],
+            readiness_report_id=inputs.readiness.report_id,
+            complete=inputs.complete,
+            blockers=[
+                ReviewBlocker(
+                    input_key=entry.input_key,
+                    label=entry.label,
+                    state=entry.state,
+                    detail=entry.detail,
+                )
+                for entry in inputs.blockers
+            ],
+            test_result_ids=[r.result_id for r in inputs.results],
+            breach_ids=[b.breach_id for b in inputs.breaches],
+            open_breach_ids=[
+                b.breach_id for b in inputs.open_breaches
+            ],
+            material_disagreement_ids=[
+                d.disagreement_id
+                for d in inputs.spread.disagreements if d.material
+            ],
+            summary=summary,
+        )
+        is_new = self.store.get_review_pack(pack.pack_id) is None
+        self.store.save_review_pack(pack)
+        if is_new:
+            self._audit(
+                credit_file_id,
+                "annual_review_pack_assembled",
+                f"annual review {pack.review_number} pack "
+                f"{pack.pack_id} assembled at {as_of.isoformat()} "
+                f"for the period {pack.period_start.isoformat()} "
+                f"to {pack.due_date.isoformat()}: spread "
+                f"{pack.spread_id}, computation pack "
+                f"{pack.computation_pack_id}, policy "
+                f"{pack.pinned_policy_version} (pinned) and "
+                f"{pack.current_policy_version} (current), "
+                + (
+                    "complete"
+                    if pack.complete
+                    else f"INCOMPLETE — {len(pack.blockers)} "
+                    "blocker(s): "
+                    + ", ".join(b.input_key for b in pack.blockers)
+                ),
+            )
+        return pack
+
+    def get_review_pack(
+        self, credit_file_id: str, pack_id: str
+    ) -> AnnualReviewPack:
+        self._load(credit_file_id)
+        pack = self.store.get_review_pack(pack_id)
+        if pack is None or pack.credit_file_id != credit_file_id:
+            raise NotFoundError(
+                f"annual review pack {pack_id} not found on "
+                f"credit file {credit_file_id}"
+            )
+        return pack
+
+    def list_review_packs(
+        self, credit_file_id: str
+    ) -> list[AnnualReviewPack]:
+        self._load(credit_file_id)
+        return self.store.list_review_packs(credit_file_id)
+
+    def check_review_summary(
+        self,
+        credit_file_id: str,
+        pack_id: str,
+        *,
+        paragraphs: list[str],
+        locked_facts: list[str],
+    ) -> object:
+        """Re-verify a candidate summary against a stored pack's
+        pinned inputs — the examiner's surface. The pack's own
+        summary passes (it was verified at assembly); a tampered
+        one — a figure swapped, a locked paragraph dropped, a
+        breach denied in prose — is refused by name. Nothing is
+        stored either way: this is a check, not an edit path."""
+        pack = self.get_review_pack(credit_file_id, pack_id)
+        inputs = self._review_inputs_for_pack(pack)
+        return verify_review_summary(
+            paragraphs=list(paragraphs),
+            locked_facts=list(locked_facts),
+            inputs=inputs,
+            composer_profile=pack.summary.composer_profile,
+        )
+
+    def _review_inputs_for_pack(
+        self, pack: AnnualReviewPack
+    ) -> ReviewInputs:
+        """Rebuild the assembly inputs a stored pack pins, from
+        the store — every artefact by the id the pack recorded."""
+        credit_file = self._load(pack.credit_file_id)
+        covenant_set = self.get_covenant_set(
+            pack.credit_file_id, pack.set_id
+        )
+        anchor, basis = self._review_anchor(credit_file, covenant_set)
+        spread = next(
+            (
+                s for s in self.store.list_spreads(pack.credit_file_id)
+                if s.spread_id == pack.spread_id
+            ),
+            None,
+        )
+        if spread is None:
+            raise NotFoundError(
+                f"spread {pack.spread_id} pinned by review pack "
+                f"{pack.pack_id} not found"
+            )
+        computation_pack = self.store.get_computation_pack(
+            pack.computation_pack_id
+        )
+        if computation_pack is None:
+            raise NotFoundError(
+                f"computation pack {pack.computation_pack_id} "
+                f"pinned by review pack {pack.pack_id} not found"
+            )
+        pinned_report = self.store.get_policy_report(
+            pack.pinned_policy_report_id
+        )
+        current_report = self.store.get_policy_report(
+            pack.current_policy_report_id
+        )
+        readiness = self.store.get_readiness_report(
+            pack.readiness_report_id
+        )
+        if pinned_report is None or current_report is None \
+                or readiness is None:
+            raise NotFoundError(
+                f"a report pinned by review pack {pack.pack_id} "
+                "is missing from the store"
+            )
+        results = [
+            result
+            for result in (
+                self.store.get_covenant_test_result(result_id)
+                for result_id in pack.test_result_ids
+            )
+            if result is not None
+        ]
+        breaches = [
+            breach
+            for breach in (
+                self.store.get_breach_case(breach_id)
+                for breach_id in pack.breach_ids
+            )
+            if breach is not None
+        ]
+        open_breaches = [
+            breach
+            for breach in (
+                self.store.get_breach_case(breach_id)
+                for breach_id in pack.open_breach_ids
+            )
+            if breach is not None
+        ]
+        return ReviewInputs(
+            credit_file=credit_file,
+            covenant_set=covenant_set,
+            review_number=pack.review_number,
+            anchor_date=pack.anchor_date,
+            anchor_basis=basis,
+            period_start=pack.period_start,
+            due_date=pack.due_date,
+            as_of=pack.as_of,
+            spread=spread,
+            pack=computation_pack,
+            pinned_report=pinned_report,
+            current_report=current_report,
+            readiness=readiness,
+            results=results,
+            standings={
+                r.result_id: result_standing(r, spread) for r in results
+            },
+            breaches=breaches,
+            open_breaches=open_breaches,
+            blockers=readiness.blockers,
+        )
+
+    def record_review_outcome(
+        self,
+        credit_file_id: str,
+        *,
+        review_number: int,
+        stance: str,
+        reason_codes: list[str],
+        reviewer_id: str,
+        reviewer_role: str,
+        pack_id: str | None = None,
+        set_id: str | None = None,
+        as_of: date | None = None,
+        countersigner_id: str | None = None,
+        countersigner_role: str | None = None,
+        conditions: list[CommitteeCondition] | None = None,
+        note: str = "",
+    ) -> AnnualReviewOutcome:
+        """Record a named credit officer's stance on one annual
+        review — the act that closes the instance.
+
+        The stance reads a pack: the one named, or the latest
+        assembled for the instance, or one assembled now at the
+        review's due date. Every discipline in reviews.py runs
+        before anything is stored — officer role, coded reasons,
+        the condition machinery, the self-review countersignature
+        wall — and an instance closes exactly once: a second
+        outcome for the same review is refused by name, because a
+        changed stance is a later review's business, not an edit
+        of this one. An escalate_to_committee stance mints the
+        referral it hands to the committee machinery, in the same
+        act."""
+        credit_file = self._load(credit_file_id)
+        covenant_set = self._review_set_for(credit_file_id, set_id)
+        existing = [
+            o for o in self.store.list_review_outcomes(credit_file_id)
+            if o.set_id == covenant_set.set_id
+            and o.review_number == review_number
+        ]
+        if existing:
+            raise ValidationError(
+                f"annual review {review_number} on covenant set "
+                f"{covenant_set.set_id} already closed with "
+                f"outcome {existing[0].outcome_id} "
+                f"({existing[0].stance}): a review instance "
+                "closes exactly once"
+            )
+        instance = self._review_instance_for(
+            credit_file, covenant_set, review_number,
+            as_of=as_of or date(1, 1, 1),
+        )
+        if pack_id is not None:
+            pack = self.get_review_pack(credit_file_id, pack_id)
+            if pack.set_id != covenant_set.set_id \
+                    or pack.review_number != review_number:
+                raise ValidationError(
+                    f"review pack {pack_id} belongs to review "
+                    f"{pack.review_number} on set {pack.set_id}, "
+                    f"not review {review_number} on set "
+                    f"{covenant_set.set_id}: a stance reads the "
+                    "pack of the review it closes"
+                )
+        else:
+            packs = [
+                p for p in self.store.list_review_packs(credit_file_id)
+                if p.set_id == covenant_set.set_id
+                and p.review_number == review_number
+            ]
+            pack = packs[-1] if packs else self.assemble_review_pack(
+                credit_file_id,
+                review_number=review_number,
+                set_id=covenant_set.set_id,
+                as_of=as_of or instance.due_date,
+            )
+        memo = self._get_memo_raw(credit_file_id, covenant_set.memo_id)
+        stored_conditions = validate_review_outcome(
+            stance=stance,
+            reason_codes=list(reason_codes or []),
+            note=note,
+            conditions=list(conditions or []),
+            reviewer_id=reviewer_id,
+            reviewer_role=reviewer_role,
+            memo=memo,
+            memo_inputs=self._memo_inputs(memo),
+            countersigner_id=countersigner_id,
+            countersigner_role=countersigner_role,
+        )
+        descriptor = {
+            "credit_file_id": credit_file_id,
+            "set_id": covenant_set.set_id,
+            "review_number": review_number,
+            "pack_id": pack.pack_id,
+            "stance": stance,
+            "reason_codes": list(reason_codes or []),
+            "reviewer_id": reviewer_id,
+            "countersigner_id": countersigner_id,
+            "conditions": [
+                c.model_dump(mode="json") for c in stored_conditions
+            ],
+            "note": note,
+        }
+        outcome_id = f"reviewoutcome-{_canonical_hash(descriptor)[:16]}"
+        referral: CommitteeReferral | None = None
+        if stance == "escalate_to_committee":
+            referral = CommitteeReferral(
+                referral_id=(
+                    f"referral-{_canonical_hash({'outcome': outcome_id})[:16]}"
+                ),
+                credit_file_id=credit_file_id,
+                set_id=covenant_set.set_id,
+                review_number=review_number,
+                outcome_id=outcome_id,
+                pack_id=pack.pack_id,
+                memo_id=covenant_set.memo_id,
+                reason_codes=list(reason_codes or []),
+                reason_vocabulary=REVIEW_VOCABULARY_VERSION,
+                referred_by=reviewer_id,
+                referred_by_role=reviewer_role,
+                note=note,
+            )
+        outcome = AnnualReviewOutcome(
+            outcome_id=outcome_id,
+            credit_file_id=credit_file_id,
+            set_id=covenant_set.set_id,
+            review_number=review_number,
+            due_date=instance.due_date,
+            pack_id=pack.pack_id,
+            stance=stance,
+            reason_codes=list(reason_codes or []),
+            reason_vocabulary=REVIEW_VOCABULARY_VERSION,
+            reviewer_id=reviewer_id,
+            reviewer_role=reviewer_role,
+            countersigner_id=countersigner_id,
+            countersigner_role=countersigner_role,
+            conditions=stored_conditions,
+            referral_id=referral.referral_id if referral else None,
+            note=note,
+        )
+        is_new = self.store.get_review_outcome(outcome_id) is None
+        self.store.save_review_outcome(outcome)
+        if referral is not None:
+            self.store.save_committee_referral(referral)
+        if is_new:
+            detail = (
+                f"annual review {review_number} on covenant set "
+                f"{covenant_set.set_id} recorded {stance} by "
+                f"{reviewer_id} ({reviewer_role}) on pack "
+                f"{pack.pack_id}; reasons "
+                f"({REVIEW_VOCABULARY_VERSION}): "
+                + ", ".join(outcome.reason_codes)
+            )
+            if countersigner_id:
+                detail += f"; countersigned by {countersigner_id}"
+            if stored_conditions:
+                detail += f"; {len(stored_conditions)} condition(s)"
+            if referral is not None:
+                detail += (
+                    f"; escalated — committee referral "
+                    f"{referral.referral_id} recorded on memo "
+                    f"{referral.memo_id}"
+                )
+            self._audit(
+                credit_file_id, "annual_review_recorded", detail,
+                actor=reviewer_id,
+            )
+        return outcome
+
+    def list_review_outcomes(
+        self, credit_file_id: str
+    ) -> list[AnnualReviewOutcome]:
+        self._load(credit_file_id)
+        return self.store.list_review_outcomes(credit_file_id)
+
+    def list_committee_referrals(
+        self, credit_file_id: str
+    ) -> list[CommitteeReferral]:
+        self._load(credit_file_id)
+        return self.store.list_committee_referrals(credit_file_id)
+
+    def review_due_work(self, *, as_of: date) -> list[dict]:
+        """The annual review queue at `as_of`: every review
+        instance standing at overdue / due / due_soon across the
+        portfolio, worst first — which borrower, which review,
+        due when, and whether its pack has been assembled."""
+        queue: list[dict] = []
+        for credit_file in self.store.list_credit_files():
+            for covenant_set in self.store.list_covenant_sets(
+                credit_file.credit_file_id
+            ):
+                for instance in self._review_instances(
+                    credit_file, covenant_set, as_of=as_of
+                ):
+                    if instance.state in REVIEW_WORK_STATES:
+                        queue.append({
+                            "borrower": credit_file.borrower.legal_name,
+                            "credit_file_id": credit_file.credit_file_id,
+                            "instance": instance,
+                        })
+        order = {"overdue": 0, "due": 1, "due_soon": 2}
+        queue.sort(key=lambda entry: (
+            order[entry["instance"].state],
+            entry["instance"].due_date,
+            entry["borrower"],
+        ))
+        return queue
+
+    def _open_due_reviews_for(
+        self, credit_file: CreditFile, *, as_of: date
+    ) -> list[dict]:
+        """Assemble packs for one file's review instances that
+        stand due or overdue without an outcome and without a
+        pack — the scheduler opening the review, evidenced, so
+        the officer's stance has something to read."""
+        opened: list[dict] = []
+        for covenant_set in self.store.list_covenant_sets(
+            credit_file.credit_file_id
+        ):
+            for instance in self._review_instances(
+                credit_file, covenant_set, as_of=as_of
+            ):
+                if instance.state not in ("due", "overdue"):
+                    continue
+                if instance.outcome_id is not None \
+                        or instance.pack_id is not None:
+                    continue
+                pack = self.assemble_review_pack(
+                    credit_file.credit_file_id,
+                    review_number=instance.review_number,
+                    set_id=covenant_set.set_id,
+                    as_of=as_of,
+                )
+                opened.append({
+                    "credit_file_id": credit_file.credit_file_id,
+                    "borrower": credit_file.borrower.legal_name,
+                    "set_id": covenant_set.set_id,
+                    "review_number": instance.review_number,
+                    "due_date": instance.due_date,
+                    "pack_id": pack.pack_id,
+                    "complete": pack.complete,
+                })
+        return opened
+
+    def open_due_reviews(
+        self, *, as_of: date, credit_file_id: str | None = None
+    ) -> dict:
+        """Open every due annual review in the portfolio (or on
+        one file): assemble the pack for each instance standing
+        due or overdue that has neither an outcome nor a pack.
+        Idempotent — an opened review is not opened twice."""
+        files = (
+            [self._load(credit_file_id)]
+            if credit_file_id is not None
+            else self.store.list_credit_files()
+        )
+        opened: list[dict] = []
+        for credit_file in files:
+            opened.extend(
+                self._open_due_reviews_for(credit_file, as_of=as_of)
+            )
+        return {"as_of": as_of, "reviews_opened": opened}
 
     def amend_covenant(
         self,

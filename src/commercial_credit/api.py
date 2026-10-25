@@ -29,8 +29,13 @@ and its outstanding-items rendering. Round 10 adds covenants:
 recording the facility closing date, the covenant sets approvals
 create, the derived schedule (test dates, states, named required
 inputs) at a requested as_of, the portfolio due-work queue, the
-scheduler tick, and covenant amendment by supersession. Every
-request carries a request id into the structured logs.
+scheduler tick, and covenant amendment by supersession. Round
+11 adds covenant test execution and breach cases. Round 12 adds
+annual reviews: the derived review obligations per covenant set,
+pack assembly (verified summary included), the due-work queue,
+the scheduler opening due reviews, and the officer's coded
+outcome — with its committee referral when the stance escalates.
+Every request carries a request id into the structured logs.
 """
 
 from __future__ import annotations
@@ -875,16 +880,39 @@ def amend_covenant(
     return record.model_dump(mode="json")
 
 
+def _review_instance_view(instance) -> dict:  # noqa: ANN001, ANN202
+    """One derived annual review instance, as the API carries it."""
+    return {
+        "credit_file_id": instance.credit_file_id,
+        "set_id": instance.set_id,
+        "review_number": instance.review_number,
+        "anchor_date": instance.anchor_date.isoformat(),
+        "period_start": instance.period_start.isoformat(),
+        "due_date": instance.due_date.isoformat(),
+        "state": instance.state,
+        "days_until_due": instance.days_until_due,
+        "outcome_id": instance.outcome_id,
+        "pack_id": instance.pack_id,
+    }
+
+
 @app.get("/covenant-due-work")
 def get_covenant_due_work(as_of: date) -> list[dict]:
-    return [
-        {
+    out: list[dict] = []
+    for entry in pipeline.covenant_due_work(as_of=as_of):
+        item = {
             "borrower": entry["borrower"],
             "credit_file_id": entry["credit_file_id"],
-            "instance": entry["instance"].model_dump(mode="json"),
+            "kind": entry.get("kind", "covenant_schedule"),
         }
-        for entry in pipeline.covenant_due_work(as_of=as_of)
-    ]
+        if entry.get("instance") is not None:
+            item["instance"] = entry["instance"].model_dump(mode="json")
+        if entry.get("review_instance") is not None:
+            item["review_instance"] = _review_instance_view(
+                entry["review_instance"]
+            )
+        out.append(item)
+    return out
 
 
 class CovenantTickRequest(BaseModel):
@@ -922,6 +950,18 @@ def tick_covenants(body: CovenantTickRequest) -> dict:
                 "breach": entry["breach"].model_dump(mode="json"),
             }
             for entry in result["breaches_opened"]
+        ],
+        "reviews_opened": [
+            {
+                "credit_file_id": entry["credit_file_id"],
+                "borrower": entry["borrower"],
+                "set_id": entry["set_id"],
+                "review_number": entry["review_number"],
+                "due_date": entry["due_date"].isoformat(),
+                "pack_id": entry["pack_id"],
+                "complete": entry["complete"],
+            }
+            for entry in result["reviews_opened"]
         ],
     }
 
@@ -1139,3 +1179,186 @@ def default_breach(
         reason_code=body.reason_code, note=body.note,
     )
     return breach.model_dump(mode="json")
+
+
+# ------------------------------------------------------------------
+# Round 12: annual reviews. The obligations derive from each
+# covenant set's anchor; the pack assembles in code from stored
+# artefacts (its verified summary rides inside it); the outcome
+# is a named officer's coded stance that closes the instance —
+# and, when it escalates, the referral it created is readable
+# here. The scheduler tick above also opens due reviews.
+# ------------------------------------------------------------------
+
+
+@app.get("/applications/{credit_file_id}/annual-reviews")
+def get_annual_review_schedule(
+    credit_file_id: str, as_of: date, set_id: str | None = None
+) -> dict:
+    _file_or_404(credit_file_id)
+    schedule = pipeline.annual_review_schedule(
+        credit_file_id, as_of=as_of, set_id=set_id
+    )
+    return {
+        "credit_file_id": schedule["credit_file_id"],
+        "borrower": schedule["borrower"],
+        "as_of": schedule["as_of"].isoformat(),
+        "sets": [
+            {
+                "covenant_set": view["covenant_set"].model_dump(
+                    mode="json"
+                ),
+                "anchor_date": view["anchor_date"].isoformat(),
+                "anchor_basis": view["anchor_basis"],
+                "instances": [
+                    _review_instance_view(instance)
+                    for instance in view["instances"]
+                ],
+            }
+            for view in schedule["sets"]
+        ],
+    }
+
+
+class AssembleReviewPackRequest(BaseModel):
+    as_of: date
+    set_id: str | None = None
+    profile: str = "offline"
+
+
+@app.post(
+    "/applications/{credit_file_id}/annual-reviews/{review_number}/pack",
+    status_code=201,
+)
+def assemble_review_pack(
+    credit_file_id: str, review_number: int,
+    body: AssembleReviewPackRequest,
+) -> dict:
+    _file_or_404(credit_file_id)
+    pack = pipeline.assemble_review_pack(
+        credit_file_id,
+        review_number=review_number,
+        set_id=body.set_id,
+        as_of=body.as_of,
+        profile=body.profile,
+    )
+    return pack.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/annual-review-packs")
+def list_review_packs(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return [
+        pack.model_dump(mode="json")
+        for pack in pipeline.list_review_packs(credit_file_id)
+    ]
+
+
+@app.get(
+    "/applications/{credit_file_id}/annual-review-packs/{pack_id}"
+)
+def get_review_pack(credit_file_id: str, pack_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    return pipeline.get_review_pack(
+        credit_file_id, pack_id
+    ).model_dump(mode="json")
+
+
+class RecordReviewOutcomeRequest(BaseModel):
+    stance: str
+    reason_codes: list[str]
+    reviewer_id: str
+    reviewer_role: str
+    pack_id: str | None = None
+    set_id: str | None = None
+    as_of: date | None = None
+    countersigner_id: str | None = None
+    countersigner_role: str | None = None
+    conditions: list[CommitteeCondition] = []
+    note: str = ""
+
+
+@app.post(
+    "/applications/{credit_file_id}/annual-reviews/{review_number}/outcome",
+    status_code=201,
+)
+def record_review_outcome(
+    credit_file_id: str, review_number: int,
+    body: RecordReviewOutcomeRequest,
+) -> dict:
+    _file_or_404(credit_file_id)
+    outcome = pipeline.record_review_outcome(
+        credit_file_id,
+        review_number=review_number,
+        stance=body.stance,
+        reason_codes=body.reason_codes,
+        reviewer_id=body.reviewer_id,
+        reviewer_role=body.reviewer_role,
+        pack_id=body.pack_id,
+        set_id=body.set_id,
+        as_of=body.as_of,
+        countersigner_id=body.countersigner_id,
+        countersigner_role=body.countersigner_role,
+        conditions=body.conditions,
+        note=body.note,
+    )
+    return outcome.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/annual-review-outcomes")
+def list_review_outcomes(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return [
+        outcome.model_dump(mode="json")
+        for outcome in pipeline.list_review_outcomes(credit_file_id)
+    ]
+
+
+@app.get("/applications/{credit_file_id}/committee-referrals")
+def list_committee_referrals(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return [
+        referral.model_dump(mode="json")
+        for referral in pipeline.list_committee_referrals(credit_file_id)
+    ]
+
+
+@app.get("/annual-review-due-work")
+def get_annual_review_due_work(as_of: date) -> list[dict]:
+    return [
+        {
+            "borrower": entry["borrower"],
+            "credit_file_id": entry["credit_file_id"],
+            "review_instance": _review_instance_view(entry["instance"]),
+        }
+        for entry in pipeline.review_due_work(as_of=as_of)
+    ]
+
+
+class OpenDueReviewsRequest(BaseModel):
+    as_of: date
+    credit_file_id: str | None = None
+
+
+@app.post("/annual-reviews/open-due")
+def open_due_reviews(body: OpenDueReviewsRequest) -> dict:
+    if body.credit_file_id is not None:
+        _file_or_404(body.credit_file_id)
+    result = pipeline.open_due_reviews(
+        as_of=body.as_of, credit_file_id=body.credit_file_id
+    )
+    return {
+        "as_of": result["as_of"].isoformat(),
+        "reviews_opened": [
+            {
+                "credit_file_id": entry["credit_file_id"],
+                "borrower": entry["borrower"],
+                "set_id": entry["set_id"],
+                "review_number": entry["review_number"],
+                "due_date": entry["due_date"].isoformat(),
+                "pack_id": entry["pack_id"],
+                "complete": entry["complete"],
+            }
+            for entry in result["reviews_opened"]
+        ],
+    }
