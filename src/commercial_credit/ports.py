@@ -24,6 +24,7 @@ from .models import (
     MemoDiff,
     MemoReviewEvent,
     PolicyReport,
+    ReadinessReport,
     SourceDocument,
     Spread,
     SpreadAdjustment,
@@ -110,6 +111,16 @@ class CreditFileStore(Protocol):
     def list_policy_reports(
         self, credit_file_id: str
     ) -> list[PolicyReport]: ...
+
+    def save_readiness_report(self, report: ReadinessReport) -> None: ...
+
+    def get_readiness_report(
+        self, report_id: str
+    ) -> ReadinessReport | None: ...
+
+    def list_readiness_reports(
+        self, credit_file_id: str
+    ) -> list[ReadinessReport]: ...
 
     def save_memo(self, memo: CreditMemo) -> None: ...
 

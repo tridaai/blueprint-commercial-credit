@@ -24,6 +24,7 @@ from .models import (
     MemoDiff,
     MemoReviewEvent,
     PolicyReport,
+    ReadinessReport,
     Spread,
     SpreadAdjustment,
 )
@@ -41,6 +42,8 @@ class InMemoryCreditStore:
         self._pack_order: dict[str, list[str]] = {}
         self._reports: dict[str, PolicyReport] = {}
         self._report_order: dict[str, list[str]] = {}
+        self._readiness: dict[str, ReadinessReport] = {}
+        self._readiness_order: dict[str, list[str]] = {}
         self._memos: dict[str, CreditMemo] = {}
         self._memo_order: dict[str, list[str]] = {}
         self._review_events: dict[str, list[MemoReviewEvent]] = {}
@@ -140,6 +143,30 @@ class InMemoryCreditStore:
         return [
             self._reports[report_id].model_copy(deep=True)
             for report_id in self._report_order.get(credit_file_id, [])
+        ]
+
+    def save_readiness_report(self, report: ReadinessReport) -> None:
+        # Content-addressed, like the policy reports: storing the
+        # same report twice records it once.
+        if report.report_id in self._readiness:
+            return
+        self._readiness[report.report_id] = report.model_copy(deep=True)
+        self._readiness_order.setdefault(report.credit_file_id, []).append(
+            report.report_id
+        )
+
+    def get_readiness_report(
+        self, report_id: str
+    ) -> ReadinessReport | None:
+        report = self._readiness.get(report_id)
+        return report.model_copy(deep=True) if report else None
+
+    def list_readiness_reports(
+        self, credit_file_id: str
+    ) -> list[ReadinessReport]:
+        return [
+            self._readiness[report_id].model_copy(deep=True)
+            for report_id in self._readiness_order.get(credit_file_id, [])
         ]
 
     def save_memo(self, memo: CreditMemo) -> None:
@@ -260,6 +287,9 @@ class SqliteCreditStore:
                 pack_id TEXT PRIMARY KEY,
                 credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS policy_reports (
+                report_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS readiness_reports (
                 report_id TEXT PRIMARY KEY,
                 credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS memos (
@@ -414,6 +444,33 @@ class SqliteCreditStore:
             (credit_file_id,),
         ).fetchall()
         return [PolicyReport.model_validate_json(r[0]) for r in rows]
+
+    def save_readiness_report(self, report: ReadinessReport) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO readiness_reports (report_id, credit_file_id, payload) "
+                "VALUES (?, ?, ?) ON CONFLICT(report_id) DO NOTHING",
+                (report.report_id, report.credit_file_id, report.model_dump_json()),
+            )
+
+    def get_readiness_report(
+        self, report_id: str
+    ) -> ReadinessReport | None:
+        row = self._conn.execute(
+            "SELECT payload FROM readiness_reports WHERE report_id = ?",
+            (report_id,),
+        ).fetchone()
+        return ReadinessReport.model_validate_json(row[0]) if row else None
+
+    def list_readiness_reports(
+        self, credit_file_id: str
+    ) -> list[ReadinessReport]:
+        rows = self._conn.execute(
+            "SELECT payload FROM readiness_reports WHERE credit_file_id = ? "
+            "ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [ReadinessReport.model_validate_json(r[0]) for r in rows]
 
     def save_memo(self, memo: CreditMemo) -> None:
         with self._lock, self._conn:
@@ -808,6 +865,53 @@ class PostgresCreditStore:
             payload = row["payload"]
             out.append(
                 PolicyReport.model_validate(
+                    payload if isinstance(payload, dict) else json.loads(payload)
+                )
+            )
+        return out
+
+    def save_readiness_report(self, report: ReadinessReport) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO readiness_reports (report_id, credit_file_id, as_of, payload) "
+                "VALUES (%s, %s, %s, %s::jsonb) ON CONFLICT (report_id) DO NOTHING",
+                (
+                    report.report_id,
+                    report.credit_file_id,
+                    report.as_of,
+                    report.model_dump_json(),
+                ),
+            )
+
+    def get_readiness_report(
+        self, report_id: str
+    ) -> ReadinessReport | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM readiness_reports WHERE report_id = %s",
+                (report_id,),
+            ).fetchone()
+        if not row:
+            return None
+        payload = row["payload"]
+        return ReadinessReport.model_validate(
+            payload if isinstance(payload, dict) else json.loads(payload)
+        )
+
+    def list_readiness_reports(
+        self, credit_file_id: str
+    ) -> list[ReadinessReport]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM readiness_reports WHERE credit_file_id = %s "
+                "ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append(
+                ReadinessReport.model_validate(
                     payload if isinstance(payload, dict) else json.loads(payload)
                 )
             )
