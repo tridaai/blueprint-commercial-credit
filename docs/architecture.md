@@ -493,6 +493,94 @@ codes from `breach-resolution-reasons-v1`; terminal states
 refuse all transitions — and the store surface for breaches is
 exactly save/get/list, which the tests pin.
 
+## Annual reviews (round 12)
+
+The annual review is the post-approval obligation machinery:
+`src/commercial_credit/reviews.py` (derivation, pack inputs,
+locked facts, verifier, stance validation) plus pipeline
+services and migration `0011_annual_reviews.sql`.
+
+**Obligation derivation.** Instances are derived, never stored:
+for each covenant set (one per approved facility), the anchor is
+the closing date, or the committee decision's `decided_at` when
+no closing is recorded — the basis (`closing_date` /
+`approval_date`) is named on every instance. Due dates are
+`add_months(anchor, 12·n)` capped at `maturity_date(anchor,
+facility_term_months)`, on the same month lattice as covenants
+(Feb 29 anchor ⇒ Feb 28 / Feb 29 anniversaries). States:
+`scheduled` / `due_soon` (≤30 days) / `due` / `overdue` /
+`completed` (an outcome record closes the instance). The next
+instance's window opens at the previous due date regardless of
+when — or whether — the review landed.
+
+**The pack.** `AnnualReviewPack` is content-addressed over the
+pinned inputs: the covenant set, the decided memo, the spread
+and computation pack rebuilt through the existing engines on
+the latest statements (with the set's covenants as
+definitions), the covenant test results in the window with
+restatement standing derived at assembly, the window's breaches
+and all open breaches, material disagreements, the readiness
+report recomputed at the review date, and **two policy
+reports** — the memo's pinned version and
+`CURRENT_POLICY_VERSION` — with `PolicyOutcomeDifference` rows
+wherever outcomes differ. `complete` is false exactly when the
+readiness report blocks; the blockers are carried as
+`ReviewBlocker` rows and rendered into the locked facts.
+Assembly against a pack/instance/set mismatch is refused;
+re-assembly over unchanged inputs returns the same pack id
+(insert-once stores).
+
+**The summary.** `ReviewSummary` = locked facts + composer
+paragraphs + `ReviewSummaryVerification`. Locked facts are a
+pure function of the pack inputs (`locked_fact_paragraphs`),
+rendered by code: review position, period counts, one paragraph
+per failed covenant test and per breach, the policy record under
+both versions plus the differences paragraph, disagreements via
+the round-8 canonical renderer, and the INCOMPLETE PACK
+paragraph when blockers exist. The composer (model port;
+offline deterministic default, live profile refuses loudly
+until configured) writes prose. `verify_review_summary` builds
+the trace universe from the pinned artefacts (the memo
+verifier's machinery, extended with both policy reports, the
+period's covenant results and breach figures, and the locked
+counts), recomputes the canonical locked record from the
+inputs — never from the candidate — and refuses: any
+untraceable figure, any canonical locked paragraph absent or
+reworded in the rendered text, and any denial phrase
+contradicting an adversely stated fact (a closed list in the
+module: breaches-as-none, tests-as-all-passed,
+exceptions-as-full-compliance, incompleteness-as-complete).
+`check_review_summary` exposes the same verification as an
+examiner surface over a stored pack.
+
+**The gate.** `record_review_outcome` requires a named reviewer
+with a credit-officer role, a stance from
+`annual-review-reasons-v1` (affirm / affirm_with_conditions /
+place_on_watchlist / escalate_to_committee) and coded reasons
+from that stance's vocabulary. Conditions reuse round 7's
+`validate_conditions` + cadence-schedulability check verbatim.
+The decided memo's approving officer (`reviewed_by`) is the
+file's one identified insider: if they review, a countersigning
+officer (different person, officer role) is mandatory; any other
+officer reviews alone. An instance closes exactly once.
+`escalate_to_committee` mints a `CommitteeReferral` in the same
+act — pack, outcome, decided memo, stance codes, `open` — the
+surface the round-7 machinery convenes on; no committee logic is
+rebuilt. Outcomes and referrals are content-addressed,
+insert-once, in all three stores.
+
+**Surfaces.** `GET /applications/{id}/annual-reviews?as_of=`,
+`POST …/annual-reviews/{n}/pack`, `GET
+…/annual-review-packs[/{pack_id}]`, `POST
+…/annual-review-packs/{pack_id}/check-summary`, `POST
+…/annual-reviews/{n}/outcome`, `GET …/annual-review-outcomes`,
+`GET …/committee-referrals`, `GET
+/annual-review-due-work?as_of=`. Review instances join
+`covenant_due_work` (tagged `kind: "annual_review"`), and
+`tick_covenants` gains `reviews_opened`: packs assembled
+idempotently for due/overdue instances that have neither an
+outcome nor a pack.
+
 ## Storage
 
 PostgreSQL is the deployment store. `migrations/` holds numbered SQL

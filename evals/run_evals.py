@@ -247,6 +247,35 @@ committee-ready file taken through a conditional approval:
                             inputs named, and the amendment lands
                             as version 2 in the derived schedule.
 
+Round 12 counters — annual reviews, graded on approved files
+taken through their first review year:
+
+  review_schedule_date_     the derived review anniversaries —
+    wrong                   the pure leap-day table and the
+                            approved set's five due dates.
+                            REQUIRED: 0.
+  review_stale_pack_        a pack assembled over stale inputs
+    marked_complete         must be produced incomplete, its
+                            blockers named; the fresh pack must
+                            read complete. REQUIRED: 0.
+  review_pack_figure_       an invented figure and a dropped
+    untraceable             locked fact in the review summary
+                            are both refused. REQUIRED: 0
+                            accepted.
+  review_summary_breach_    a breach denied in summary prose is
+    softened                refused, and the locked record states
+                            the failure. REQUIRED: 0.
+  review_closed_without_    the review may not close anonymously,
+    officer_or_stance       unroled, uncoded, or by the decided
+                            memo's approver acting alone.
+                            REQUIRED: 0 accepted.
+  review_positive_paths     the pack assembles complete over the
+                            breach year, affirm lands
+                            countersigned and the instance
+                            completes, watchlist lands, escalation
+                            records its committee referral, and
+                            the v1-to-v2 differences are named.
+
 Later rounds add counters as their machinery lands.
 Exit code 0 = GATE: PASS.
 """
@@ -2740,6 +2769,226 @@ def main() -> int:
           f"{'pass recorded clean, fail → breach → cured by FY2027 pass, breach waived on the committee decision, restatement flags + re-test passes' if testing_positive else 'FAILED'}")
     if not testing_positive:
         failures.append("a covenant testing positive path did not land")
+
+    # ---------------------------------------------------------------
+    # Round 12: annual review packs. The obligation derives from
+    # the covenant set's anchor — the graded tables include a
+    # leap-day closing (Feb 28 in common years, Feb 29 in leap
+    # years). The pack assembles from stored artefacts under both
+    # policy versions, differences named; its summary is verified
+    # — an invented figure, a dropped locked fact, or a breach
+    # denied in prose is refused; a stale pack is produced
+    # incomplete, never blessed complete; the stance is a coded
+    # act of a named officer, and the decided memo's approver may
+    # not review alone. Zero tolerance on every counter.
+    # ---------------------------------------------------------------
+    from commercial_credit.covenants import (
+        maturity_date as _maturity_date,
+    )
+    from commercial_credit.reviews import (
+        review_due_dates as _review_due_dates,
+    )
+
+    date_wrong = 0
+    _leap_anchor = date(2024, 2, 29)
+    if _review_due_dates(
+        _leap_anchor, maturity=_maturity_date(_leap_anchor, 60)
+    ) != [
+        date(2025, 2, 28), date(2026, 2, 28), date(2027, 2, 28),
+        date(2028, 2, 29), date(2029, 2, 28),
+    ]:
+        date_wrong += 1
+    rp = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    rcf, _r_decision = _t_approved(rp)
+    r_instances = rp.annual_review_schedule(
+        rcf, as_of=date(2027, 6, 15)
+    )["sets"][0]["instances"]
+    if [i.due_date for i in r_instances] != [
+        date(2027, 7, 1), date(2028, 7, 1), date(2029, 7, 1),
+        date(2030, 7, 1), date(2031, 7, 1),
+    ] or r_instances[0].state != "due_soon":
+        date_wrong += 1
+    print(f"review_schedule_date_wrong: {date_wrong} of 2 graded "
+          f"tables (required 0)")
+    if date_wrong:
+        failures.append("an annual review date was wrong")
+
+    # The breach-year pack: FY2026 delivered, its tests run, the
+    # pack assembled at 2027-03-01 — complete, carrying the
+    # period's failures and breaches in its locked record.
+    _t_deliver(rp, rcf, 2026, _T_FY2026)
+    rp.run_due_covenant_tests(rcf, as_of=date(2027, 3, 1))
+    r_pack = rp.assemble_review_pack(
+        rcf, review_number=1, as_of=date(2027, 3, 1)
+    )
+    # The stale pack: a second approved file, no new statements —
+    # produced at its due date incomplete, naming its blockers,
+    # with the v1→v2 differences on the record.
+    sp = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    scf, _s_decision = _t_approved(sp)
+    s_pack = sp.assemble_review_pack(
+        scf, review_number=1, as_of=date(2027, 7, 1)
+    )
+    stale_marked = 0
+    if s_pack.complete or not s_pack.blockers:
+        stale_marked += 1
+    if not any(
+        p.startswith("INCOMPLETE PACK")
+        for p in s_pack.summary.locked_facts
+    ):
+        stale_marked += 1
+    if r_pack.complete is not True or r_pack.blockers:
+        stale_marked += 1
+    print(f"review_stale_pack_marked_complete: {stale_marked} "
+          f"(required 0)")
+    if stale_marked:
+        failures.append("a stale review pack was marked complete")
+
+    # Tamper probes on the verified summary: an invented figure
+    # and a dropped locked fact are both refused.
+    untraceable_accepted = 0
+    untraceable_accepted += _refused(lambda: rp.check_review_summary(
+        rcf, r_pack.pack_id,
+        paragraphs=[
+            *r_pack.summary.paragraphs,
+            "The exposure now totals $999,999.99.",
+        ],
+        locked_facts=r_pack.summary.locked_facts,
+    ))
+    _softened_locked = [
+        p for p in r_pack.summary.locked_facts
+        if not p.startswith("FAILED COVENANT TEST")
+    ]
+    untraceable_accepted += _refused(lambda: rp.check_review_summary(
+        rcf, r_pack.pack_id,
+        paragraphs=r_pack.summary.paragraphs,
+        locked_facts=_softened_locked,
+    ))
+    print(f"review_pack_figure_untraceable: "
+          f"{untraceable_accepted} of 2 probes accepted (required 0)")
+    if untraceable_accepted:
+        failures.append("a tampered review summary was accepted")
+
+    # A breach denied in prose is a softened summary — refused;
+    # and the locked record itself must state the failure.
+    softened = _refused(lambda: rp.check_review_summary(
+        rcf, r_pack.pack_id,
+        paragraphs=[
+            *r_pack.summary.paragraphs,
+            "There were no breaches in the period.",
+        ],
+        locked_facts=r_pack.summary.locked_facts,
+    ))
+    if not any(
+        p.startswith("FAILED COVENANT TEST")
+        for p in r_pack.summary.locked_facts
+    ):
+        softened += 1
+    print(f"review_summary_breach_softened: {softened} (required 0)")
+    if softened:
+        failures.append("a review summary softened a breach")
+
+    # The stance's discipline: anonymous, unroled, uncoded, and
+    # the memo's own approver acting alone are all refused.
+    closed_unlawful = 0
+    closed_unlawful += _refused(lambda: rp.record_review_outcome(
+        rcf, review_number=1, stance="affirm",
+        reason_codes=["performance_in_line"],
+        reviewer_id="", reviewer_role=C_OFFICER_ROLE,
+        pack_id=r_pack.pack_id,
+    ))
+    closed_unlawful += _refused(lambda: rp.record_review_outcome(
+        rcf, review_number=1, stance="affirm",
+        reason_codes=["performance_in_line"],
+        reviewer_id="rm-eval", reviewer_role="relationship_manager",
+        pack_id=r_pack.pack_id,
+    ))
+    closed_unlawful += _refused(lambda: rp.record_review_outcome(
+        rcf, review_number=1, stance="affirm",
+        reason_codes=[],
+        reviewer_id=C_OFFICER, reviewer_role=C_OFFICER_ROLE,
+        pack_id=r_pack.pack_id,
+    ))
+    closed_unlawful += _refused(lambda: rp.record_review_outcome(
+        rcf, review_number=1, stance="affirm",
+        reason_codes=["performance_in_line"],
+        reviewer_id=C_OFFICER, reviewer_role=C_OFFICER_ROLE,
+        pack_id=r_pack.pack_id,
+    ))
+    print(f"review_closed_without_officer_or_stance: "
+          f"{closed_unlawful} of 4 probes accepted (required 0)")
+    if closed_unlawful:
+        failures.append("a review closed without a lawful stance")
+
+    # Positive paths: the approver affirms with a countersigning
+    # officer and the instance completes (the next derives,
+    # unmoved); a watchlist stance lands on the stale file; an
+    # escalation records its committee referral; the stale pack
+    # names the v1 pass that v2 fails.
+    affirm = rp.record_review_outcome(
+        rcf, review_number=1, stance="affirm",
+        reason_codes=["covenant_breach_in_period"],
+        reviewer_id=C_OFFICER, reviewer_role=C_OFFICER_ROLE,
+        countersigner_id="officer-eval-two",
+        countersigner_role="senior_credit_officer",
+        pack_id=r_pack.pack_id,
+    )
+    r_after = rp.annual_review_schedule(
+        rcf, as_of=date(2027, 3, 2)
+    )["sets"][0]["instances"]
+    affirm_ok = (
+        r_after[0].state == "completed"
+        and r_after[0].outcome_id == affirm.outcome_id
+        and r_after[1].period_start == date(2027, 7, 1)
+        and r_after[1].due_date == date(2028, 7, 1)
+    )
+    watch = sp.record_review_outcome(
+        scf, review_number=1, stance="place_on_watchlist",
+        reason_codes=["incomplete_inputs"],
+        reviewer_id="officer-eval-two",
+        reviewer_role="senior_credit_officer",
+        pack_id=s_pack.pack_id,
+    )
+    ep = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    ecf, _e_decision = _t_approved(ep)
+    e_pack = ep.assemble_review_pack(
+        ecf, review_number=1, as_of=date(2027, 7, 1)
+    )
+    esc = ep.record_review_outcome(
+        ecf, review_number=1, stance="escalate_to_committee",
+        reason_codes=["policy_exception_open"],
+        reviewer_id="officer-eval-two",
+        reviewer_role="senior_credit_officer",
+        pack_id=e_pack.pack_id,
+    )
+    e_referrals = ep.list_committee_referrals(ecf)
+    referral_ok = (
+        esc.referral_id is not None
+        and len(e_referrals) == 1
+        and e_referrals[0].referral_id == esc.referral_id
+        and e_referrals[0].pack_id == e_pack.pack_id
+    )
+    s_differences = {
+        d.test_id: (d.pinned_outcome, d.current_outcome)
+        for d in s_pack.policy_differences
+    }
+    review_positive = (
+        affirm_ok
+        and watch.stance == "place_on_watchlist"
+        and referral_ok
+        and s_differences.get("min_dscr") == ("pass", "fail")
+        and r_pack.summary.verification.verified
+    )
+    print(f"review_positive_paths: "
+          f"{'pack assembles complete over the breach year, affirm lands countersigned and the instance completes, watchlist lands, escalation records its referral, v1-to-v2 differences named' if review_positive else 'FAILED'}")
+    if not review_positive:
+        failures.append("an annual review positive path did not land")
 
     if failures:
         print("GATE: FAIL")

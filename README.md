@@ -611,6 +611,66 @@ actually works:
   resolution actions `POST
   /applications/{id}/breach-cases/{breach_id}/review|escalate|cure|waive|default`.
 
+## What round 12 adds
+
+The committee's approval starts a clock, and this round builds
+the machinery that keeps it: the **annual review**. Every
+approved facility with a covenant set owes a review twelve
+months after closing — or after approval, when no closing is
+recorded, with the basis named on the schedule, never silently
+guessed — and annually to maturity. The instances are derived
+in code from the anchor (month-lattice arithmetic: a leap-day
+closing reviews on Feb 28 in common years, Feb 29 in leap
+years), carry the states `scheduled / due_soon / due /
+overdue / completed`, join the covenant due-work queue, and
+are opened by the scheduler tick idempotently. A late review
+never pushes the next one out; each instance derives from the
+anchor.
+
+The **review pack** is a content-addressed artefact assembled
+in code from stored artefacts only — nothing is spread or
+computed by hand. The spread is rebuilt and the figures
+recomputed through the existing engines on the latest
+statements, the covenant test history for the period is carried
+with its restatement standing, every breach of the period and
+every open breach ride along with their resolution state, and
+material disagreements carry exactly as round 8 left them.
+Policy is run **twice**: under the version the decided memo
+pinned and under the current version, with every per-test
+difference surfaced on the record — a tightening pack never
+silently re-bases the file's history. Readiness is recomputed
+at the review date, and a pack whose required inputs are stale
+or missing is still produced — marked **incomplete**, naming
+every blocker. Absence is named, never papered over.
+
+The officer-facing **review summary** follows the house
+discipline: the facts are locked paragraphs rendered by code
+from the pinned artefacts (the review position, the covenant
+record with every failed test named, every breach, the policy
+record under both versions, disagreements, the incomplete
+section when there is one), and the composer's narrative is
+passed through the same figure verifier as the memo — every
+figure traces to the pack's pinned inputs. The verifier
+recomputes the locked record from those inputs rather than
+trusting the candidate: a dropped locked fact, a reworded one,
+an invented figure, or a breach denied in prose ("there were no
+breaches") are all refused mechanically.
+
+The **review gate** closes the loop. A named reviewer holding a
+credit-officer role records the outcome in a coded stance from
+the versioned vocabulary `annual-review-reasons-v1` — `affirm`,
+`affirm_with_conditions`, `place_on_watchlist`,
+`escalate_to_committee` — each with coded reasons; conditions
+reuse the committee's machinery whole, so a financial-covenant
+condition must trace to a real figure. The officer who approved
+the decided memo may not review it alone: their affirmation
+needs a countersigning officer, a different person with an
+officer role. An escalation mints a **committee referral** in
+the same act — a recorded artefact naming the pack, the
+outcome, and the decided memo the committee machinery acts on.
+An instance closes exactly once; the next year's instance
+already stands derived from the anchor.
+
 ## The laws (enforced in code, never in prompts)
 
 1. **No model-computed numbers.** Extraction returns values +
