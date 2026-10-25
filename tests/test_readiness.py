@@ -483,16 +483,29 @@ def test_no_waiver_surface_exists():
             "waiv" in name or "override" in name or name == "force"
             for name in params
         ), fn.__name__
-    # No method that waives or overrides anything — with one
-    # named exception that is not a readiness surface at all:
+    # No method that waives or overrides anything — with three
+    # named entries that are not readiness surfaces at all:
+    # _overrides_for is round 12's private lookup (the review
+    # gate reloading a pack's pinned countersign override) and
+    # list_rating_overrides is round 13's read-only listing of
+    # the recorded override artefacts;
     # round 11's waive_breach resolves a covenant BREACH, only
     # on a committee decision's authority, and cannot touch a
     # readiness blocker (its parameters name a breach and a
-    # decision, never a file's readiness).
+    # decision, never a file's readiness); round 13's
+    # override_rating moves a risk rating's FINAL grade, at most
+    # one grade from the assigned grade, for a coded reason,
+    # countersigned by a second officer — its parameters name an
+    # assignment and a grade, never a file's readiness, and the
+    # readiness report it could supposedly clear has no field
+    # for it to write.
     assert [
         name for name in dir(CreditPipeline)
         if "waiv" in name or "override" in name
-    ] == ["waive_breach"]
+    ] == [
+        "_overrides_for", "list_rating_overrides",
+        "override_rating", "waive_breach",
+    ]
     # No waiver field on the report or its entries.
     for model in (ReadinessReport, ReadinessEntry):
         assert not any(
