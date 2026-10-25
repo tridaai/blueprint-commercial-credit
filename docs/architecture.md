@@ -395,6 +395,63 @@ never disagree. Storage is one table (`readiness_reports`,
 migration 0008) behind the store port, payload-shaped like the
 policy reports.
 
+## Covenants (round 10)
+
+`covenants.py` holds the monitoring structure design law 6 names.
+Three separations keep it honest. First, **the set is an artefact,
+the schedule is a derivation**: a `CovenantSet` (content-addressed,
+migration 0009) is created once by one committee decision — its
+financial-covenant conditions plus the policy template for the
+facility type, held as data in the module with its policy
+citations — and pins the decision id and the memo's policy pack
+version. The schedule is never stored: `derive_schedule` recomputes
+every test instance from the set, the file's current spread years
+and an `as_of` passed in, so the same inputs always produce the
+same instances, ids included. Second, **dates are lattice
+arithmetic, not day-stepping**: fiscal period ends are computed on
+a (year, month) lattice with the day clamped to the month's last
+day, which is what makes quarter ends land on Mar 31 (not Mar 30),
+leap-day closings clamp cleanly, and a June fiscal year end shift
+the whole calendar. Tests run to the facility's maturity (closing
++ term) and a point-in-time covenant adds a final test at maturity
+itself. A reporting deliverable's due date is its period end plus
+the policy's reporting lag (90 days annual, 60 semiannual, 45
+quarterly); a deliverable whose period is already spread is met
+and leaves the schedule.
+
+State is derived per instance: a fiscal test whose period is not
+yet spread stands at `awaiting_inputs` from the moment its chasing
+window opens, naming the spread inputs it needs — missing inputs
+dominate the deadline states for a test, because a test that
+cannot be run is not late, it is unready; for a deliverable the
+date states stand, because the missing thing is the obligation
+itself. The scheduler is the pipeline's `tick_covenants`: it walks
+the derived schedules and writes an audit event the first time an
+instance is seen at `due` or `overdue`, keyed by the instance id
+in the event detail, so re-running the tick at the same `as_of`
+records nothing twice. `covenant_due_work` folds every file's
+work-state instances into one ordered queue (overdue, due,
+awaiting inputs, due soon), each naming its borrower and inputs.
+
+Third, **terms change by supersession, never by edit**. The stores
+expose no update path for a set or a covenant — save is
+insert-once, amendments are their own append-only artefacts
+(`covenant_amendments`, migration 0009). `validate_amendment`
+checks the whole discipline purely: a named author in an amending
+role, a coded reason from `covenant-amendment-reasons-v1`, an
+authorising decision that is an approval on the same file, and a
+change that actually changes something; the minted covenant is
+version n+1 naming its predecessor, and the set's current
+covenants are derived as the latest version of each lineage —
+amending by a superseded id walks the lineage rather than forking
+it. The set's closing anchor is likewise a recorded fact, not an
+edit: `CreditFile.closing_date` is set only through
+`record_closing`, which audits the first recording and names a
+later change as a correction; a set created before any closing
+exists waits in the named `awaiting_closing_date` state, and the
+schedule derivation applies the file's closing date when it
+arrives without rewriting the stored set.
+
 ## Storage
 
 PostgreSQL is the deployment store. `migrations/` holds numbered SQL

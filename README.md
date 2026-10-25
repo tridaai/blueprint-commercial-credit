@@ -480,8 +480,69 @@ place, before anyone convenes:
   /applications/{id}/readiness-reports[/{report_id}]`, and `GET
   /applications/{id}/outstanding-items`.
 
-Later rounds add the covenant monitoring loop that schedules
-round 7's conditions.
+## What round 10 adds
+
+The covenant model and scheduler — design law 6: covenants are
+clocks + math. An approval is not the end of a credit's life; it
+is the start of its monitoring life, and this round builds the
+structure that life runs on:
+
+- **The covenant set** — created in the same act as a committee
+  approval (plain or conditional; a decline or deferral creates
+  none), from two sources kept visibly distinct: the decision's
+  own financial-covenant conditions (thresholds already traced at
+  the round 7 gate) and the policy pack's standard template for
+  the facility type — a leverage ceiling tested quarterly, a DSCR
+  floor tested annually, a liquidity floor — defined as data with
+  its policy citations. Where a condition and the template name
+  the same test, the committee's term governs and the template
+  entry is not duplicated. A condition whose cadence the
+  scheduler cannot read as quarterly, semiannual or annual
+  refuses the decision before anything is stored: a covenant that
+  cannot be scheduled is never quietly dropped from monitoring.
+  The set pins the memo's policy pack version and the decision id
+  it came from (migration `0009`).
+- **The closing anchor** — test dates derive from the facility's
+  closing date, a recorded file fact (`POST
+  /applications/{id}/closing`, by a named actor, audited; a
+  changed date is a named correction, never a silent edit). A set
+  created before the closing is recorded stands in the named
+  `awaiting_closing_date` state: its covenants exist, its
+  schedule waits — no anchor is ever guessed.
+- **The schedule, derived in code** — pure date arithmetic over
+  the closing date and the term, `as_of` always passed in, no
+  wall clock: fiscal period ends at each covenant's cadence
+  (month-lattice arithmetic, so leap years and fiscal-year
+  offsets land exactly), capped at maturity, with a final
+  point-in-time test at maturity itself. Reporting-requirement
+  conditions ride the same schedule as dated deliverables (annual
+  statements due 90 days after fiscal year end). Every instance
+  stands in a derived state — `scheduled` / `due_soon` / `due` /
+  `overdue`, or `awaiting_inputs`, naming the exact spread inputs
+  the test needs (a fiscal test whose period is not yet spread
+  cannot be run, and says what it is waiting for).
+- **The scheduler + the queue** — an idempotent tick (`POST
+  /covenant-scheduler/tick`) records each instance's first
+  sighting at due or overdue on the credit file's audit trail;
+  re-running it records nothing twice. The due-work queue (`GET
+  /covenant-due-work?as_of=`) answers the monitoring question
+  across the portfolio: what is due, for which borrower, needing
+  which inputs.
+- **Amendment by supersession** — a covenant's threshold,
+  operator, frequency or grace is never edited. An amendment
+  mints the next version of the covenant with a named author in
+  an amending role, a coded reason from the versioned vocabulary
+  (`covenant-amendment-reasons-v1`), and the committee decision
+  that authorised it; the stored set is byte-identical before and
+  after, and tests prove no in-place mutation surface exists on
+  the pipeline or any store. New API surface: `GET
+  /applications/{id}/covenant-sets[/{set_id}]`, `GET
+  /applications/{id}/covenant-schedule?as_of=`, `GET
+  /applications/{id}/covenant-amendments`, `POST
+  /applications/{id}/covenants/{covenant_id}/amendments`.
+
+Round 11 adds the other half of law 6: re-spreading on new
+financials, testing the due covenants in code, and breach cases.
 
 ## The laws (enforced in code, never in prompts)
 
