@@ -13,10 +13,13 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from .models import (
+    AnnualReviewOutcome,
+    AnnualReviewPack,
     AuditEvent,
     Borrower,
     BreachCase,
     CommitteeDecision,
+    CommitteeReferral,
     ComputationPack,
     CovenantAmendment,
     CovenantSet,
@@ -198,6 +201,38 @@ class CreditFileStore(Protocol):
     def list_covenant_test_results(
         self, credit_file_id: str
     ) -> list[CovenantTestResult]: ...
+
+    def save_review_pack(self, pack: AnnualReviewPack) -> None: ...
+
+    def get_review_pack(
+        self, pack_id: str
+    ) -> AnnualReviewPack | None: ...
+
+    def list_review_packs(
+        self, credit_file_id: str
+    ) -> list[AnnualReviewPack]: ...
+
+    def save_review_outcome(self, outcome: AnnualReviewOutcome) -> None: ...
+
+    def get_review_outcome(
+        self, outcome_id: str
+    ) -> AnnualReviewOutcome | None: ...
+
+    def list_review_outcomes(
+        self, credit_file_id: str
+    ) -> list[AnnualReviewOutcome]: ...
+
+    def save_committee_referral(
+        self, referral: CommitteeReferral
+    ) -> None: ...
+
+    def get_committee_referral(
+        self, referral_id: str
+    ) -> CommitteeReferral | None: ...
+
+    def list_committee_referrals(
+        self, credit_file_id: str
+    ) -> list[CommitteeReferral]: ...
 
     def save_breach_case(self, breach: BreachCase) -> None: ...
 

@@ -15,9 +15,12 @@ from pathlib import Path
 
 from .errors import StoreUnavailableError
 from .models import (
+    AnnualReviewOutcome,
+    AnnualReviewPack,
     AuditEvent,
     BreachCase,
     CommitteeDecision,
+    CommitteeReferral,
     ComputationPack,
     CovenantAmendment,
     CovenantSet,
@@ -62,6 +65,12 @@ class InMemoryCreditStore:
         self._test_result_order: dict[str, list[str]] = {}
         self._breaches: dict[str, BreachCase] = {}
         self._breach_order: dict[str, list[str]] = {}
+        self._review_packs: dict[str, AnnualReviewPack] = {}
+        self._review_pack_order: dict[str, list[str]] = {}
+        self._review_outcomes: dict[str, AnnualReviewOutcome] = {}
+        self._review_outcome_order: dict[str, list[str]] = {}
+        self._referrals: dict[str, CommitteeReferral] = {}
+        self._referral_order: dict[str, list[str]] = {}
 
     def save_credit_file(self, credit_file: CreditFile) -> None:
         self._files[credit_file.credit_file_id] = credit_file.model_copy(deep=True)
@@ -360,6 +369,86 @@ class InMemoryCreditStore:
             for breach in self._breaches.values()
         ]
 
+    # -- Round 12: annual review packs, outcomes, referrals.
+    # All three are content-addressed artefacts, stored
+    # insert-once like the packs and reports they sit beside:
+    # the same assembly, the same stance, the same referral is
+    # the same record, stored once.
+
+    def save_review_pack(self, pack: AnnualReviewPack) -> None:
+        if pack.pack_id in self._review_packs:
+            return
+        self._review_packs[pack.pack_id] = pack.model_copy(deep=True)
+        self._review_pack_order.setdefault(
+            pack.credit_file_id, []
+        ).append(pack.pack_id)
+
+    def get_review_pack(
+        self, pack_id: str
+    ) -> AnnualReviewPack | None:
+        pack = self._review_packs.get(pack_id)
+        return pack.model_copy(deep=True) if pack else None
+
+    def list_review_packs(
+        self, credit_file_id: str
+    ) -> list[AnnualReviewPack]:
+        return [
+            self._review_packs[pack_id].model_copy(deep=True)
+            for pack_id in self._review_pack_order.get(credit_file_id, [])
+        ]
+
+    def save_review_outcome(self, outcome: AnnualReviewOutcome) -> None:
+        if outcome.outcome_id in self._review_outcomes:
+            return
+        self._review_outcomes[outcome.outcome_id] = outcome.model_copy(
+            deep=True
+        )
+        self._review_outcome_order.setdefault(
+            outcome.credit_file_id, []
+        ).append(outcome.outcome_id)
+
+    def get_review_outcome(
+        self, outcome_id: str
+    ) -> AnnualReviewOutcome | None:
+        outcome = self._review_outcomes.get(outcome_id)
+        return outcome.model_copy(deep=True) if outcome else None
+
+    def list_review_outcomes(
+        self, credit_file_id: str
+    ) -> list[AnnualReviewOutcome]:
+        return [
+            self._review_outcomes[outcome_id].model_copy(deep=True)
+            for outcome_id in self._review_outcome_order.get(
+                credit_file_id, []
+            )
+        ]
+
+    def save_committee_referral(
+        self, referral: CommitteeReferral
+    ) -> None:
+        if referral.referral_id in self._referrals:
+            return
+        self._referrals[referral.referral_id] = referral.model_copy(
+            deep=True
+        )
+        self._referral_order.setdefault(
+            referral.credit_file_id, []
+        ).append(referral.referral_id)
+
+    def get_committee_referral(
+        self, referral_id: str
+    ) -> CommitteeReferral | None:
+        referral = self._referrals.get(referral_id)
+        return referral.model_copy(deep=True) if referral else None
+
+    def list_committee_referrals(
+        self, credit_file_id: str
+    ) -> list[CommitteeReferral]:
+        return [
+            self._referrals[referral_id].model_copy(deep=True)
+            for referral_id in self._referral_order.get(credit_file_id, [])
+        ]
+
     def ping(self) -> bool:
         return True
 
@@ -429,6 +518,18 @@ class SqliteCreditStore:
             CREATE TABLE IF NOT EXISTS breach_cases (
                 breach_id TEXT PRIMARY KEY,
                 credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS annual_review_packs (
+                pack_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, set_id TEXT NOT NULL,
+                review_number INTEGER NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS annual_review_outcomes (
+                outcome_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, set_id TEXT NOT NULL,
+                review_number INTEGER NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS committee_referrals (
+                referral_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, outcome_id TEXT NOT NULL,
+                payload TEXT NOT NULL);
             """
         )
         self._conn.commit()
@@ -826,6 +927,119 @@ class SqliteCreditStore:
                     breach.model_dump_json(),
                 ),
             )
+
+    # -- Round 12: annual review packs, outcomes, referrals —
+    # content-addressed artefacts, insert-once like the reports.
+
+    def save_review_pack(self, pack: AnnualReviewPack) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO annual_review_packs (pack_id, "
+                "credit_file_id, set_id, review_number, payload) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(pack_id) DO NOTHING",
+                (
+                    pack.pack_id, pack.credit_file_id, pack.set_id,
+                    pack.review_number, pack.model_dump_json(),
+                ),
+            )
+
+    def get_review_pack(
+        self, pack_id: str
+    ) -> AnnualReviewPack | None:
+        row = self._conn.execute(
+            "SELECT payload FROM annual_review_packs "
+            "WHERE pack_id = ?",
+            (pack_id,),
+        ).fetchone()
+        return AnnualReviewPack.model_validate_json(row[0]) if row else None
+
+    def list_review_packs(
+        self, credit_file_id: str
+    ) -> list[AnnualReviewPack]:
+        rows = self._conn.execute(
+            "SELECT payload FROM annual_review_packs "
+            "WHERE credit_file_id = ? ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [AnnualReviewPack.model_validate_json(r[0]) for r in rows]
+
+    def save_review_outcome(self, outcome: AnnualReviewOutcome) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO annual_review_outcomes (outcome_id, "
+                "credit_file_id, set_id, review_number, payload) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(outcome_id) DO NOTHING",
+                (
+                    outcome.outcome_id, outcome.credit_file_id,
+                    outcome.set_id, outcome.review_number,
+                    outcome.model_dump_json(),
+                ),
+            )
+
+    def get_review_outcome(
+        self, outcome_id: str
+    ) -> AnnualReviewOutcome | None:
+        row = self._conn.execute(
+            "SELECT payload FROM annual_review_outcomes "
+            "WHERE outcome_id = ?",
+            (outcome_id,),
+        ).fetchone()
+        return (
+            AnnualReviewOutcome.model_validate_json(row[0]) if row else None
+        )
+
+    def list_review_outcomes(
+        self, credit_file_id: str
+    ) -> list[AnnualReviewOutcome]:
+        rows = self._conn.execute(
+            "SELECT payload FROM annual_review_outcomes "
+            "WHERE credit_file_id = ? ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [
+            AnnualReviewOutcome.model_validate_json(r[0]) for r in rows
+        ]
+
+    def save_committee_referral(
+        self, referral: CommitteeReferral
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO committee_referrals (referral_id, "
+                "credit_file_id, outcome_id, payload) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(referral_id) DO NOTHING",
+                (
+                    referral.referral_id, referral.credit_file_id,
+                    referral.outcome_id, referral.model_dump_json(),
+                ),
+            )
+
+    def get_committee_referral(
+        self, referral_id: str
+    ) -> CommitteeReferral | None:
+        row = self._conn.execute(
+            "SELECT payload FROM committee_referrals "
+            "WHERE referral_id = ?",
+            (referral_id,),
+        ).fetchone()
+        return (
+            CommitteeReferral.model_validate_json(row[0]) if row else None
+        )
+
+    def list_committee_referrals(
+        self, credit_file_id: str
+    ) -> list[CommitteeReferral]:
+        rows = self._conn.execute(
+            "SELECT payload FROM committee_referrals "
+            "WHERE credit_file_id = ? ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [
+            CommitteeReferral.model_validate_json(r[0]) for r in rows
+        ]
 
     def get_breach_case(self, breach_id: str) -> BreachCase | None:
         row = self._conn.execute(
@@ -1543,6 +1757,126 @@ class PostgresCreditStore:
                 )
             )
         return out
+
+    # -- Round 12: annual review packs, outcomes, referrals —
+    # content-addressed artefacts, insert-once (migration 0011).
+
+    @staticmethod
+    def _validate(model, row):  # noqa: ANN001, ANN202
+        if row is None:
+            return None
+        payload = row["payload"]
+        return model.model_validate(
+            payload if isinstance(payload, dict) else json.loads(payload)
+        )
+
+    def save_review_pack(self, pack: AnnualReviewPack) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO annual_review_packs (pack_id, "
+                "credit_file_id, set_id, review_number, payload) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb) "
+                "ON CONFLICT (pack_id) DO NOTHING",
+                (
+                    pack.pack_id, pack.credit_file_id, pack.set_id,
+                    pack.review_number, pack.model_dump_json(),
+                ),
+            )
+
+    def get_review_pack(
+        self, pack_id: str
+    ) -> AnnualReviewPack | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM annual_review_packs "
+                "WHERE pack_id = %s",
+                (pack_id,),
+            ).fetchone()
+        return self._validate(AnnualReviewPack, row)
+
+    def list_review_packs(
+        self, credit_file_id: str
+    ) -> list[AnnualReviewPack]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM annual_review_packs "
+                "WHERE credit_file_id = %s ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        return [self._validate(AnnualReviewPack, row) for row in rows]
+
+    def save_review_outcome(self, outcome: AnnualReviewOutcome) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO annual_review_outcomes (outcome_id, "
+                "credit_file_id, set_id, review_number, payload) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb) "
+                "ON CONFLICT (outcome_id) DO NOTHING",
+                (
+                    outcome.outcome_id, outcome.credit_file_id,
+                    outcome.set_id, outcome.review_number,
+                    outcome.model_dump_json(),
+                ),
+            )
+
+    def get_review_outcome(
+        self, outcome_id: str
+    ) -> AnnualReviewOutcome | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM annual_review_outcomes "
+                "WHERE outcome_id = %s",
+                (outcome_id,),
+            ).fetchone()
+        return self._validate(AnnualReviewOutcome, row)
+
+    def list_review_outcomes(
+        self, credit_file_id: str
+    ) -> list[AnnualReviewOutcome]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM annual_review_outcomes "
+                "WHERE credit_file_id = %s ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        return [self._validate(AnnualReviewOutcome, row) for row in rows]
+
+    def save_committee_referral(
+        self, referral: CommitteeReferral
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO committee_referrals (referral_id, "
+                "credit_file_id, outcome_id, payload) "
+                "VALUES (%s, %s, %s, %s::jsonb) "
+                "ON CONFLICT (referral_id) DO NOTHING",
+                (
+                    referral.referral_id, referral.credit_file_id,
+                    referral.outcome_id, referral.model_dump_json(),
+                ),
+            )
+
+    def get_committee_referral(
+        self, referral_id: str
+    ) -> CommitteeReferral | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM committee_referrals "
+                "WHERE referral_id = %s",
+                (referral_id,),
+            ).fetchone()
+        return self._validate(CommitteeReferral, row)
+
+    def list_committee_referrals(
+        self, credit_file_id: str
+    ) -> list[CommitteeReferral]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM committee_referrals "
+                "WHERE credit_file_id = %s ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        return [self._validate(CommitteeReferral, row) for row in rows]
 
     def ping(self) -> bool:
         try:
