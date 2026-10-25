@@ -452,6 +452,47 @@ exists waits in the named `awaiting_closing_date` state, and the
 schedule derivation applies the file's closing date when it
 arrives without rewriting the stored set.
 
+## Covenant testing and breach cases (round 11)
+
+Execution deliberately adds no math. `covenant_testing.py` holds
+the discipline — result identity, restatement standing, lineage,
+the breach state machine and its validators, all pure — and the
+pipeline supplies the engines: a due test builds a
+`CovenantDefinition` from the current covenant version and calls
+`compute_metrics`, which re-spreads through the round 2 engine
+and recomputes through the round 3 engine; the test reads its
+figure out of the stored pack's own covenant result and compares
+it with the engine's operator table, so a result can never
+disagree with the headroom the pack recorded. The result id is a
+content hash over the instance, the covenant version, the spread
+and pack ids, the outcome and the result it supersedes — the
+same test over the same inputs is the same artefact, stored
+insert-once in all three stores (migration `0010`).
+
+Standing is derived, never stored: each result pins the tested
+period's sources (document id, hash, version per source type,
+from the spread's `PeriodSource` records), and a result reads
+`superseded_by_restatement` when the current spread's sources
+for that period no longer match its pin. The scheduler tick —
+extended, still idempotent — runs due tests after recording
+crossings: an instance whose head result is superseded, or whose
+awaiting result's statements have arrived, is re-tested with the
+new result naming its predecessor. A point-in-time instance
+whose current period moves when newer statements arrive is
+re-tested over the new period the same way.
+
+A breach case is the one living record of this round: opened by
+the failing test (its id derived from the result id), upserted
+as its acts accumulate, its event history append-only inside the
+payload. The validators are mechanical — a cure must name a
+stored result that passes, postdates the failure, and tests the
+same covenant lineage (walked across amendment supersessions);
+a waiver must name a stored committee decision of the same file
+with an approval outcome; escalation and defaulting must carry
+codes from `breach-resolution-reasons-v1`; terminal states
+refuse all transitions — and the store surface for breaches is
+exactly save/get/list, which the tests pin.
+
 ## Storage
 
 PostgreSQL is the deployment store. `migrations/` holds numbered SQL

@@ -541,8 +541,75 @@ structure that life runs on:
   /applications/{id}/covenant-amendments`, `POST
   /applications/{id}/covenants/{covenant_id}/amendments`.
 
-Round 11 adds the other half of law 6: re-spreading on new
-financials, testing the due covenants in code, and breach cases.
+## What round 11 adds
+
+Covenant test execution and breach cases — the math half of
+design law 6. Round 10 derived the schedule; this round runs the
+tests on it, and gives a failure the workflow object a bank
+actually works:
+
+- **Test execution through the existing engines** — when a
+  covenant test instance is due and its period's statements are
+  on file, the test re-spreads the period through the round 2
+  spreading engine and recomputes the covenant's metric through
+  the round 3 computation engine: no new math lives in this
+  round. The figure is read out of the stored computation pack's
+  own covenant result and compared against the covenant's
+  threshold with the covenant's operator. The outcome is recorded
+  as a `CovenantTestResult` artefact — instance, covenant
+  id+version, spread id, computation pack id, figure, threshold,
+  outcome, as-of — content-addressed and insert-once (migration
+  `0010`), so re-running a test over the same inputs stores
+  nothing twice and the tick can run as often as the bank likes.
+- **Honest outcomes** — `pass` / `fail` / `not_evaluable` /
+  `awaiting_inputs`, and no fifth state. A test whose statements
+  have not arrived stands at `awaiting_inputs`, recorded with
+  the exact inputs it is waiting for — blocked on the borrower,
+  never silently skipped. A test whose figure cannot be computed
+  (the statements arrived without the cash-flow page, say) is
+  `not_evaluable`, naming the missing input; a `not_evaluable`
+  never reads as a pass and opens no breach — nothing has been
+  measured.
+- **Breach cases** — a failing test opens its `BreachCase` in
+  the same act, so a failure without a case cannot exist: one
+  breach per failing result, carrying the covenant, the figure,
+  the threshold, and a cure deadline (test date + the covenant's
+  cure period). The state machine runs `open → under_review →
+  cured / waived / escalated / defaulted_path`, and every move
+  is a coded act by a named officer in a breach role, appended
+  to the case's event history and the audit trail: **cured**
+  only by a later passing re-test of the same covenant, linked
+  by result id (the failing result cannot cure its own breach);
+  **waived** only on the authority of a stored committee
+  decision of the same credit file with an approval outcome — a
+  waiver that names no decision, an invented one, or a decline
+  is a free-text waiver and is refused; **escalated** and
+  **defaulted** under coded reasons from the versioned
+  vocabulary (`breach-resolution-reasons-v1`), the default path
+  reachable only through review or escalation. Cured, waived
+  and defaulted are terminal and refuse every further act.
+  There is no delete and no silent close: an unworked breach
+  stays open, ageing against its cure deadline on every list.
+- **Restated-input discipline** — every result pins the period
+  sources it rested on (the exact document versions of the
+  tested period). When the borrower restates that period, the
+  result's standing derives as `superseded_by_restatement` —
+  flagged at read time, never rewritten — a re-test is
+  scheduled and run against the restated figures, and the new
+  result supersedes the old by id; the original record, and any
+  breach it opened, stand.
+- **Portfolio surface** — the scheduler tick now also executes
+  due tests and reports what it recorded and opened. API:
+  `POST /applications/{id}/covenant-tests/run`, `POST
+  /applications/{id}/covenant-tests/{instance_id}/run`, `GET
+  /applications/{id}/covenant-test-results` (each with its
+  restatement standing), `GET
+  /applications/{id}/covenants/{covenant_id}/history`, `GET
+  /breach-cases?as_of=` and `GET
+  /applications/{id}/breach-cases[/{breach_id}]?as_of=` (with
+  ageing: days in breach, days to the cure deadline), and the
+  resolution actions `POST
+  /applications/{id}/breach-cases/{breach_id}/review|escalate|cure|waive|default`.
 
 ## The laws (enforced in code, never in prompts)
 
