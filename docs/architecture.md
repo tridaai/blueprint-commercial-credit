@@ -62,10 +62,12 @@ that turns a credit file's extractions + adjustments into a `Spread`.
 Determinism is a design constraint, not a hope: inputs are canonically
 sorted, the spread carries no timestamps or random ids, and its id is
 a hash of its canonical content, so rebuilds converge byte-identically
-(the eval gate rebuilds and compares). Within a period, the latest
-filed statement version supplies every value; earlier versions are
-named in `period_sources.superseded_document_ids` and their
-extractions remain in the store. Adjustments are validated on receipt
+(the eval gate rebuilds and compares). Within a period and a source
+type (round 8), the latest filed version of that type supplies its
+values; earlier versions are named in
+`period_sources.superseded_document_ids` and their extractions remain
+in the store. Across source types nothing supersedes — see the
+disagreements section below. Adjustments are validated on receipt
 (`require_valid_adjustment` + taxonomy membership) before they are
 stored, and the spread carries both the unadjusted values and the
 derived adjusted view per line and period.
@@ -312,6 +314,43 @@ both. The API exposes convene, decide, the committee state
 adverse-action notice for a memo's latest decline; memo history
 gains the memo's committee decisions alongside its versions,
 events and diff.
+
+## Document disagreements (round 8)
+
+`disagreements.py` holds the source-type vocabulary (audited
+statements, tax return, management statements), the precedence
+between them (audited > tax > management), and the disagreement
+policy as versioned data: tolerances per pair and line, and the
+materiality thresholds. Extraction stamps every value with its
+source type; the spreading builder resolves, per (line, period,
+source type), the type's current-version figure, takes the
+highest-precedence reporter as the spread's working value, and
+runs every multi-source line through `detect_disagreement`. A
+difference beyond tolerance becomes a `Disagreement` record on
+the spread — every source's value, provenance and SHA, deltas
+against the working figure, the materiality verdict, the policy
+version — and, being spread content, is covered by the spread id.
+
+Downstream, the record is load-bearing in two places. The
+computation engine walks each figure's derivation steps
+(transitively, through step and figure inputs, and across the
+global pack's entity boundary via the entity packs' own flags)
+and stamps `disagreement_ids` on figures resting on a materially
+disagreed cell; immaterial disagreements flag nothing. The memo
+verifier holds the disagreements section to the exceptions
+discipline: the section must exist when the spread records
+disagreements, its structured id list must equal the spread's
+material set exactly, and each material disagreement must appear
+as the canonical paragraph `render_disagreement_paragraph`
+produces — so rewording a material difference into smaller
+language is a mechanical refusal, not an editorial judgement.
+Flagged figures trace in the memo with a source string naming
+the disagreement, so a contested figure never verifies as a
+clean one. The officer gate locks the section against edits.
+The API serves the records at
+`/applications/{id}/disagreements[/{disagreement_id}]` with a
+materiality filter; the spread payload carries them in full, so
+no new tables or migration were needed.
 
 ## Storage
 

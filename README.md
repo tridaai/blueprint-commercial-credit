@@ -338,9 +338,83 @@ codes tied to evidence (design law 3):
   in_committee → committee_approved |
   committee_approved_conditional | declined | deferred.
 
-Later rounds add disagreement handling, staleness blocks, and
-the covenant monitoring loop that schedules round 7's
-conditions.
+Later rounds add staleness blocks and the covenant monitoring
+loop that schedules round 7's conditions.
+
+## What round 8 adds
+
+Disagreement handling — design law 5 made mechanical. A
+borrower's figures arrive from more than one kind of source, and
+the kinds do not always agree; this round is the discipline for
+that, end to end:
+
+- **Sources are typed, and the types never merge** — every
+  extracted value is stamped with its source type (audited
+  statements, tax return, management statements). Supersession —
+  round 2's restatement rule — now runs *within* a source type:
+  a corrected audited statement replaces the earlier audited
+  statement. A tax return filed later supersedes nothing; it
+  stands beside the audit as a different witness. The spread
+  records the current document version per (period, source
+  type), so both witnesses stay retrievable as reported.
+- **Precedence without concealment** — the spread's working
+  figure follows a stated precedence in a versioned disagreement
+  policy (`aldergrove-disagreements` v1): audited first, then
+  tax, then management. Where two source types report different
+  figures for a line beyond the policy's tolerances — exact-zero
+  tolerance between the audit and the tax return on revenue,
+  EBIT and net income, a 0.1% relative tolerance elsewhere — the
+  spread records a **Disagreement**: the line, the period, every
+  source's value with its full provenance (document, SHA,
+  page/line), the absolute and relative delta of each from the
+  working figure, and a materiality verdict (material at 2% of
+  the figure or $50,000). The record is part of the spread's
+  content, so the spread id covers it. Nothing is averaged, ever:
+  on the seed borrower's FY2024 revenue the three witnesses
+  report $12,374,000 / $11,905,000 / $12,410,000, and the spread
+  carries $12,374,000 — the audited figure — with all three on
+  the record.
+- **Figures over contested lines are flagged** — the computation
+  engine (now `aldergrove-compute-v2`) walks each figure's
+  derivation: a figure that reads a materially disagreed line —
+  directly, through an intermediate step, or through a figure it
+  consumes — carries the disagreement's id on its own record,
+  including across the global pack's entity boundary. The figure
+  still computes, from the precedence value; it can never present
+  as clean, because the memo figure verifier's trace for a
+  flagged figure names the disagreement it rests on. Figures
+  over lines whose only disagreements are immaterial are not
+  flagged: the distinction is the policy's, applied in code.
+- **The memo carries them, structurally** — when the spread
+  records disagreements, the memo gains a *Document
+  disagreements* section: every material disagreement stated in
+  its record's own terms (each source's figure, the deltas, the
+  verdict), rendered by one canonical function the verifier
+  requires verbatim. The verifier checks the section's id list
+  against the spread's material set exactly — the same
+  discipline round 5 applied to policy exceptions — so a memo
+  that drops the section, omits a material disagreement, lists
+  an immaterial one as material, or rewords a material
+  difference into smaller language is refused, the omission
+  named. Immaterial disagreements are counted in the section
+  and listed in full through the API. The section is locked at
+  the credit officer gate, like the exceptions section: the gate
+  cannot soften what the spread recorded.
+- **The seed borrower gains its other witnesses** — Hartline's
+  FY2024 tax return (revenue $469,000 under the audit, EBIT
+  $219,200 under) and management accounts (a touch higher),
+  grading detection exactly: seven disagreements, five material,
+  two immaterial, and none on the lines where the witnesses
+  concur. New API surface: `GET
+  /applications/{id}/disagreements` (list, `?material=`
+  filter) and `GET /applications/{id}/disagreements/{id}`
+  (detail); the spread view carries the records and the
+  per-type period sources. No migration was needed:
+  disagreements are content of the spread artefact, stored in
+  its payload like the packs and memos.
+
+Later rounds add staleness blocks (round 9) and the covenant
+monitoring loop that schedules round 7's conditions.
 
 ## The laws (enforced in code, never in prompts)
 
