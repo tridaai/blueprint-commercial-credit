@@ -105,6 +105,27 @@ Round 5 counters — memo drafting + the figure verifier:
     discipline              every number the offline composer emits
                             exists in the inputs it composed from.
 
+Round 6 counters — the credit officer gate:
+
+  officer_anonymous_        gate actions with an empty officer id
+    action_accepted         or role (submit, approve, return) must
+                            each be REFUSED. REQUIRED: 0 accepted.
+  officer_illegal_          deciding a memo that is not in officer
+    transition_accepted     review, submitting one twice, and
+                            approving a returned memo must each be
+                            REFUSED. REQUIRED: 0 accepted.
+  officer_untraceable_      an approval whose edit introduces a
+    edit_stored             figure the verifier cannot trace must
+                            store NOTHING — no final memo, no diff.
+                            REQUIRED: 0 stored.
+  officer_exception_        an approval whose edit targets the
+    drop_stored             exceptions section (to drop or soften
+                            an outcome) must store NOTHING.
+                            REQUIRED: 0 stored.
+  officer_diff_missing_     every approval — with edits and
+    for_edited_approval     as-is — records its MemoDiff.
+                            REQUIRED: 0 missing.
+
 Later rounds add counters (stale-input committee-ready, decline
 without coded reasons) as their machinery lands. Exit code
 0 = GATE: PASS.
@@ -135,6 +156,7 @@ from commercial_credit.errors import (  # noqa: E402
     CreditError,
     MemoVerificationError,
     ProvenanceError,
+    ValidationError,
 )
 from commercial_credit.memo import (  # noqa: E402
     MemoInputs,
@@ -1049,6 +1071,197 @@ def main() -> int:
           f"{'identical memo id on recomposition' if memo_deterministic else 'MISMATCH'}")
     if not memo_deterministic:
         failures.append("memo recomposition did not reproduce the identical memo")
+
+    # ---------------------------------------------------------------
+    # Round 6: the credit officer gate, graded on its refusals and
+    # its record. The Hartline draft (pipeline r3) takes the
+    # edited-approval path; a second file opened cold takes the
+    # return → recompose → approve path and the illegal
+    # transitions. Zero tolerance throughout: one accepted
+    # anonymous action, illegal transition or bad edit fails.
+    # ---------------------------------------------------------------
+    OFFICER = "officer-eval"
+    OFFICER_ROLE = "credit_officer"
+    RM = "rm-eval"
+    RM_ROLE = "relationship_manager"
+    gate_cf = hartline_memo.credit_file_id
+    gate_mid = hartline_memo.memo_id
+
+    # Anonymous actions: an empty id or role names nobody, and the
+    # gate records nobody.
+    anonymous_attempts = [
+        lambda: r3.submit_memo_for_review(
+            gate_cf, gate_mid, actor="", actor_role=RM_ROLE
+        ),
+        lambda: r3.approve_memo(
+            gate_cf, gate_mid, officer_id="", officer_role=OFFICER_ROLE
+        ),
+        lambda: r3.return_memo(
+            gate_cf, gate_mid, officer_id=OFFICER, officer_role="",
+            reason_codes=["insufficient_analysis"],
+        ),
+    ]
+    anonymous_accepted = 0
+    for attempt in anonymous_attempts:
+        try:
+            attempt()
+            anonymous_accepted += 1
+        except ValidationError:
+            pass
+    print(f"officer_anonymous_action_accepted: {anonymous_accepted} of "
+          f"{len(anonymous_attempts)} anonymous actions accepted "
+          f"(required 0)")
+    if anonymous_accepted:
+        failures.append("the officer gate accepted an anonymous action")
+
+    # The Hartline draft enters review.
+    r3.submit_memo_for_review(gate_cf, gate_mid, actor=RM, actor_role=RM_ROLE)
+    memos_before = len(r3.store.list_memos(gate_cf))
+
+    # An edit introducing an untraceable figure stores nothing.
+    untraceable_stored = 0
+    try:
+        r3.approve_memo(
+            gate_cf, gate_mid, officer_id=OFFICER,
+            officer_role=OFFICER_ROLE,
+            edits={
+                "recommendation": [
+                    "Recommend approval; reserves of $8,888,888.88 "
+                    "stand behind the facility."
+                ]
+            },
+        )
+        untraceable_stored = 1  # the approval itself landed
+    except MemoVerificationError:
+        if (
+            len(r3.store.list_memos(gate_cf)) != memos_before
+            or r3.store.list_memo_diffs(gate_cf)
+        ):
+            untraceable_stored = 1
+    print(f"officer_untraceable_edit_stored: {untraceable_stored} "
+          f"stored (required 0)")
+    if untraceable_stored:
+        failures.append("an approval with an untraceable edited figure was stored")
+
+    # An edit aimed at the exceptions section stores nothing.
+    exception_drop_stored = 0
+    try:
+        r3.approve_memo(
+            gate_cf, gate_mid, officer_id=OFFICER,
+            officer_role=OFFICER_ROLE,
+            edits={"policy_exceptions": ["No exceptions."]},
+        )
+        exception_drop_stored = 1
+    except ValidationError:
+        if (
+            len(r3.store.list_memos(gate_cf)) != memos_before
+            or r3.store.list_memo_diffs(gate_cf)
+        ):
+            exception_drop_stored = 1
+    print(f"officer_exception_drop_stored: {exception_drop_stored} "
+          f"stored (required 0)")
+    if exception_drop_stored:
+        failures.append("an approval editing the exceptions section was stored")
+
+    # The clean edited approval lands, with its diff recorded.
+    diff_missing = 0
+    edited_final = r3.approve_memo(
+        gate_cf, gate_mid, officer_id=OFFICER, officer_role=OFFICER_ROLE,
+        edits={
+            "recommendation": [
+                "Recommend approval of the $1,500,000.00 term "
+                "facility, subject to the conditions recorded below."
+            ]
+        },
+    )
+    edited_diff = r3.store.get_memo_diff_by_final(edited_final.memo_id)
+    if (
+        edited_diff is None
+        or edited_diff.action != "approved_with_edits"
+        or not any(
+            c.kind == "added" and c.new_text == "$1,500,000.00"
+            for c in edited_diff.figure_changes
+        )
+    ):
+        diff_missing += 1
+    if r3.memo_status(gate_cf, gate_mid) != "officer_approved":
+        failures.append("the edited approval did not close the review")
+
+    # Illegal transitions + the return/recompose path, on a cold file.
+    gate_pipeline = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    g_borrower, g_facility = ReferenceLosFeed().fetch_application(
+        "LOS-2026-0117"
+    )
+    g_file = gate_pipeline.open_application(g_borrower, g_facility)
+    g_cf = g_file.credit_file_id
+    g_mid = gate_pipeline.store.list_memos(g_cf)[0].memo_id
+    illegal_attempts = [
+        lambda: gate_pipeline.approve_memo(
+            g_cf, g_mid, officer_id=OFFICER, officer_role=OFFICER_ROLE
+        ),  # still a draft
+    ]
+    gate_pipeline.submit_memo_for_review(
+        g_cf, g_mid, actor=RM, actor_role=RM_ROLE
+    )
+    illegal_attempts.append(
+        lambda: gate_pipeline.submit_memo_for_review(
+            g_cf, g_mid, actor=RM, actor_role=RM_ROLE
+        )  # already in review
+    )
+    gate_pipeline.return_memo(
+        g_cf, g_mid, officer_id=OFFICER, officer_role=OFFICER_ROLE,
+        reason_codes=["insufficient_analysis"],
+    )
+    illegal_attempts.append(
+        lambda: gate_pipeline.approve_memo(
+            g_cf, g_mid, officer_id=OFFICER, officer_role=OFFICER_ROLE
+        )  # returned — must be recomposed first
+    )
+    illegal_accepted = 0
+    for attempt in illegal_attempts:
+        try:
+            attempt()
+            illegal_accepted += 1
+        except ValidationError:
+            pass
+    print(f"officer_illegal_transition_accepted: {illegal_accepted} of "
+          f"{len(illegal_attempts)} illegal transitions accepted "
+          f"(required 0)")
+    if illegal_accepted:
+        failures.append("the officer gate accepted an illegal transition")
+
+    g_draft2 = gate_pipeline.recompose_memo(
+        g_cf, supersedes_memo_id=g_mid, actor=RM, actor_role=RM_ROLE
+    )
+    gate_pipeline.submit_memo_for_review(
+        g_cf, g_draft2.memo_id, actor=RM, actor_role=RM_ROLE
+    )
+    g_final = gate_pipeline.approve_memo(
+        g_cf, g_draft2.memo_id, officer_id=OFFICER,
+        officer_role=OFFICER_ROLE,
+    )
+    asis_diff = gate_pipeline.store.get_memo_diff_by_final(g_final.memo_id)
+    if (
+        asis_diff is None
+        or asis_diff.section_changes
+        or asis_diff.figure_changes
+    ):
+        diff_missing += 1
+    print(f"officer_diff_missing_for_edited_approval: {diff_missing} "
+          f"missing over 2 approvals (required 0)")
+    if diff_missing:
+        failures.append("an approval landed without its diff record")
+    gate_positive = (
+        edited_final.status == "officer_approved"
+        and g_final.status == "officer_approved"
+        and gate_pipeline.memo_status(g_cf, g_mid) == "returned"
+    )
+    print(f"officer_gate_positive_paths: "
+          f"{'edited approval + return/recompose/approve landed' if gate_positive else 'FAILED'}")
+    if not gate_positive:
+        failures.append("an officer gate positive path did not land")
 
     if failures:
         print("GATE: FAIL")
