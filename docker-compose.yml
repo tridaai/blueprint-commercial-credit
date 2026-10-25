@@ -1,0 +1,75 @@
+# Production-shaped stack for the Commercial Credit Memo &
+# Covenant Monitoring Agent.
+#
+#   docker compose up --build
+#
+# serves the API at http://localhost:8000 — fully wired, no host
+# state: credit files live in PostgreSQL (db), source documents in
+# object storage (minio). Credentials below are local-stack defaults
+# for this reference stack, overridable via the environment; a real
+# deployment injects them from a secrets manager and puts TLS in
+# front of every hop — see docs/architecture.md.
+
+services:
+  api:
+    build:
+      context: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://credit:credit-local-only@db:5432/credit
+      S3_ENDPOINT_URL: http://minio:8333
+      S3_BUCKET: credit-documents
+      S3_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    depends_on:
+      db:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  db:
+    # PostgreSQL 16 + pgvector: credit files today; comparable-
+    # borrower retrieval joins in a later round.
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: credit
+      POSTGRES_PASSWORD: credit-local-only
+      POSTGRES_DB: credit
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U credit -d credit"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # S3-compatible object storage for source documents. SeaweedFS's
+  # S3 gateway — service name stays `minio` so S3_ENDPOINT_URL above
+  # doesn't need to change; only the port (9000 -> 8333) does.
+  minio:
+    image: chrislusf/seaweedfs:latest
+    command: server -s3 -dir=/data -ip=0.0.0.0
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8333/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  minio-init:
+    # One-shot: create the documents bucket, then exit. SeaweedFS's
+    # S3 gateway doesn't enforce SigV4 auth in this unconfigured
+    # mode, so a plain unsigned PUT is enough.
+    image: curlimages/curl:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["sh", "-c", "code=$$(curl -s -o /dev/null -w '%{http_code}' -X PUT http://minio:8333/credit-documents); case $$code in 200|204|409) exit 0 ;; *) echo \"bucket create failed: HTTP $$code\" >&2; exit 1 ;; esac"]
+
+volumes:
+  pgdata:
+  miniodata:
