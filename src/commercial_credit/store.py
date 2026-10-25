@@ -20,6 +20,8 @@ from .models import (
     CreditFile,
     CreditMemo,
     ExtractedValue,
+    MemoDiff,
+    MemoReviewEvent,
     PolicyReport,
     Spread,
     SpreadAdjustment,
@@ -40,6 +42,9 @@ class InMemoryCreditStore:
         self._report_order: dict[str, list[str]] = {}
         self._memos: dict[str, CreditMemo] = {}
         self._memo_order: dict[str, list[str]] = {}
+        self._review_events: dict[str, list[MemoReviewEvent]] = {}
+        self._diffs: dict[str, MemoDiff] = {}
+        self._diff_order: dict[str, list[str]] = {}
 
     def save_credit_file(self, credit_file: CreditFile) -> None:
         self._files[credit_file.credit_file_id] = credit_file.model_copy(deep=True)
@@ -153,6 +158,45 @@ class InMemoryCreditStore:
             for memo_id in self._memo_order.get(credit_file_id, [])
         ]
 
+    def save_memo_review_event(self, event: MemoReviewEvent) -> None:
+        # Append-only: a recorded gate action is never rewritten.
+        self._review_events.setdefault(event.credit_file_id, []).append(
+            event.model_copy(deep=True)
+        )
+
+    def list_memo_review_events(
+        self, credit_file_id: str, memo_id: str | None = None
+    ) -> list[MemoReviewEvent]:
+        events = self._review_events.get(credit_file_id, [])
+        return [
+            e.model_copy(deep=True)
+            for e in events
+            if memo_id is None or e.memo_id == memo_id
+        ]
+
+    def save_memo_diff(self, diff: MemoDiff) -> None:
+        # Content-addressed: the same diff id is the same record.
+        if diff.diff_id in self._diffs:
+            return
+        self._diffs[diff.diff_id] = diff.model_copy(deep=True)
+        self._diff_order.setdefault(diff.credit_file_id, []).append(diff.diff_id)
+
+    def get_memo_diff(self, diff_id: str) -> MemoDiff | None:
+        diff = self._diffs.get(diff_id)
+        return diff.model_copy(deep=True) if diff else None
+
+    def get_memo_diff_by_final(self, memo_id: str) -> MemoDiff | None:
+        for diff in self._diffs.values():
+            if diff.to_memo_id == memo_id:
+                return diff.model_copy(deep=True)
+        return None
+
+    def list_memo_diffs(self, credit_file_id: str) -> list[MemoDiff]:
+        return [
+            self._diffs[diff_id].model_copy(deep=True)
+            for diff_id in self._diff_order.get(credit_file_id, [])
+        ]
+
     def ping(self) -> bool:
         return True
 
@@ -191,6 +235,14 @@ class SqliteCreditStore:
             CREATE TABLE IF NOT EXISTS memos (
                 memo_id TEXT PRIMARY KEY,
                 credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS memo_review_events (
+                event_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, memo_id TEXT NOT NULL,
+                payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS memo_diffs (
+                diff_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, from_memo_id TEXT NOT NULL,
+                to_memo_id TEXT NOT NULL, payload TEXT NOT NULL);
             """
         )
         self._conn.commit()
@@ -350,6 +402,72 @@ class SqliteCreditStore:
             (credit_file_id,),
         ).fetchall()
         return [CreditMemo.model_validate_json(r[0]) for r in rows]
+
+    def save_memo_review_event(self, event: MemoReviewEvent) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO memo_review_events (event_id, credit_file_id, memo_id, payload) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(event_id) DO NOTHING",
+                (
+                    event.event_id,
+                    event.credit_file_id,
+                    event.memo_id,
+                    event.model_dump_json(),
+                ),
+            )
+
+    def list_memo_review_events(
+        self, credit_file_id: str, memo_id: str | None = None
+    ) -> list[MemoReviewEvent]:
+        if memo_id is None:
+            rows = self._conn.execute(
+                "SELECT payload FROM memo_review_events "
+                "WHERE credit_file_id = ? ORDER BY rowid",
+                (credit_file_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT payload FROM memo_review_events "
+                "WHERE credit_file_id = ? AND memo_id = ? ORDER BY rowid",
+                (credit_file_id, memo_id),
+            ).fetchall()
+        return [MemoReviewEvent.model_validate_json(r[0]) for r in rows]
+
+    def save_memo_diff(self, diff: MemoDiff) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO memo_diffs (diff_id, credit_file_id, from_memo_id, to_memo_id, payload) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(diff_id) DO NOTHING",
+                (
+                    diff.diff_id,
+                    diff.credit_file_id,
+                    diff.from_memo_id,
+                    diff.to_memo_id,
+                    diff.model_dump_json(),
+                ),
+            )
+
+    def get_memo_diff(self, diff_id: str) -> MemoDiff | None:
+        row = self._conn.execute(
+            "SELECT payload FROM memo_diffs WHERE diff_id = ?",
+            (diff_id,),
+        ).fetchone()
+        return MemoDiff.model_validate_json(row[0]) if row else None
+
+    def get_memo_diff_by_final(self, memo_id: str) -> MemoDiff | None:
+        row = self._conn.execute(
+            "SELECT payload FROM memo_diffs WHERE to_memo_id = ?",
+            (memo_id,),
+        ).fetchone()
+        return MemoDiff.model_validate_json(row[0]) if row else None
+
+    def list_memo_diffs(self, credit_file_id: str) -> list[MemoDiff]:
+        rows = self._conn.execute(
+            "SELECT payload FROM memo_diffs WHERE credit_file_id = ? "
+            "ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [MemoDiff.model_validate_json(r[0]) for r in rows]
 
     def ping(self) -> bool:
         try:
@@ -659,6 +777,103 @@ class PostgresCreditStore:
             payload = row["payload"]
             out.append(
                 CreditMemo.model_validate(
+                    payload if isinstance(payload, dict) else json.loads(payload)
+                )
+            )
+        return out
+
+    def save_memo_review_event(self, event: MemoReviewEvent) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO memo_review_events (event_id, credit_file_id, memo_id, payload) "
+                "VALUES (%s, %s, %s, %s::jsonb) ON CONFLICT (event_id) DO NOTHING",
+                (
+                    event.event_id,
+                    event.credit_file_id,
+                    event.memo_id,
+                    event.model_dump_json(),
+                ),
+            )
+
+    def list_memo_review_events(
+        self, credit_file_id: str, memo_id: str | None = None
+    ) -> list[MemoReviewEvent]:
+        with self._connect() as conn:
+            if memo_id is None:
+                rows = conn.execute(
+                    "SELECT payload FROM memo_review_events "
+                    "WHERE credit_file_id = %s ORDER BY id",
+                    (credit_file_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT payload FROM memo_review_events "
+                    "WHERE credit_file_id = %s AND memo_id = %s "
+                    "ORDER BY id",
+                    (credit_file_id, memo_id),
+                ).fetchall()
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append(
+                MemoReviewEvent.model_validate(
+                    payload if isinstance(payload, dict) else json.loads(payload)
+                )
+            )
+        return out
+
+    def save_memo_diff(self, diff: MemoDiff) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO memo_diffs (diff_id, credit_file_id, from_memo_id, to_memo_id, payload) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb) ON CONFLICT (diff_id) DO NOTHING",
+                (
+                    diff.diff_id,
+                    diff.credit_file_id,
+                    diff.from_memo_id,
+                    diff.to_memo_id,
+                    diff.model_dump_json(),
+                ),
+            )
+
+    def get_memo_diff(self, diff_id: str) -> MemoDiff | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM memo_diffs WHERE diff_id = %s",
+                (diff_id,),
+            ).fetchone()
+        if not row:
+            return None
+        payload = row["payload"]
+        return MemoDiff.model_validate(
+            payload if isinstance(payload, dict) else json.loads(payload)
+        )
+
+    def get_memo_diff_by_final(self, memo_id: str) -> MemoDiff | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM memo_diffs WHERE to_memo_id = %s",
+                (memo_id,),
+            ).fetchone()
+        if not row:
+            return None
+        payload = row["payload"]
+        return MemoDiff.model_validate(
+            payload if isinstance(payload, dict) else json.loads(payload)
+        )
+
+    def list_memo_diffs(self, credit_file_id: str) -> list[MemoDiff]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM memo_diffs WHERE credit_file_id = %s "
+                "ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append(
+                MemoDiff.model_validate(
                     payload if isinstance(payload, dict) else json.loads(payload)
                 )
             )
