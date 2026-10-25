@@ -948,6 +948,12 @@ class MemoReviewEvent(BaseModel):
     carry coded reasons from the versioned vocabulary
     (officer_gate.RETURN_REASON_CODES); `flag` carries the full
     MemoCommitteeFlag when the action is `flagged`.
+
+    Round 7 adds two committee actions to the same stream —
+    committee_convened and committee_decided — so a memo's full
+    status (officer gate, then committee) derives from one ordered
+    event record. A committee_decided event carries its outcome in
+    `committee_outcome`; the decision itself is a CommitteeDecision.
     """
 
     event_id: str = Field(default_factory=lambda: new_id("rev"))
@@ -960,6 +966,7 @@ class MemoReviewEvent(BaseModel):
     reason_codes: list[str] = Field(default_factory=list)
     reason_vocabulary: str | None = None
     flag: MemoCommitteeFlag | None = None
+    committee_outcome: str | None = None
     note: str = ""
     at: datetime = Field(default_factory=utcnow)
 
@@ -1014,3 +1021,119 @@ class MemoDiff(BaseModel):
     figure_changes: list[FigureChange] = Field(default_factory=list)
     note: str = ""
     created_at: datetime = Field(default_factory=utcnow)
+
+
+# ---------------------------------------------------------------------
+# Round 7: the committee gate. The officer-final memo goes before a
+# credit committee of named members, which approves, approves with
+# structured conditions, declines, or defers. A decision exists only
+# as a stored record naming its members and its quorum; a decline
+# exists only with coded adverse-action reasons, each mechanically
+# tied to the evidence (design law 3). Covenants are round 10 —
+# conditions recorded here are structured records, not yet
+# scheduled.
+# ---------------------------------------------------------------------
+
+
+class CommitteeMember(BaseModel):
+    """One named member of the deciding committee, with their role.
+
+    A committee decision is a record of named people: a member
+    without an id or a role is nobody, and the gate records nobody.
+    """
+
+    member_id: str
+    member_role: str
+
+
+class CommitteeCondition(BaseModel):
+    """One condition of a conditional approval, as a structured
+    record (round 10 will schedule the financial ones as covenants).
+
+    Types: financial_covenant (a metric, an operator and a
+    threshold — the threshold must trace into the decided memo's
+    pinned artefacts, and `threshold_trace` records where it
+    traced to), reporting_requirement (what must be reported, on
+    what cadence), documentation (a checklist item that must be
+    satisfied), other (only with a note). `due_cadence` is data —
+    how often or by when the condition bites — never a schedule.
+    """
+
+    condition_id: str
+    type: str  # financial_covenant | reporting_requirement | documentation | other
+    metric_key: str | None = None
+    operator: str | None = None
+    threshold: Decimal | None = None
+    threshold_trace: str | None = None
+    report_what: str | None = None
+    checklist_item_id: str | None = None
+    due_cadence: str = ""
+    note: str = ""
+
+
+class AdverseActionReason(BaseModel):
+    """One coded reason for a decline (design law 3; ECOA/Reg B).
+
+    The code comes from the versioned vocabulary
+    (committee.ADVERSE_REASON_CODES). A code alone is an assertion;
+    the reason stands only with its TIE — the mechanical link to
+    the evidence the code describes, exactly one of:
+
+      policy_test — a test of the memo's pinned policy report, by
+                    test id, whose recorded outcome is fail or
+                    not_evaluable as the code requires (a passed
+                    test can never be cited);
+      figure      — a figure occurrence in the decided memo's
+                    verification record, by its text, value and
+                    trace source;
+      file_fact   — a required checklist item that is missing from
+                    the credit file, by item id.
+
+    There is no free-text reason: a decline whose reasons are not
+    coded and tied is refused before it is recorded, so the
+    borrower-facing notice can be generated from the codes and
+    their ties alone — never hand-typed.
+    """
+
+    code: str
+    tie_kind: str  # policy_test | figure | file_fact
+    test_id: str | None = None
+    figure_text: str | None = None
+    figure_value: str | None = None
+    figure_source: str | None = None
+    checklist_item_id: str | None = None
+
+
+class CommitteeDecision(BaseModel):
+    """The committee's decision on one officer-final memo.
+
+    Content-addressed like the artefacts it decides between: the
+    decision id derives from the memo decided, the outcome, the
+    members, the conditions, the reasons and the decision's place
+    in the memo's decision sequence. A memo may carry more than
+    one decision only across a deferral — a deferred decision is
+    superseded by the decision taken when the memo is re-presented;
+    an approve, conditional approve or decline is final.
+
+    `outcome`: approve | approve_with_conditions | decline | defer.
+    Every outcome names the members who decided and the quorum the
+    decision required; the recorder — who entered the decision —
+    is one of those members, recorded by name and role.
+    """
+
+    decision_id: str
+    credit_file_id: str
+    memo_id: str
+    outcome: str  # approve | approve_with_conditions | decline | defer
+    quorum_required: int
+    members: list[CommitteeMember] = Field(default_factory=list)
+    recorded_by: str
+    recorded_by_role: str
+    conditions: list[CommitteeCondition] = Field(default_factory=list)
+    adverse_reasons: list[AdverseActionReason] = Field(default_factory=list)
+    reason_vocabulary: str | None = None
+    deferral_reasons: list[str] = Field(default_factory=list)
+    deferral_vocabulary: str | None = None
+    representment_requirements: list[str] = Field(default_factory=list)
+    note: str = ""
+    decided_at: datetime = Field(default_factory=utcnow)
