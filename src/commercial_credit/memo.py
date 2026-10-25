@@ -317,7 +317,30 @@ def build_trace_universe(inputs: MemoInputs) -> dict[Decimal, str]:
 
 
 def _render_header(memo: CreditMemo) -> str:
-    if memo.status == "officer_approved":
+    if memo.status == "committee_approved":
+        title = "CREDIT MEMORANDUM — COMMITTEE APPROVED"
+        status_line = "Status: approved by the credit committee"
+    elif memo.status == "committee_approved_conditional":
+        title = "CREDIT MEMORANDUM — COMMITTEE APPROVED WITH CONDITIONS"
+        status_line = (
+            "Status: approved by the credit committee, with conditions"
+        )
+    elif memo.status == "declined":
+        title = "CREDIT MEMORANDUM — DECLINED"
+        status_line = (
+            "Status: declined by the credit committee; the "
+            "adverse-action reasons are on the decision record"
+        )
+    elif memo.status == "deferred":
+        title = "CREDIT MEMORANDUM — OFFICER APPROVED"
+        status_line = (
+            "Status: deferred by the credit committee — returned "
+            "to the credit officer for re-presentment"
+        )
+    elif memo.status == "in_committee":
+        title = "CREDIT MEMORANDUM — OFFICER APPROVED"
+        status_line = "Status: officer approved — before the credit committee"
+    elif memo.status == "officer_approved":
         title = "CREDIT MEMORANDUM — OFFICER APPROVED"
         status_line = "Status: officer approved — committee-ready"
     elif memo.status == "returned":

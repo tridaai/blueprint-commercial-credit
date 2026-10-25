@@ -12,10 +12,13 @@ credit memo and runs the figure verifier over it — a memo that
 cannot be fully traced is refused, and the refusal fails the run
 rather than storing a bad draft. The human gates act on the
 stored memo rather than inside the intake graph: the credit
-officer gate (round 6) is the workflow at the bottom of this
+officer gate (round 6) is the workflow in the middle of this
 module — named-officer review over the draft, edits re-verified,
-returns coded, diffs recorded — and the committee gate joins it
-in round 7.
+returns coded, diffs recorded — and the committee gate (round 7)
+below it: a quorum of named members deciding the officer-final
+memo, conditions as structured records, declines only with coded
+adverse-action reasons tied to the evidence, deferrals that name
+what must change before the memo comes back.
 """
 
 from __future__ import annotations
@@ -27,6 +30,18 @@ from typing import TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from .checklist import generate_checklist
+from .committee import (
+    ADVERSE_REASONS_VERSION,
+    DEFERRAL_REASONS_VERSION,
+    OUTCOMES,
+    STATUS_IN_COMMITTEE,
+    derive_full_status,
+    render_adverse_action_notice,
+    validate_adverse_reasons,
+    validate_conditions,
+    validate_deferral,
+    validate_quorum,
+)
 from .computations import (
     ENGINE_VERSION,
     compute_entity_pack,
@@ -36,8 +51,12 @@ from .documents import read_document_verified, register_document
 from .errors import NotFoundError, ValidationError
 from .extraction import OfflineReferenceExtractor, receive_extraction
 from .models import (
+    AdverseActionReason,
     AuditEvent,
     Borrower,
+    CommitteeCondition,
+    CommitteeDecision,
+    CommitteeMember,
     ComputationPack,
     CovenantDefinition,
     CreditFile,
@@ -70,7 +89,6 @@ from .officer_gate import (
     STATUS_RETURNED,
     apply_edits,
     compute_memo_diff,
-    derive_status,
     require_identity,
     require_officer,
     validate_return_reasons,
@@ -512,7 +530,7 @@ class CreditPipeline:
         events = self.store.list_memo_review_events(
             memo.credit_file_id, memo.memo_id
         )
-        return derive_status(memo, events)
+        return derive_full_status(memo, events)
 
     def _with_status(self, memo: CreditMemo) -> CreditMemo:
         return memo.model_copy(update={"status": self._status_of(memo)})
@@ -1023,7 +1041,338 @@ class CreditPipeline:
                 if diff is not None and diff.credit_file_id == credit_file_id
                 else None
             ),
+            "committee_decisions": self.store.list_committee_decisions(
+                credit_file_id, memo_id
+            ),
         }
+
+    # -- the committee gate (round 7) --------------------------------
+    def _require_decidable_memo(
+        self, credit_file_id: str, memo_id: str
+    ) -> CreditMemo:
+        """The artefact the committee may act on: the officer-final
+        memo itself — not its draft (the draft was superseded by
+        it), not a returned or still-draft memo."""
+        memo = self._get_memo_raw(credit_file_id, memo_id)
+        superseded_by = next(
+            (
+                m.memo_id
+                for m in self.store.list_memos(credit_file_id)
+                if m.supersedes_memo_id == memo_id
+            ),
+            None,
+        )
+        if superseded_by is not None:
+            raise ValidationError(
+                f"memo {memo_id} has been superseded by "
+                f"{superseded_by}: the committee decides the "
+                "current officer-final memo, not a superseded "
+                "version"
+            )
+        if memo.status != STATUS_APPROVED:
+            raise ValidationError(
+                f"memo {memo_id} is a {memo.status} artefact; the "
+                "committee acts only on the officer-final memo "
+                "(officer_approved) — the officer gate decides first"
+            )
+        return memo
+
+    def convene_committee(
+        self,
+        credit_file_id: str,
+        memo_id: str,
+        *,
+        actor: str,
+        actor_role: str,
+    ) -> CreditMemo:
+        """Bring an officer-final memo before the committee.
+
+        Lawful from officer_approved (first presentment) and from
+        deferred (re-presentment after the officer has addressed
+        the deferral's requirements). Convening is an event on the
+        memo's stream — the derived status becomes in_committee —
+        and the decision is a separate act (decide_committee).
+        """
+        require_identity(actor, actor_role, what="convening the committee")
+        memo = self._require_decidable_memo(credit_file_id, memo_id)
+        status = self._status_of(memo)
+        if status not in (STATUS_APPROVED, "deferred"):
+            raise ValidationError(
+                f"memo {memo_id} is {status}; only an "
+                "officer-approved memo awaiting the committee, or "
+                "a deferred memo being re-presented, can be convened"
+            )
+        self._record_review_event(MemoReviewEvent(
+            credit_file_id=credit_file_id,
+            memo_id=memo_id,
+            action="committee_convened",
+            actor_id=actor,
+            actor_role=actor_role,
+        ))
+        self._audit(
+            credit_file_id,
+            "committee_convened",
+            f"officer-final memo {memo_id} brought before the "
+            f"credit committee by {actor} ({actor_role})"
+            + (" (re-presentment)" if status == "deferred" else ""),
+            actor=actor,
+        )
+        return self.get_memo(credit_file_id, memo_id)
+
+    def decide_committee(
+        self,
+        credit_file_id: str,
+        memo_id: str,
+        *,
+        recorder_id: str,
+        recorder_role: str,
+        members: list[CommitteeMember],
+        outcome: str,
+        quorum_required: int = 2,
+        conditions: list[CommitteeCondition] | None = None,
+        adverse_reasons: list[AdverseActionReason] | None = None,
+        deferral_reasons: list[str] | None = None,
+        representment_requirements: list[str] | None = None,
+        note: str = "",
+    ) -> CommitteeDecision:
+        """Record the committee's decision on a convened memo.
+
+        The decision is one stored record: the outcome, the named
+        members and the quorum they met, the recorder (one of the
+        members), and the outcome's own payload — structured
+        conditions for a conditional approval, coded tied reasons
+        for a decline, coded reasons + named re-presentment
+        requirements for a deferral. Every discipline in
+        committee.py runs before anything is stored: a refused
+        decision records nothing, and the memo stays in committee.
+        """
+        require_identity(recorder_id, recorder_role,
+                         what="a committee decision")
+        memo = self._require_decidable_memo(credit_file_id, memo_id)
+        status = self._status_of(memo)
+        if status != STATUS_IN_COMMITTEE:
+            raise ValidationError(
+                f"memo {memo_id} is {status}; the committee "
+                "decides only a memo that stands convened before "
+                "it (in_committee) — a decided memo cannot be "
+                "decided again"
+            )
+        if outcome not in OUTCOMES:
+            raise ValidationError(
+                f"unknown committee outcome {outcome!r}; outcomes "
+                f"are {sorted(OUTCOMES)}"
+            )
+        validate_quorum(
+            members,
+            quorum_required,
+            recorder_id=recorder_id,
+            officer_id=memo.reviewed_by,
+        )
+        conditions = list(conditions or [])
+        adverse_reasons = list(adverse_reasons or [])
+        deferral_reasons = list(deferral_reasons or [])
+        representment_requirements = list(representment_requirements or [])
+        inputs = self._memo_inputs(memo)
+        stored_conditions: list[CommitteeCondition] = []
+        if outcome == "approve_with_conditions":
+            if not conditions:
+                raise ValidationError(
+                    "an approve_with_conditions decision requires "
+                    "at least one structured condition: conditions "
+                    "are records, not prose in a note"
+                )
+            numbered = [
+                c.model_copy(update={
+                    "condition_id": c.condition_id or f"cond-{i + 1}",
+                })
+                for i, c in enumerate(conditions)
+            ]
+            stored_conditions = validate_conditions(numbered, inputs)
+        elif conditions:
+            raise ValidationError(
+                f"a {outcome} decision carries no conditions; "
+                "conditions belong to approve_with_conditions"
+            )
+        if outcome == "decline":
+            validate_adverse_reasons(
+                adverse_reasons,
+                inputs.policy_report,
+                memo,
+                inputs.credit_file,
+            )
+        elif adverse_reasons:
+            raise ValidationError(
+                f"a {outcome} decision carries no adverse-action "
+                "reasons; coded reasons belong to a decline "
+                "(design law 3)"
+            )
+        if outcome == "defer":
+            validate_deferral(deferral_reasons, representment_requirements, note)
+        elif deferral_reasons or representment_requirements:
+            raise ValidationError(
+                f"a {outcome} decision carries no deferral "
+                "reasons or re-presentment requirements; those "
+                "belong to a deferral"
+            )
+        prior = self.store.list_committee_decisions(credit_file_id, memo_id)
+        descriptor = {
+            "memo_id": memo_id,
+            "sequence": len(prior) + 1,
+            "outcome": outcome,
+            "quorum_required": quorum_required,
+            "members": [m.model_dump(mode="json") for m in members],
+            "recorded_by": recorder_id,
+            "conditions": [
+                c.model_dump(mode="json") for c in stored_conditions
+            ],
+            "adverse_reasons": [
+                r.model_dump(mode="json") for r in adverse_reasons
+            ],
+            "deferral_reasons": deferral_reasons,
+            "representment_requirements": representment_requirements,
+            "note": note,
+        }
+        decision = CommitteeDecision(
+            decision_id=f"decision-{_canonical_hash(descriptor)[:16]}",
+            credit_file_id=credit_file_id,
+            memo_id=memo_id,
+            outcome=outcome,
+            quorum_required=quorum_required,
+            members=list(members),
+            recorded_by=recorder_id,
+            recorded_by_role=recorder_role,
+            conditions=stored_conditions,
+            adverse_reasons=adverse_reasons if outcome == "decline" else [],
+            reason_vocabulary=(
+                ADVERSE_REASONS_VERSION if outcome == "decline" else None
+            ),
+            deferral_reasons=deferral_reasons if outcome == "defer" else [],
+            deferral_vocabulary=(
+                DEFERRAL_REASONS_VERSION if outcome == "defer" else None
+            ),
+            representment_requirements=(
+                representment_requirements if outcome == "defer" else []
+            ),
+            note=note,
+        )
+        self.store.save_committee_decision(decision)
+        event_codes = (
+            [r.code for r in adverse_reasons]
+            if outcome == "decline"
+            else deferral_reasons if outcome == "defer" else []
+        )
+        self._record_review_event(MemoReviewEvent(
+            credit_file_id=credit_file_id,
+            memo_id=memo_id,
+            action="committee_decided",
+            actor_id=recorder_id,
+            actor_role=recorder_role,
+            committee_outcome=outcome,
+            reason_codes=event_codes,
+            reason_vocabulary=decision.reason_vocabulary
+            or decision.deferral_vocabulary,
+            note=note,
+        ))
+        detail = (
+            f"committee decision {decision.decision_id} on memo "
+            f"{memo_id}: {outcome}, recorded by {recorder_id} "
+            f"({recorder_role}) for {len(members)} members "
+            f"(quorum {quorum_required})"
+        )
+        if stored_conditions:
+            detail += f"; {len(stored_conditions)} condition(s)"
+        if outcome == "decline":
+            detail += (
+                f"; adverse-action reasons "
+                f"({ADVERSE_REASONS_VERSION}): "
+                + ", ".join(r.code for r in adverse_reasons)
+            )
+        if outcome == "defer":
+            detail += (
+                f"; deferral reasons ({DEFERRAL_REASONS_VERSION}): "
+                + ", ".join(deferral_reasons)
+                + "; re-presentment requires: "
+                + "; ".join(representment_requirements)
+            )
+        self._audit(credit_file_id, "committee_decision_recorded", detail,
+                    actor=recorder_id)
+        return decision
+
+    def list_committee_decisions(
+        self, credit_file_id: str, memo_id: str
+    ) -> list[CommitteeDecision]:
+        """Every decision recorded on a memo, in order — across a
+        deferral, the superseded deferral first, then the decision
+        taken at re-presentment."""
+        self._get_memo_raw(credit_file_id, memo_id)
+        return self.store.list_committee_decisions(credit_file_id, memo_id)
+
+    def get_committee_decision(
+        self, credit_file_id: str, decision_id: str
+    ) -> CommitteeDecision:
+        self._load(credit_file_id)
+        decision = self.store.get_committee_decision(decision_id)
+        if decision is None or decision.credit_file_id != credit_file_id:
+            raise NotFoundError(
+                f"committee decision {decision_id} not found on "
+                f"credit file {credit_file_id}"
+            )
+        return decision
+
+    def committee_state(self, credit_file_id: str, memo_id: str) -> dict:
+        """A memo's committee position: its derived status, every
+        decision recorded on it, and the latest one."""
+        memo = self._get_memo_raw(credit_file_id, memo_id)
+        decisions = self.store.list_committee_decisions(
+            credit_file_id, memo_id
+        )
+        return {
+            "memo_id": memo_id,
+            "status": self._status_of(memo),
+            "decisions": decisions,
+            "latest_decision": decisions[-1] if decisions else None,
+        }
+
+    def get_adverse_action_notice(
+        self,
+        credit_file_id: str,
+        memo_id: str,
+        *,
+        decision_id: str | None = None,
+    ) -> str:
+        """The adverse-action notice for a decline on this memo,
+        generated from the decision's coded reasons and their ties
+        (committee.render_adverse_action_notice). Defaults to the
+        memo's latest decline."""
+        memo = self._get_memo_raw(credit_file_id, memo_id)
+        decisions = self.store.list_committee_decisions(
+            credit_file_id, memo_id
+        )
+        if decision_id is not None:
+            decision = next(
+                (d for d in decisions if d.decision_id == decision_id),
+                None,
+            )
+            if decision is None:
+                raise NotFoundError(
+                    f"committee decision {decision_id} not found on "
+                    f"memo {memo_id}"
+                )
+        else:
+            declines = [d for d in decisions if d.outcome == "decline"]
+            decision = declines[-1] if declines else None
+            if decision is None:
+                raise NotFoundError(
+                    f"no decline recorded on memo {memo_id}: there "
+                    "is no adverse-action notice"
+                )
+        report = self.store.get_policy_report(memo.policy_report_id)
+        if report is None:
+            raise NotFoundError(
+                f"policy report {memo.policy_report_id} not found"
+            )
+        credit_file = self._load(credit_file_id)
+        return render_adverse_action_notice(decision, memo, report, credit_file)
 
     def add_adjustment(
         self, credit_file_id: str, adjustment: SpreadAdjustment

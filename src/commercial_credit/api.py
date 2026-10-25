@@ -16,8 +16,13 @@ record and its rendered text. Round 6 adds the credit officer
 gate: submit a draft for review, approve it (as-is or with
 edits), return it for rework with coded reasons, flag items on
 it, recompose a returned memo, and read a memo's version history
-and its approval diff. Every request carries a request id into
-the structured logs.
+and its approval diff. Round 7 adds the committee gate: convene
+the committee on an officer-final memo, record its decision
+(approve, approve with structured conditions, decline with coded
+adverse-action reasons tied to the evidence, or defer with named
+re-presentment requirements), and read the decision record, its
+conditions, and the generated adverse-action notice. Every
+request carries a request id into the structured logs.
 """
 
 from __future__ import annotations
@@ -39,7 +44,10 @@ from .errors import CreditError, NotFoundError, ValidationError
 from .logging_setup import configure_logging, request_id_var
 from .models import (
     AdjustmentReasonCode,
+    AdverseActionReason,
     Borrower,
+    CommitteeCondition,
+    CommitteeMember,
     CovenantDefinition,
     DocumentKind,
     Elimination,
@@ -552,4 +560,115 @@ def get_memo_history(credit_file_id: str, memo_id: str) -> dict:
             if history["diff"] is not None
             else None
         ),
+        "committee_decisions": [
+            d.model_dump(mode="json")
+            for d in history["committee_decisions"]
+        ],
+    }
+
+
+# -- the committee gate (round 7) ------------------------------------
+
+
+class ConveneCommitteeRequest(BaseModel):
+    actor: str
+    actor_role: str
+
+
+class DecideCommitteeRequest(BaseModel):
+    recorder_id: str
+    recorder_role: str
+    members: list[CommitteeMember] = []
+    outcome: str
+    quorum_required: int = 2
+    conditions: list[CommitteeCondition] = []
+    adverse_reasons: list[AdverseActionReason] = []
+    deferral_reasons: list[str] = []
+    representment_requirements: list[str] = []
+    note: str = ""
+
+
+@app.post("/applications/{credit_file_id}/memos/{memo_id}/committee/convene")
+def convene_committee(
+    credit_file_id: str, memo_id: str, body: ConveneCommitteeRequest
+) -> dict:
+    _file_or_404(credit_file_id)
+    memo = pipeline.convene_committee(
+        credit_file_id, memo_id, actor=body.actor, actor_role=body.actor_role
+    )
+    return memo.model_dump(mode="json")
+
+
+@app.post(
+    "/applications/{credit_file_id}/memos/{memo_id}/committee/decide",
+    status_code=201,
+)
+def decide_committee(
+    credit_file_id: str, memo_id: str, body: DecideCommitteeRequest
+) -> dict:
+    _file_or_404(credit_file_id)
+    decision = pipeline.decide_committee(
+        credit_file_id,
+        memo_id,
+        recorder_id=body.recorder_id,
+        recorder_role=body.recorder_role,
+        members=body.members,
+        outcome=body.outcome,
+        quorum_required=body.quorum_required,
+        conditions=body.conditions,
+        adverse_reasons=body.adverse_reasons,
+        deferral_reasons=body.deferral_reasons,
+        representment_requirements=body.representment_requirements,
+        note=body.note,
+    )
+    return decision.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/memos/{memo_id}/committee")
+def get_committee_state(credit_file_id: str, memo_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    state = pipeline.committee_state(credit_file_id, memo_id)
+    return {
+        "memo_id": state["memo_id"],
+        "status": state["status"],
+        "decisions": [
+            d.model_dump(mode="json") for d in state["decisions"]
+        ],
+        "latest_decision": (
+            state["latest_decision"].model_dump(mode="json")
+            if state["latest_decision"] is not None
+            else None
+        ),
+    }
+
+
+@app.get(
+    "/applications/{credit_file_id}/memos/{memo_id}/committee"
+    "/decisions/{decision_id}"
+)
+def get_committee_decision(
+    credit_file_id: str, memo_id: str, decision_id: str
+) -> dict:
+    _file_or_404(credit_file_id)
+    decision = pipeline.get_committee_decision(credit_file_id, decision_id)
+    if decision.memo_id != memo_id:
+        raise NotFoundError(
+            f"committee decision {decision_id} not found on memo {memo_id}"
+        )
+    return decision.model_dump(mode="json")
+
+
+@app.get(
+    "/applications/{credit_file_id}/memos/{memo_id}/committee"
+    "/adverse-action-notice"
+)
+def get_adverse_action_notice(credit_file_id: str, memo_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    text = pipeline.get_adverse_action_notice(credit_file_id, memo_id)
+    decisions = pipeline.list_committee_decisions(credit_file_id, memo_id)
+    declines = [d for d in decisions if d.outcome == "decline"]
+    return {
+        "memo_id": memo_id,
+        "decision_id": declines[-1].decision_id if declines else None,
+        "text": text,
     }
