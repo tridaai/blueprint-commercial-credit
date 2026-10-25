@@ -1003,7 +1003,15 @@ class CreditPipeline:
             for m in all_memos
             if m.memo_id in chain
         ]
-        events = self.store.list_memo_review_events(credit_file_id, memo_id)
+        # Events recorded on this memo, plus the approval event
+        # that created it if it is an officer-final artefact (that
+        # event is recorded on the draft, naming this memo as its
+        # result).
+        events = [
+            e
+            for e in self.store.list_memo_review_events(credit_file_id)
+            if e.memo_id == memo_id or e.resulting_memo_id == memo_id
+        ]
         diff = self.store.get_memo_diff_by_final(memo_id)
         return {
             "memo_id": memo_id,
