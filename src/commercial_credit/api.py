@@ -409,6 +409,52 @@ def get_policy_report(credit_file_id: str, report_id: str) -> dict:
     return report.model_dump(mode="json")
 
 
+# -- committee readiness (round 9) -----------------------------------
+# Distinct from GET /readiness, the health probe: these routes serve
+# the per-file ReadinessReport — computed fresh at the requested
+# as_of, or fetched by id exactly as stored.
+
+
+@app.get("/applications/{credit_file_id}/readiness-report")
+def get_current_readiness_report(
+    credit_file_id: str, as_of: date | None = None
+) -> dict:
+    _file_or_404(credit_file_id)
+    report = pipeline.compute_readiness(credit_file_id, as_of=as_of)
+    return report.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/readiness-reports")
+def list_readiness_reports(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return [
+        r.model_dump(mode="json")
+        for r in pipeline.list_readiness_reports(credit_file_id)
+    ]
+
+
+@app.get("/applications/{credit_file_id}/readiness-reports/{report_id}")
+def get_readiness_report(credit_file_id: str, report_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    report = pipeline.get_readiness_report(credit_file_id, report_id)
+    return report.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/outstanding-items")
+def get_outstanding_items(
+    credit_file_id: str, as_of: date | None = None
+) -> dict:
+    _file_or_404(credit_file_id)
+    report = pipeline.compute_readiness(credit_file_id, as_of=as_of)
+    text = pipeline.outstanding_items(credit_file_id, as_of=as_of)
+    return {
+        "credit_file_id": credit_file_id,
+        "readiness_report_id": report.report_id,
+        "as_of": report.as_of.isoformat(),
+        "text": text,
+    }
+
+
 class ComposeMemoRequest(BaseModel):
     report_id: str | None = None
     pack_version: str | None = None
@@ -468,6 +514,7 @@ class ApproveMemoRequest(BaseModel):
     officer_role: str
     edits: dict[str, list[str]] | None = None
     note: str = ""
+    as_of: date | None = None
 
 
 class ReturnMemoRequest(BaseModel):
@@ -513,6 +560,7 @@ def approve_memo(credit_file_id: str, memo_id: str, body: ApproveMemoRequest) ->
         officer_role=body.officer_role,
         edits=body.edits,
         note=body.note,
+        as_of=body.as_of,
     )
     return memo.model_dump(mode="json")
 
@@ -597,6 +645,7 @@ def get_memo_history(credit_file_id: str, memo_id: str) -> dict:
 class ConveneCommitteeRequest(BaseModel):
     actor: str
     actor_role: str
+    as_of: date | None = None
 
 
 class DecideCommitteeRequest(BaseModel):
@@ -618,7 +667,11 @@ def convene_committee(
 ) -> dict:
     _file_or_404(credit_file_id)
     memo = pipeline.convene_committee(
-        credit_file_id, memo_id, actor=body.actor, actor_role=body.actor_role
+        credit_file_id,
+        memo_id,
+        actor=body.actor,
+        actor_role=body.actor_role,
+        as_of=body.as_of,
     )
     return memo.model_dump(mode="json")
 

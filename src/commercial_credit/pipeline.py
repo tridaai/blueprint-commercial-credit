@@ -73,6 +73,7 @@ from .models import (
     MemoVerification,
     PolicyHistoryEntry,
     PolicyReport,
+    ReadinessReport,
     Spread,
     SpreadAdjustment,
     new_id,
@@ -97,6 +98,9 @@ from .officer_gate import (
 from .policy import CURRENT_POLICY_VERSION
 from .policy import evaluate_policy as run_policy_evaluation
 from .ports import CreditFileStore, DocumentStore, Extractor
+from .readiness import build_readiness_report
+from .readiness import readiness_refusal_message
+from .readiness import render_outstanding_items
 from .spreading import build_spread as assemble_spread
 from .spreading import validate_adjustment
 
@@ -635,6 +639,130 @@ class CreditPipeline:
         self.store.save_memo_review_event(event)
         return event
 
+    # -------------------------------------------------------------
+    # Round 9: committee readiness (design law 7). The report is
+    # computed fresh at the moment it is used — at officer approval,
+    # so the block is stamped on the approval record, and again at
+    # convene, where any blocker refuses the transition and the
+    # refusal names every blocker. A report minted earlier is a
+    # record, never a blessing: staleness is judged at the as_of of
+    # the action itself.
+    # -------------------------------------------------------------
+
+    def _store_readiness(self, report: ReadinessReport) -> ReadinessReport:
+        """Store a readiness report, auditing only its first minting
+        (the artefact is content-addressed; recomputation of the
+        same state records nothing new)."""
+        is_new = (
+            self.store.get_readiness_report(report.report_id) is None
+        )
+        self.store.save_readiness_report(report)
+        if is_new:
+            self._audit(
+                report.credit_file_id,
+                "readiness_computed",
+                f"readiness report {report.report_id} computed at "
+                f"{report.as_of} under readiness policy "
+                f"{report.readiness_policy_id} "
+                f"{report.readiness_policy_version} and policy pack "
+                f"{report.policy_version}: "
+                f"{report.blocker_count} blocker(s), "
+                f"{report.summary}",
+            )
+        return report
+
+    def _readiness_for_inputs(
+        self, inputs: MemoInputs, *, as_of: date
+    ) -> ReadinessReport:
+        return build_readiness_report(
+            inputs.credit_file,
+            as_of=as_of,
+            policy_version=inputs.policy_report.policy_version,
+            pack=inputs.pack,
+            global_pack=inputs.global_pack,
+            policy_report=inputs.policy_report,
+        )
+
+    def compute_readiness(
+        self,
+        credit_file_id: str,
+        *,
+        as_of: date | None = None,
+        memo_id: str | None = None,
+    ) -> ReadinessReport:
+        """Compute (and store) the file's current readiness report.
+
+        With a memo, the report reads the artefacts that memo pins —
+        the view the committee gate itself uses. Without one, it
+        reads the file's latest computation packs and policy
+        report. `as_of` is the evaluation date; freshness is judged
+        at that date, never at the wall clock.
+        """
+        as_of = as_of or date.today()
+        if memo_id is not None:
+            memo = self._get_memo_raw(credit_file_id, memo_id)
+            report = self._readiness_for_inputs(
+                self._memo_inputs(memo), as_of=as_of
+            )
+            return self._store_readiness(report)
+        credit_file = self._load(credit_file_id)
+        packs = self.store.list_computation_packs(credit_file_id)
+        pack = next(
+            (p for p in reversed(packs) if p.scope == "entity"), None
+        )
+        global_pack = next(
+            (p for p in reversed(packs) if p.scope == "global"), None
+        )
+        reports = self.store.list_policy_reports(credit_file_id)
+        policy_report = reports[-1] if reports else None
+        report = build_readiness_report(
+            credit_file,
+            as_of=as_of,
+            policy_version=(
+                policy_report.policy_version
+                if policy_report is not None
+                else CURRENT_POLICY_VERSION
+            ),
+            pack=pack,
+            global_pack=global_pack,
+            policy_report=policy_report,
+        )
+        return self._store_readiness(report)
+
+    def get_readiness_report(
+        self, credit_file_id: str, report_id: str
+    ) -> ReadinessReport:
+        self._load(credit_file_id)
+        report = self.store.get_readiness_report(report_id)
+        if report is None or report.credit_file_id != credit_file_id:
+            raise NotFoundError(
+                f"readiness report {report_id} not found on credit "
+                f"file {credit_file_id}"
+            )
+        return report
+
+    def list_readiness_reports(
+        self, credit_file_id: str
+    ) -> list[ReadinessReport]:
+        self._load(credit_file_id)
+        return self.store.list_readiness_reports(credit_file_id)
+
+    def outstanding_items(
+        self,
+        credit_file_id: str,
+        *,
+        as_of: date | None = None,
+        memo_id: str | None = None,
+    ) -> str:
+        """The borrower-facing 'what we still need' list, rendered
+        from the current readiness report — generated, never
+        hand-typed."""
+        report = self.compute_readiness(
+            credit_file_id, as_of=as_of, memo_id=memo_id
+        )
+        credit_file = self._load(credit_file_id)
+        return render_outstanding_items(report, credit_file)
+
     def submit_memo_for_review(
         self,
         credit_file_id: str,
@@ -683,6 +811,7 @@ class CreditPipeline:
         officer_role: str,
         edits: dict[str, list[str]] | None = None,
         note: str = "",
+        as_of: date | None = None,
     ) -> CreditMemo:
         """The officer's approval: as-is, or with paragraph edits.
 
@@ -695,6 +824,13 @@ class CreditPipeline:
         that no longer accounts for the pinned report, refuses
         the approval and stores nothing. An officer who declared
         a conflict of interest on this memo cannot approve it.
+
+        Approval is NOT the committee gate: it lands even when the
+        file carries readiness blockers (round 9) — but the
+        readiness report computed over the memo's pinned artefacts
+        is stamped onto the approval event and the diff, so the
+        block is on the record from this moment, never a surprise
+        at convene.
         """
         require_officer(officer_id, officer_role, what="an approval")
         memo = self._get_memo_raw(credit_file_id, memo_id)
@@ -744,10 +880,14 @@ class CreditPipeline:
             ),
             "created_at": utcnow(),
         })
+        inputs = self._memo_inputs(memo)
         # The verifier decides — over the final rendered text,
         # exactly as it decided for the draft. A refusal raises
         # MemoVerificationError and nothing below runs.
-        verification = verify_memo(candidate, self._memo_inputs(memo))
+        verification = verify_memo(candidate, inputs)
+        readiness = self._readiness_for_inputs(
+            inputs, as_of=as_of or date.today()
+        )
         descriptor = {
             "supersedes_memo_id": memo.memo_id,
             "reviewed_by": officer_id,
@@ -773,8 +913,11 @@ class CreditPipeline:
             action=action,
             note=note,
         )
+        diff.readiness_report_id = readiness.report_id
+        diff.readiness_blocker_count = readiness.blocker_count
         self.store.save_memo(final)
         self.store.save_memo_diff(diff)
+        self._store_readiness(readiness)
         self._record_review_event(MemoReviewEvent(
             credit_file_id=credit_file_id,
             memo_id=memo_id,
@@ -782,6 +925,8 @@ class CreditPipeline:
             actor_id=officer_id,
             actor_role=officer_role,
             resulting_memo_id=final.memo_id,
+            readiness_report_id=readiness.report_id,
+            readiness_blocker_count=readiness.blocker_count,
             note=note,
         ))
         self._audit(
@@ -791,7 +936,9 @@ class CreditPipeline:
             f"{officer_id} ({officer_role}); officer-final memo "
             f"{final.memo_id}, diff {diff.diff_id}: "
             f"{len(diff.section_changes)} section(s) and "
-            f"{len(diff.figure_changes)} figure(s) changed",
+            f"{len(diff.figure_changes)} figure(s) changed; "
+            f"readiness report {readiness.report_id} carries "
+            f"{readiness.blocker_count} blocker(s)",
             actor=officer_id,
         )
         return final
@@ -1126,6 +1273,7 @@ class CreditPipeline:
         *,
         actor: str,
         actor_role: str,
+        as_of: date | None = None,
     ) -> CreditMemo:
         """Bring an officer-final memo before the committee.
 
@@ -1134,6 +1282,16 @@ class CreditPipeline:
         the deferral's requirements). Convening is an event on the
         memo's stream — the derived status becomes in_committee —
         and the decision is a separate act (decide_committee).
+
+        Readiness gate (round 9, design law 7): readiness is
+        recomputed HERE, at convene time, over the memo's pinned
+        artefacts and the file as it stands today — a report minted
+        at approval (or any earlier moment) cannot bless this
+        transition. Any blocker — a missing required item, a stale
+        one, a figure or test that cannot be evaluated for want of
+        an input — refuses the convene, and the refusal names every
+        blocker. There is no waiver: the block clears only when the
+        input itself is received or refreshed.
         """
         require_identity(actor, actor_role, what="convening the committee")
         memo = self._require_decidable_memo(credit_file_id, memo_id)
@@ -1143,6 +1301,13 @@ class CreditPipeline:
                 f"memo {memo_id} is {status}; only an "
                 "officer-approved memo awaiting the committee, or "
                 "a deferred memo being re-presented, can be convened"
+            )
+        readiness = self._store_readiness(self._readiness_for_inputs(
+            self._memo_inputs(memo), as_of=as_of or date.today()
+        ))
+        if readiness.blockers:
+            raise ValidationError(
+                readiness_refusal_message(readiness, memo_id=memo_id)
             )
         self._record_review_event(MemoReviewEvent(
             credit_file_id=credit_file_id,
