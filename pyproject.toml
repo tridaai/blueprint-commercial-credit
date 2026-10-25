@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trida-blueprint-commercial-credit"
+version = "0.1.0"
+description = "Trida AI Blueprint — Commercial Credit Memo & Covenant Monitoring Agent (reference prototype)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11,<3.13"
+# Direct dependencies are pinned EXACTLY (==). The full transitive set is
+# frozen in constraints.txt; install with the two-step pip fallback in
+# the Makefile, or `uv sync` (primary).
+dependencies = [
+    "langgraph==0.6.11",
+    # The system of record is PostgreSQL: credit files, spreads, memos
+    # and covenant schedules over psycopg 3 (see db.py). DATABASE_URL
+    # configures it; without one the service runs on the SQLite local
+    # store, and tests use in-memory doubles.
+    "psycopg[binary]==3.3.6",
+    # Source documents live in object storage behind a port
+    # (documents.py): boto3 against any S3-compatible endpoint
+    # (AWS S3, SeaweedFS in the compose stack).
+    "boto3==1.43.111",
+    "fastapi==0.143.0",
+    "pydantic==2.14.0",
+    "uvicorn==0.54.0",
+    "httpx==0.28.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1"]
+
+[project.scripts]
+commercial-credit-agent = "commercial_credit.cli:main"
+commercial-credit-demo = "commercial_credit.demo:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
