@@ -208,6 +208,23 @@ def require_complete_provenance(values: list[ExtractedValue]) -> None:
             )
 
 
+class PolicyHistoryEntry(BaseModel):
+    """One line of a credit file's policy history (round 4).
+
+    Evaluating a file against one pinned policy pack version records
+    an entry here: the pack, the version, the report the evaluation
+    produced, and the as-of date the file facts were read at. A later
+    evaluation under a newer pack version appends its own entry —
+    history is never rewritten, which is what lets an in-flight file
+    keep its v1 report after v2 ships (design law 2).
+    """
+
+    policy_pack_id: str
+    policy_version: str
+    report_id: str
+    as_of: date
+
+
 class CreditFileStatus(str, Enum):
     INTAKE = "intake"
     COLLECTING_DOCUMENTS = "collecting_documents"
@@ -221,6 +238,7 @@ class CreditFile(BaseModel):
     status: CreditFileStatus = CreditFileStatus.INTAKE
     checklist: list[ChecklistItem] = Field(default_factory=list)
     documents: list[SourceDocument] = Field(default_factory=list)
+    policy_history: list[PolicyHistoryEntry] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -605,3 +623,161 @@ class ComputationPack(BaseModel):
     exclusions: list[ExclusionRecord] = Field(default_factory=list)
     figures: list[ComputedFigure] = Field(default_factory=list)
     covenant_results: list[CovenantResult] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------
+# Round 4: the policy pack. Lending policy is code, versioned
+# (design law 2): a pack is an identified, dated set of coded tests
+# over computation-pack figures and credit-file facts. Evaluating a
+# file pins ONE pack version and produces a PolicyReport — itself a
+# content-addressed artefact — whose every outcome is pass, fail, or
+# not_evaluable with the missing input named. A test whose figure
+# could not be computed is never a silent pass.
+# ---------------------------------------------------------------------
+
+
+class PolicyTest(BaseModel):
+    """One coded lending-policy test.
+
+    `kind` says what the test reads:
+      figure    — a ComputedFigure from a computation pack (the
+                  borrower's own pack, or the global pack when
+                  `scope` is "global"), compared against a threshold
+                  with an operator;
+      file_fact — a fact of the credit file itself: its checklist,
+                  its facility, its documents and their dates.
+
+    Every test names its exact inputs here, carries a severity
+    (blocker — the file cannot proceed on a fail — or warning), and
+    cites the policy text it encodes.
+    """
+
+    test_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    kind: str = Field(pattern=r"^(figure|file_fact)$")
+    severity: str = Field(pattern=r"^(blocker|warning)$")
+    citation: str = Field(min_length=1)
+    # figure tests
+    figure_key: str | None = None
+    scope: str = "borrower"  # borrower | global
+    operator: str | None = Field(default=None, pattern=r"^(>=|<=|>|<)$")
+    threshold: Decimal | None = None
+    segment_thresholds: dict[str, Decimal] | None = None
+    # file-fact tests
+    fact: str | None = None  # required_documents | statement_age | appraisal_age | concentration
+    limit: Decimal | None = None
+    applies_to_facility_types: list[str] = Field(default_factory=list)
+    requires_guarantors: bool = False
+
+    @model_validator(mode="after")
+    def _inputs_named(self) -> "PolicyTest":
+        if self.kind == "figure":
+            if not self.figure_key:
+                raise ValidationError(
+                    f"policy test {self.test_id!r} is a figure test "
+                    "but names no figure"
+                )
+            if not self.operator:
+                raise ValidationError(
+                    f"policy test {self.test_id!r} names no operator"
+                )
+            if self.threshold is None and not self.segment_thresholds:
+                raise ValidationError(
+                    f"policy test {self.test_id!r} names no threshold "
+                    "and no segment threshold table"
+                )
+        else:
+            if not self.fact:
+                raise ValidationError(
+                    f"policy test {self.test_id!r} is a file-fact test "
+                    "but names no fact"
+                )
+            if self.fact != "required_documents" and self.limit is None:
+                raise ValidationError(
+                    f"policy test {self.test_id!r} names no limit"
+                )
+        return self
+
+
+class PolicyPack(BaseModel):
+    """One version of the bank's lending policy, as data + code.
+
+    A pack is identified (pack id + version), dated (effective
+    window), and issued with a note. `capital_base` is the bank's
+    stated capital base the concentration test measures a single
+    borrower's facility against. Packs are immutable once shipped:
+    a policy change is a new version, never an edit — earlier
+    reports keep the pack they were evaluated under.
+    """
+
+    pack_id: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+    effective_from: date
+    effective_to: date | None = None
+    issuing_note: str = Field(min_length=1)
+    capital_base: Decimal = Field(gt=Decimal("0"))
+    tests: list[PolicyTest] = Field(min_length=1)
+
+
+class PolicyInputValue(BaseModel):
+    """One input a policy test actually read, on the record.
+
+    `value` is the string form of what was read — Decimal, date,
+    count — so the report shows the facts the outcome rests on,
+    exactly as read, alongside where they came from.
+    """
+
+    input: str
+    value: str
+    source: str = ""
+
+
+class PolicyTestOutcome(BaseModel):
+    """The outcome of one test against one credit file.
+
+    `outcome` is pass, fail, or not_evaluable. not_evaluable always
+    names the missing input — a figure that was not computable, a
+    global pack that was never combined, a document that is not on
+    file. It is the honest third state law 2 demands: the test did
+    not pass, it could not be run.
+    """
+
+    test_id: str
+    name: str
+    severity: str
+    citation: str
+    outcome: str  # pass | fail | not_evaluable
+    operator: str | None = None
+    threshold: Decimal | None = None
+    fiscal_year: int | None = None
+    values_read: list[PolicyInputValue] = Field(default_factory=list)
+    missing_inputs: list[str] = Field(default_factory=list)
+    detail: str = ""
+
+
+class PolicyReport(BaseModel):
+    """The stored artefact of one policy evaluation run.
+
+    Content-addressed like the computation pack it reads: the report
+    id is derived from the pack version evaluated, the computation
+    pack(s) read, the as-of date, and a digest of the credit-file
+    facts the tests read. Re-evaluating the same file under the same
+    pinned version over unchanged inputs reproduces the identical
+    report. The report carries no timestamps of its own.
+    """
+
+    report_id: str
+    credit_file_id: str
+    policy_pack_id: str
+    policy_version: str
+    computation_pack_id: str
+    global_pack_id: str | None = None
+    as_of: date
+    outcomes: list[PolicyTestOutcome] = Field(default_factory=list)
+    summary: dict[str, int] = Field(default_factory=dict)
+
+    def outcome(self, test_id: str) -> PolicyTestOutcome | None:
+        for outcome in self.outcomes:
+            if outcome.test_id == test_id:
+                return outcome
+        return None
