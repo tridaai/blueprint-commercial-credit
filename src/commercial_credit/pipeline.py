@@ -62,6 +62,7 @@ from .models import (
     CreditFile,
     CreditFileStatus,
     CreditMemo,
+    Disagreement,
     DocumentKind,
     Elimination,
     ExtractedValue,
@@ -177,7 +178,16 @@ class CreditPipeline:
         total = 0
         done: list[str] = []
         for doc in credit_file.documents:
-            if doc.kind != DocumentKind.FINANCIAL_STATEMENT:
+            # Round 8: tax returns are extracted too — they are a
+            # source the spread reads in their own right, and the
+            # disagreements between them and the statements are
+            # round 8's subject. Other kinds stay unextracted:
+            # the extractor reads statements and returns, and
+            # returns [] for anything else.
+            if doc.kind not in (
+                DocumentKind.FINANCIAL_STATEMENT,
+                DocumentKind.TAX_RETURN,
+            ):
                 continue
             content = read_document_verified(self.documents, doc)
             values = receive_extraction(self.extractor.extract(doc, content))
@@ -268,21 +278,53 @@ class CreditPipeline:
         latest = self.store.get_latest_spread(credit_file_id)
         self.store.save_spread(spread)
         if latest is None or latest.spread_id != spread.spread_id:
-            self._audit(
-                credit_file_id,
-                "spread_built",
+            detail = (
                 f"{len(spread.periods)} periods "
                 f"({', '.join(str(y) for y in spread.periods)}), "
                 f"{len(spread.lines)} template lines, "
                 f"{len(spread.unmapped)} unmapped lines, "
-                f"template {spread.template_version}",
+                f"template {spread.template_version}"
             )
+            if spread.disagreements:
+                material = sum(1 for d in spread.disagreements if d.material)
+                detail += (
+                    f"; {len(spread.disagreements)} document "
+                    f"disagreement(s) recorded under policy "
+                    f"{spread.disagreement_policy_version} "
+                    f"({material} material)"
+                )
+            self._audit(credit_file_id, "spread_built", detail)
         return spread
 
     def get_spread(self, credit_file_id: str) -> Spread:
         """The file's current spread, rebuilt so it can never lag a
         restated document or a new extraction behind the store."""
         return self.build_spread(credit_file_id)
+
+    def list_disagreements(
+        self, credit_file_id: str, *, material: bool | None = None
+    ) -> list[Disagreement]:
+        """The disagreements the file's current spread records
+        (round 8) — every one, material and immaterial alike, in
+        the spread's own order. The as-reported view: each record
+        carries every source's figure with its provenance."""
+        spread = self.build_spread(credit_file_id)
+        records = list(spread.disagreements)
+        if material is not None:
+            records = [d for d in records if d.material == material]
+        return records
+
+    def get_disagreement(
+        self, credit_file_id: str, disagreement_id: str
+    ) -> Disagreement:
+        """One disagreement record from the file's current spread."""
+        for record in self.list_disagreements(credit_file_id):
+            if record.disagreement_id == disagreement_id:
+                return record
+        raise NotFoundError(
+            f"no disagreement {disagreement_id!r} on credit file "
+            f"{credit_file_id}"
+        )
 
     def compute_metrics(
         self,

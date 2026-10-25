@@ -21,8 +21,11 @@ the committee on an officer-final memo, record its decision
 (approve, approve with structured conditions, decline with coded
 adverse-action reasons tied to the evidence, or defer with named
 re-presentment requirements), and read the decision record, its
-conditions, and the generated adverse-action notice. Every
-request carries a request id into the structured logs.
+conditions, and the generated adverse-action notice. Round 8 adds
+the disagreements view: the spread's disagreement records between
+source types — list and detail — with the spread itself carrying
+the flags. Every request carries a request id into the structured
+logs.
 """
 
 from __future__ import annotations
@@ -234,6 +237,27 @@ def get_spread(credit_file_id: str) -> dict:
     _file_or_404(credit_file_id)
     spread = pipeline.get_spread(credit_file_id)
     return spread.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/disagreements")
+def list_disagreements(credit_file_id: str, material: bool | None = None) -> list[dict]:
+    """The disagreements the file's spread records between its
+    source types (round 8): every source's figure with its
+    provenance, the deltas, and the materiality verdict. The
+    as-reported view — nothing here is the spread's working figure
+    alone, and nothing is averaged."""
+    _file_or_404(credit_file_id)
+    return [
+        d.model_dump(mode="json")
+        for d in pipeline.list_disagreements(credit_file_id, material=material)
+    ]
+
+
+@app.get("/applications/{credit_file_id}/disagreements/{disagreement_id}")
+def get_disagreement(credit_file_id: str, disagreement_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    record = pipeline.get_disagreement(credit_file_id, disagreement_id)
+    return record.model_dump(mode="json")
 
 
 @app.get("/applications/{credit_file_id}/adjustments")
