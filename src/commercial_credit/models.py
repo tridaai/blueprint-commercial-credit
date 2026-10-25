@@ -1678,3 +1678,185 @@ class BreachCase(BaseModel):
     state: str = BREACH_OPEN
     events: list[BreachEvent] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utcnow)
+
+
+# ---------------------------------------------------------------------
+# Round 12: annual review packs. An approved facility owes the bank
+# an annual review — a fresh look at the credit on fresh figures,
+# taken by a named credit officer, recorded with a coded stance.
+# The review instance (below, in reviews.py) is derived from the
+# covenant set's anchor like the round 10 schedule; what is stored
+# is the pack assembled for the review, the officer's outcome, and
+# — when the stance escalates — the referral handed to the
+# committee machinery. A review may also stand `completed`, the
+# derived state of an instance an outcome has closed.
+# ---------------------------------------------------------------------
+
+REVIEW_COMPLETED = "completed"
+
+
+class PolicyOutcomeDifference(BaseModel):
+    """One policy test whose outcome differs between the version
+    the credit was decided under and the version current at the
+    review. The difference is surfaced, never reconciled: the
+    review reads both reports and names the tests that moved."""
+
+    test_id: str
+    pinned_outcome: str
+    current_outcome: str
+
+
+class ReviewBlocker(BaseModel):
+    """One stale or missing required input, carried into the pack
+    from the round 9 readiness report. A pack with blockers is
+    produced — the review still happens — but it is marked
+    incomplete and names every blocker: absence is stated, never
+    papered over (design law 7, carried into the review)."""
+
+    input_key: str
+    label: str
+    state: str  # present_stale | missing | not_evaluable_input
+    detail: str
+
+
+class ReviewSummaryVerification(BaseModel):
+    """The figure verifier's record over a review summary — the
+    round 5 discipline applied to the review's prose: every figure
+    in the rendered summary traced into the pack's pinned inputs,
+    and every locked fact paragraph present verbatim."""
+
+    composer_profile: str
+    figure_count: int
+    figures: list[FigureTrace] = Field(default_factory=list)
+    locked_facts_expected: int = 0
+    locked_facts_present: int = 0
+    verified: bool = True
+
+
+class ReviewSummary(BaseModel):
+    """The officer-facing summary of an annual review pack.
+
+    Two kinds of paragraph, kept distinct on the artefact:
+    `locked_facts` are rendered by code from the pack's pinned
+    artefacts — the covenant record, the breaches, the policy
+    position under both pack versions, the material disagreements,
+    the incompleteness statement — and may not be reworded by
+    anyone, composer or officer; `paragraphs` are the composer's
+    narrative, drafted through the model port and passed through
+    the figure verifier before the pack exists. A summary whose
+    prose softens a locked fact (a breach described away) is
+    refused by the verifier, not edited into shape."""
+
+    composer_profile: str
+    paragraphs: list[str] = Field(default_factory=list)
+    locked_facts: list[str] = Field(default_factory=list)
+    verification: ReviewSummaryVerification
+
+
+class AnnualReviewPack(BaseModel):
+    """The pack assembled for one annual review instance.
+
+    Content-addressed like the artefacts it pins: the pack id
+    derives from the review instance, the as-of date, every pinned
+    artefact id (spread, computation pack, both policy reports,
+    the readiness report) and the verified summary — assembling
+    the same review over the same inputs reproduces the identical
+    pack. The pack is evidence for the review, assembled in code
+    from stored artefacts only; the officer's stance is a separate
+    artefact (AnnualReviewOutcome) that names the pack it read."""
+
+    pack_id: str
+    credit_file_id: str
+    set_id: str
+    review_number: int
+    anchor_date: date
+    period_start: date
+    due_date: date
+    as_of: date
+    borrower_name: str
+    memo_id: str
+    spread_id: str
+    computation_pack_id: str
+    latest_period: int | None = None
+    periods_covered: list[int] = Field(default_factory=list)
+    pinned_policy_pack_id: str
+    pinned_policy_version: str
+    pinned_policy_report_id: str
+    current_policy_version: str
+    current_policy_report_id: str
+    policy_differences: list[PolicyOutcomeDifference] = Field(
+        default_factory=list
+    )
+    readiness_report_id: str
+    complete: bool
+    blockers: list[ReviewBlocker] = Field(default_factory=list)
+    test_result_ids: list[str] = Field(default_factory=list)
+    breach_ids: list[str] = Field(default_factory=list)
+    open_breach_ids: list[str] = Field(default_factory=list)
+    material_disagreement_ids: list[str] = Field(default_factory=list)
+    summary: ReviewSummary
+    created_at: datetime = Field(default_factory=utcnow)
+
+
+class AnnualReviewOutcome(BaseModel):
+    """A named credit officer's recorded stance on one annual
+    review — the act that closes the review instance.
+
+    The stance is one of a versioned coded vocabulary (reviews.py):
+    affirm, affirm_with_conditions (the conditions are structured
+    CommitteeCondition records, validated and traced by the round
+    7 machinery), place_on_watchlist, escalate_to_committee (which
+    mints the CommitteeReferral the outcome names). Reasons are
+    coded from the same vocabulary — a free-text stance is
+    impossible by construction. The reviewer is a named officer in
+    a credit-officer role; when the reviewer is the officer who
+    approved the decided memo at the round 6 gate, a second named
+    officer must countersign — the memo's approver does not review
+    their own credit alone."""
+
+    outcome_id: str
+    credit_file_id: str
+    set_id: str
+    review_number: int
+    due_date: date
+    pack_id: str
+    stance: str  # affirm | affirm_with_conditions | place_on_watchlist | escalate_to_committee
+    reason_codes: list[str] = Field(default_factory=list)
+    reason_vocabulary: str
+    reviewer_id: str
+    reviewer_role: str
+    countersigner_id: str | None = None
+    countersigner_role: str | None = None
+    conditions: list[CommitteeCondition] = Field(default_factory=list)
+    referral_id: str | None = None
+    note: str = ""
+    decided_at: datetime = Field(default_factory=utcnow)
+
+
+class CommitteeReferral(BaseModel):
+    """The recorded hand-off an escalating review outcome creates:
+    the pack, the review and the coded reasons, addressed to the
+    credit committee.
+
+    The referral is a surface, not a second committee: the round
+    7 machinery (convene, decide) remains the only place a
+    committee decision is made, and it acts on the memo this
+    referral names. The referral records that the review asked —
+    with the evidence pack pinned — and stands `open` until the
+    bank's own process answers it; this blueprint records no
+    committee outcome on a referral's behalf."""
+
+    referral_id: str
+    credit_file_id: str
+    set_id: str
+    review_number: int
+    outcome_id: str
+    pack_id: str
+    memo_id: str
+    reason_codes: list[str] = Field(default_factory=list)
+    reason_vocabulary: str
+    referred_by: str
+    referred_by_role: str
+    note: str = ""
+    status: str = "open"
+    created_at: datetime = Field(default_factory=utcnow)
