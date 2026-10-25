@@ -31,6 +31,8 @@ from .models import (
     MemoDiff,
     MemoReviewEvent,
     PolicyReport,
+    RatingAssignment,
+    RatingOverride,
     ReadinessReport,
     SourceDocument,
     Spread,
@@ -233,6 +235,39 @@ class CreditFileStore(Protocol):
     def list_committee_referrals(
         self, credit_file_id: str
     ) -> list[CommitteeReferral]: ...
+
+    # -- Risk ratings (round 13) -----------------------------------
+    # An assignment is content-addressed and insert-once, like
+    # the packs it reads: recomputing over the same inputs stores
+    # nothing twice, and a scorecard version change appends a new
+    # assignment — history is never rewritten. An override is
+    # likewise insert-once beside its assignment; there is no
+    # update path for either, because a grade changes by a new
+    # recorded act or not at all.
+
+    def save_rating_assignment(
+        self, assignment: RatingAssignment
+    ) -> None: ...
+
+    def get_rating_assignment(
+        self, assignment_id: str
+    ) -> RatingAssignment | None: ...
+
+    def list_rating_assignments(
+        self, credit_file_id: str
+    ) -> list[RatingAssignment]: ...
+
+    def save_rating_override(
+        self, override: RatingOverride
+    ) -> None: ...
+
+    def get_rating_override(
+        self, override_id: str
+    ) -> RatingOverride | None: ...
+
+    def list_rating_overrides(
+        self, credit_file_id: str
+    ) -> list[RatingOverride]: ...
 
     def save_breach_case(self, breach: BreachCase) -> None: ...
 

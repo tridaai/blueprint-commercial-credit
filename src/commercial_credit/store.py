@@ -31,6 +31,8 @@ from .models import (
     MemoDiff,
     MemoReviewEvent,
     PolicyReport,
+    RatingAssignment,
+    RatingOverride,
     ReadinessReport,
     Spread,
     SpreadAdjustment,
@@ -71,6 +73,10 @@ class InMemoryCreditStore:
         self._review_outcome_order: dict[str, list[str]] = {}
         self._referrals: dict[str, CommitteeReferral] = {}
         self._referral_order: dict[str, list[str]] = {}
+        self._rating_assignments: dict[str, RatingAssignment] = {}
+        self._rating_assignment_order: dict[str, list[str]] = {}
+        self._rating_overrides: dict[str, RatingOverride] = {}
+        self._rating_override_order: dict[str, list[str]] = {}
 
     def save_credit_file(self, credit_file: CreditFile) -> None:
         self._files[credit_file.credit_file_id] = credit_file.model_copy(deep=True)
@@ -449,6 +455,60 @@ class InMemoryCreditStore:
             for referral_id in self._referral_order.get(credit_file_id, [])
         ]
 
+    def save_rating_assignment(
+        self, assignment: RatingAssignment
+    ) -> None:
+        if assignment.assignment_id in self._rating_assignments:
+            return
+        self._rating_assignments[assignment.assignment_id] = (
+            assignment.model_copy(deep=True)
+        )
+        self._rating_assignment_order.setdefault(
+            assignment.credit_file_id, []
+        ).append(assignment.assignment_id)
+
+    def get_rating_assignment(
+        self, assignment_id: str
+    ) -> RatingAssignment | None:
+        assignment = self._rating_assignments.get(assignment_id)
+        return assignment.model_copy(deep=True) if assignment else None
+
+    def list_rating_assignments(
+        self, credit_file_id: str
+    ) -> list[RatingAssignment]:
+        return [
+            self._rating_assignments[assignment_id].model_copy(deep=True)
+            for assignment_id in self._rating_assignment_order.get(
+                credit_file_id, []
+            )
+        ]
+
+    def save_rating_override(self, override: RatingOverride) -> None:
+        if override.override_id in self._rating_overrides:
+            return
+        self._rating_overrides[override.override_id] = override.model_copy(
+            deep=True
+        )
+        self._rating_override_order.setdefault(
+            override.credit_file_id, []
+        ).append(override.override_id)
+
+    def get_rating_override(
+        self, override_id: str
+    ) -> RatingOverride | None:
+        override = self._rating_overrides.get(override_id)
+        return override.model_copy(deep=True) if override else None
+
+    def list_rating_overrides(
+        self, credit_file_id: str
+    ) -> list[RatingOverride]:
+        return [
+            self._rating_overrides[override_id].model_copy(deep=True)
+            for override_id in self._rating_override_order.get(
+                credit_file_id, []
+            )
+        ]
+
     def ping(self) -> bool:
         return True
 
@@ -530,6 +590,14 @@ class SqliteCreditStore:
                 referral_id TEXT PRIMARY KEY,
                 credit_file_id TEXT NOT NULL, outcome_id TEXT NOT NULL,
                 payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS rating_assignments (
+                assignment_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL,
+                scorecard_version TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS rating_overrides (
+                override_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL,
+                assignment_id TEXT NOT NULL, payload TEXT NOT NULL);
             """
         )
         self._conn.commit()
@@ -1039,6 +1107,83 @@ class SqliteCreditStore:
         ).fetchall()
         return [
             CommitteeReferral.model_validate_json(r[0]) for r in rows
+        ]
+
+    def save_rating_assignment(
+        self, assignment: RatingAssignment
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO rating_assignments (assignment_id, "
+                "credit_file_id, scorecard_version, payload) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(assignment_id) DO NOTHING",
+                (
+                    assignment.assignment_id, assignment.credit_file_id,
+                    assignment.scorecard_version,
+                    assignment.model_dump_json(),
+                ),
+            )
+
+    def get_rating_assignment(
+        self, assignment_id: str
+    ) -> RatingAssignment | None:
+        row = self._conn.execute(
+            "SELECT payload FROM rating_assignments "
+            "WHERE assignment_id = ?",
+            (assignment_id,),
+        ).fetchone()
+        return (
+            RatingAssignment.model_validate_json(row[0]) if row else None
+        )
+
+    def list_rating_assignments(
+        self, credit_file_id: str
+    ) -> list[RatingAssignment]:
+        rows = self._conn.execute(
+            "SELECT payload FROM rating_assignments "
+            "WHERE credit_file_id = ? ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [
+            RatingAssignment.model_validate_json(r[0]) for r in rows
+        ]
+
+    def save_rating_override(self, override: RatingOverride) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO rating_overrides (override_id, "
+                "credit_file_id, assignment_id, payload) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(override_id) DO NOTHING",
+                (
+                    override.override_id, override.credit_file_id,
+                    override.assignment_id, override.model_dump_json(),
+                ),
+            )
+
+    def get_rating_override(
+        self, override_id: str
+    ) -> RatingOverride | None:
+        row = self._conn.execute(
+            "SELECT payload FROM rating_overrides "
+            "WHERE override_id = ?",
+            (override_id,),
+        ).fetchone()
+        return (
+            RatingOverride.model_validate_json(row[0]) if row else None
+        )
+
+    def list_rating_overrides(
+        self, credit_file_id: str
+    ) -> list[RatingOverride]:
+        rows = self._conn.execute(
+            "SELECT payload FROM rating_overrides "
+            "WHERE credit_file_id = ? ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [
+            RatingOverride.model_validate_json(r[0]) for r in rows
         ]
 
     def get_breach_case(self, breach_id: str) -> BreachCase | None:
@@ -1877,6 +2022,79 @@ class PostgresCreditStore:
                 (credit_file_id,),
             ).fetchall()
         return [self._validate(CommitteeReferral, row) for row in rows]
+
+    def save_rating_assignment(
+        self, assignment: RatingAssignment
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO rating_assignments (assignment_id, "
+                "credit_file_id, scorecard_version, payload) "
+                "VALUES (%s, %s, %s, %s::jsonb) "
+                "ON CONFLICT (assignment_id) DO NOTHING",
+                (
+                    assignment.assignment_id, assignment.credit_file_id,
+                    assignment.scorecard_version,
+                    assignment.model_dump_json(),
+                ),
+            )
+
+    def get_rating_assignment(
+        self, assignment_id: str
+    ) -> RatingAssignment | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM rating_assignments "
+                "WHERE assignment_id = %s",
+                (assignment_id,),
+            ).fetchone()
+        return self._validate(RatingAssignment, row)
+
+    def list_rating_assignments(
+        self, credit_file_id: str
+    ) -> list[RatingAssignment]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM rating_assignments "
+                "WHERE credit_file_id = %s ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        return [self._validate(RatingAssignment, row) for row in rows]
+
+    def save_rating_override(self, override: RatingOverride) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO rating_overrides (override_id, "
+                "credit_file_id, assignment_id, payload) "
+                "VALUES (%s, %s, %s, %s::jsonb) "
+                "ON CONFLICT (override_id) DO NOTHING",
+                (
+                    override.override_id, override.credit_file_id,
+                    override.assignment_id, override.model_dump_json(),
+                ),
+            )
+
+    def get_rating_override(
+        self, override_id: str
+    ) -> RatingOverride | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM rating_overrides "
+                "WHERE override_id = %s",
+                (override_id,),
+            ).fetchone()
+        return self._validate(RatingOverride, row)
+
+    def list_rating_overrides(
+        self, credit_file_id: str
+    ) -> list[RatingOverride]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM rating_overrides "
+                "WHERE credit_file_id = %s ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        return [self._validate(RatingOverride, row) for row in rows]
 
     def ping(self) -> bool:
         try:
