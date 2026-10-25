@@ -17,6 +17,8 @@ from .models import (
     Borrower,
     CommitteeDecision,
     ComputationPack,
+    CovenantAmendment,
+    CovenantSet,
     CreditFile,
     CreditMemo,
     ExtractedValue,
@@ -151,5 +153,28 @@ class CreditFileStore(Protocol):
     def list_committee_decisions(
         self, credit_file_id: str, memo_id: str | None = None
     ) -> list[CommitteeDecision]: ...
+
+    # -- Covenant sets and amendments (round 10) --------------------
+    # A set is created once, by one decision, and never updated:
+    # save is insert-once. Amendments are append-only artefacts
+    # beside the set. There is deliberately no update path for
+    # either: a covenant's terms change by supersession, in the
+    # open, or not at all.
+
+    def save_covenant_set(self, covenant_set: CovenantSet) -> None: ...
+
+    def get_covenant_set(self, set_id: str) -> CovenantSet | None: ...
+
+    def list_covenant_sets(
+        self, credit_file_id: str
+    ) -> list[CovenantSet]: ...
+
+    def save_covenant_amendment(
+        self, amendment: CovenantAmendment
+    ) -> None: ...
+
+    def list_covenant_amendments(
+        self, credit_file_id: str
+    ) -> list[CovenantAmendment]: ...
 
     def ping(self) -> bool: ...

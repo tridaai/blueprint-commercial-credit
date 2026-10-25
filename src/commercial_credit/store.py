@@ -18,6 +18,8 @@ from .models import (
     AuditEvent,
     CommitteeDecision,
     ComputationPack,
+    CovenantAmendment,
+    CovenantSet,
     CreditFile,
     CreditMemo,
     ExtractedValue,
@@ -51,6 +53,9 @@ class InMemoryCreditStore:
         self._diff_order: dict[str, list[str]] = {}
         self._decisions: dict[str, CommitteeDecision] = {}
         self._decision_order: dict[str, list[str]] = {}
+        self._covenant_sets: dict[str, CovenantSet] = {}
+        self._covenant_set_order: dict[str, list[str]] = {}
+        self._amendments: dict[str, list[CovenantAmendment]] = {}
 
     def save_credit_file(self, credit_file: CreditFile) -> None:
         self._files[credit_file.credit_file_id] = credit_file.model_copy(deep=True)
@@ -254,6 +259,49 @@ class InMemoryCreditStore:
             or self._decisions[decision_id].memo_id == memo_id
         ]
 
+    def save_covenant_set(self, covenant_set: CovenantSet) -> None:
+        # Insert-once, like every content-addressed artefact: the
+        # set a decision created is never rewritten. Amendments
+        # are separate artefacts beside it.
+        if covenant_set.set_id in self._covenant_sets:
+            return
+        self._covenant_sets[covenant_set.set_id] = covenant_set.model_copy(
+            deep=True
+        )
+        self._covenant_set_order.setdefault(
+            covenant_set.credit_file_id, []
+        ).append(covenant_set.set_id)
+
+    def get_covenant_set(self, set_id: str) -> CovenantSet | None:
+        covenant_set = self._covenant_sets.get(set_id)
+        return covenant_set.model_copy(deep=True) if covenant_set else None
+
+    def list_covenant_sets(
+        self, credit_file_id: str
+    ) -> list[CovenantSet]:
+        return [
+            self._covenant_sets[set_id].model_copy(deep=True)
+            for set_id in self._covenant_set_order.get(credit_file_id, [])
+        ]
+
+    def save_covenant_amendment(
+        self, amendment: CovenantAmendment
+    ) -> None:
+        # Append-only: the amendment record of a set is its full
+        # history; nothing here is updated or removed.
+        existing = self._amendments.setdefault(amendment.credit_file_id, [])
+        if any(a.amendment_id == amendment.amendment_id for a in existing):
+            return
+        existing.append(amendment.model_copy(deep=True))
+
+    def list_covenant_amendments(
+        self, credit_file_id: str
+    ) -> list[CovenantAmendment]:
+        return [
+            a.model_copy(deep=True)
+            for a in self._amendments.get(credit_file_id, [])
+        ]
+
     def ping(self) -> bool:
         return True
 
@@ -307,6 +355,14 @@ class SqliteCreditStore:
                 decision_id TEXT PRIMARY KEY,
                 credit_file_id TEXT NOT NULL, memo_id TEXT NOT NULL,
                 outcome TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS covenant_sets (
+                set_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, decision_id TEXT NOT NULL,
+                payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS covenant_amendments (
+                amendment_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, set_id TEXT NOT NULL,
+                payload TEXT NOT NULL);
             """
         )
         self._conn.commit()
@@ -599,6 +655,61 @@ class SqliteCreditStore:
                 (credit_file_id, memo_id),
             ).fetchall()
         return [CommitteeDecision.model_validate_json(r[0]) for r in rows]
+
+    def save_covenant_set(self, covenant_set: CovenantSet) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO covenant_sets (set_id, credit_file_id, decision_id, payload) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(set_id) DO NOTHING",
+                (
+                    covenant_set.set_id,
+                    covenant_set.credit_file_id,
+                    covenant_set.decision_id,
+                    covenant_set.model_dump_json(),
+                ),
+            )
+
+    def get_covenant_set(self, set_id: str) -> CovenantSet | None:
+        row = self._conn.execute(
+            "SELECT payload FROM covenant_sets WHERE set_id = ?",
+            (set_id,),
+        ).fetchone()
+        return CovenantSet.model_validate_json(row[0]) if row else None
+
+    def list_covenant_sets(
+        self, credit_file_id: str
+    ) -> list[CovenantSet]:
+        rows = self._conn.execute(
+            "SELECT payload FROM covenant_sets WHERE credit_file_id = ? "
+            "ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [CovenantSet.model_validate_json(r[0]) for r in rows]
+
+    def save_covenant_amendment(
+        self, amendment: CovenantAmendment
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO covenant_amendments (amendment_id, credit_file_id, set_id, payload) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(amendment_id) DO NOTHING",
+                (
+                    amendment.amendment_id,
+                    amendment.credit_file_id,
+                    amendment.set_id,
+                    amendment.model_dump_json(),
+                ),
+            )
+
+    def list_covenant_amendments(
+        self, credit_file_id: str
+    ) -> list[CovenantAmendment]:
+        rows = self._conn.execute(
+            "SELECT payload FROM covenant_amendments "
+            "WHERE credit_file_id = ? ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [CovenantAmendment.model_validate_json(r[0]) for r in rows]
 
     def ping(self) -> bool:
         try:
@@ -1108,6 +1219,85 @@ class PostgresCreditStore:
             payload = row["payload"]
             out.append(
                 CommitteeDecision.model_validate(
+                    payload if isinstance(payload, dict) else json.loads(payload)
+                )
+            )
+        return out
+
+    def save_covenant_set(self, covenant_set: CovenantSet) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO covenant_sets (set_id, credit_file_id, decision_id, payload) "
+                "VALUES (%s, %s, %s, %s::jsonb) ON CONFLICT (set_id) DO NOTHING",
+                (
+                    covenant_set.set_id,
+                    covenant_set.credit_file_id,
+                    covenant_set.decision_id,
+                    covenant_set.model_dump_json(),
+                ),
+            )
+
+    def get_covenant_set(self, set_id: str) -> CovenantSet | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM covenant_sets WHERE set_id = %s",
+                (set_id,),
+            ).fetchone()
+        if not row:
+            return None
+        payload = row["payload"]
+        return CovenantSet.model_validate(
+            payload if isinstance(payload, dict) else json.loads(payload)
+        )
+
+    def list_covenant_sets(
+        self, credit_file_id: str
+    ) -> list[CovenantSet]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM covenant_sets WHERE credit_file_id = %s "
+                "ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append(
+                CovenantSet.model_validate(
+                    payload if isinstance(payload, dict) else json.loads(payload)
+                )
+            )
+        return out
+
+    def save_covenant_amendment(
+        self, amendment: CovenantAmendment
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO covenant_amendments (amendment_id, credit_file_id, set_id, payload) "
+                "VALUES (%s, %s, %s, %s::jsonb) ON CONFLICT (amendment_id) DO NOTHING",
+                (
+                    amendment.amendment_id,
+                    amendment.credit_file_id,
+                    amendment.set_id,
+                    amendment.model_dump_json(),
+                ),
+            )
+
+    def list_covenant_amendments(
+        self, credit_file_id: str
+    ) -> list[CovenantAmendment]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM covenant_amendments "
+                "WHERE credit_file_id = %s ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append(
+                CovenantAmendment.model_validate(
                     payload if isinstance(payload, dict) else json.loads(payload)
                 )
             )
