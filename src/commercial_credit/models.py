@@ -781,3 +781,112 @@ class PolicyReport(BaseModel):
             if outcome.test_id == test_id:
                 return outcome
         return None
+
+    def non_pass_outcomes(self) -> list[PolicyTestOutcome]:
+        """Every outcome that is not a pass, in pack order.
+
+        These are the memo's policy exceptions (round 5): a fail or
+        a not_evaluable is carried into the memo exactly as the
+        report records it — never omitted, never softened.
+        """
+        return [o for o in self.outcomes if o.outcome != "pass"]
+
+
+class MemoTable(BaseModel):
+    """One table in a memo section. Cells are rendered text; any
+    figure in a cell is verified exactly like narrative text."""
+
+    caption: str = ""
+    columns: list[str] = Field(default_factory=list)
+    rows: list[list[str]] = Field(default_factory=list)
+
+
+class MemoSection(BaseModel):
+    """One section of the draft memo.
+
+    `exception_test_ids` is used only by the policy_exceptions
+    section: the structured list of policy test ids the section
+    accounts for, so the verifier can check exceptions integrity
+    structurally instead of trusting the prose.
+    """
+
+    key: str
+    title: str
+    paragraphs: list[str] = Field(default_factory=list)
+    tables: list[MemoTable] = Field(default_factory=list)
+    exception_test_ids: list[str] = Field(default_factory=list)
+
+
+class FigureTrace(BaseModel):
+    """One figure occurrence in the rendered memo, traced home.
+
+    `text` is the figure exactly as it appears in the rendered
+    memo; `value` its canonical decimal string; `source` names the
+    artefact and field it was traced to — a computation pack figure,
+    a spread line, a policy threshold or outcome value, or a stated
+    fact of the credit file.
+    """
+
+    text: str
+    value: str
+    kind: str  # amount | ratio | percent | number
+    source: str
+    section_key: str
+
+
+class MemoVerification(BaseModel):
+    """The verifier's record, stored with the memo it cleared.
+
+    A memo only exists as a stored draft because this record exists:
+    every figure in the rendered text traced, and the exceptions
+    section accounting for every non-pass outcome of the pinned
+    policy report, by test id.
+    """
+
+    composer_profile: str
+    figure_count: int
+    figures: list[FigureTrace] = Field(default_factory=list)
+    exceptions_expected: list[str] = Field(default_factory=list)
+    exceptions_listed: list[str] = Field(default_factory=list)
+    verified: bool = True
+
+
+class CreditMemo(BaseModel):
+    """The draft credit memo: a stored, content-addressed artefact.
+
+    The header pins everything the memo was composed from — the
+    spread, the computation pack, the policy pack and version and
+    the report, all by id — so a reader can walk from any figure in
+    the memo to the exact artefacts that produced it. The memo ends
+    this round in DRAFT: it states facts and policy outcomes, its
+    recommendation and conditions sections are placeholders, and the
+    credit officer's gate is a later round.
+
+    Content-addressed like the artefacts it pins: the memo id is
+    derived from the pinned ids, the composer profile, the section
+    content and the verification record, so identical inputs
+    reproduce the identical memo.
+    """
+
+    memo_id: str
+    credit_file_id: str
+    status: str = "draft"
+    borrower_name: str
+    facility_type: str
+    spread_id: str
+    computation_pack_id: str
+    global_pack_id: str | None = None
+    policy_pack_id: str
+    policy_version: str
+    policy_report_id: str
+    as_of: date
+    composer_profile: str
+    sections: list[MemoSection] = Field(default_factory=list)
+    verification: MemoVerification
+    created_at: datetime = Field(default_factory=utcnow)
+
+    def section(self, key: str) -> MemoSection | None:
+        for section in self.sections:
+            if section.key == key:
+                return section
+        return None

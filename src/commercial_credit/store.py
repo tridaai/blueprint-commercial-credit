@@ -18,6 +18,7 @@ from .models import (
     AuditEvent,
     ComputationPack,
     CreditFile,
+    CreditMemo,
     ExtractedValue,
     PolicyReport,
     Spread,
@@ -37,6 +38,8 @@ class InMemoryCreditStore:
         self._pack_order: dict[str, list[str]] = {}
         self._reports: dict[str, PolicyReport] = {}
         self._report_order: dict[str, list[str]] = {}
+        self._memos: dict[str, CreditMemo] = {}
+        self._memo_order: dict[str, list[str]] = {}
 
     def save_credit_file(self, credit_file: CreditFile) -> None:
         self._files[credit_file.credit_file_id] = credit_file.model_copy(deep=True)
@@ -131,6 +134,25 @@ class InMemoryCreditStore:
             for report_id in self._report_order.get(credit_file_id, [])
         ]
 
+    def save_memo(self, memo: CreditMemo) -> None:
+        # Content-addressed: the same memo id is the same artefact.
+        # A memo only reaches the store after the figure verifier
+        # has cleared it; storing it twice records it once.
+        if memo.memo_id in self._memos:
+            return
+        self._memos[memo.memo_id] = memo.model_copy(deep=True)
+        self._memo_order.setdefault(memo.credit_file_id, []).append(memo.memo_id)
+
+    def get_memo(self, memo_id: str) -> CreditMemo | None:
+        memo = self._memos.get(memo_id)
+        return memo.model_copy(deep=True) if memo else None
+
+    def list_memos(self, credit_file_id: str) -> list[CreditMemo]:
+        return [
+            self._memos[memo_id].model_copy(deep=True)
+            for memo_id in self._memo_order.get(credit_file_id, [])
+        ]
+
     def ping(self) -> bool:
         return True
 
@@ -165,6 +187,9 @@ class SqliteCreditStore:
                 credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS policy_reports (
                 report_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS memos (
+                memo_id TEXT PRIMARY KEY,
                 credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
             """
         )
@@ -303,6 +328,28 @@ class SqliteCreditStore:
             (credit_file_id,),
         ).fetchall()
         return [PolicyReport.model_validate_json(r[0]) for r in rows]
+
+    def save_memo(self, memo: CreditMemo) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO memos (memo_id, credit_file_id, payload) "
+                "VALUES (?, ?, ?) ON CONFLICT(memo_id) DO NOTHING",
+                (memo.memo_id, memo.credit_file_id, memo.model_dump_json()),
+            )
+
+    def get_memo(self, memo_id: str) -> CreditMemo | None:
+        row = self._conn.execute(
+            "SELECT payload FROM memos WHERE memo_id = ?",
+            (memo_id,),
+        ).fetchone()
+        return CreditMemo.model_validate_json(row[0]) if row else None
+
+    def list_memos(self, credit_file_id: str) -> list[CreditMemo]:
+        rows = self._conn.execute(
+            "SELECT payload FROM memos WHERE credit_file_id = ? ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [CreditMemo.model_validate_json(r[0]) for r in rows]
 
     def ping(self) -> bool:
         try:
@@ -569,6 +616,49 @@ class PostgresCreditStore:
             payload = row["payload"]
             out.append(
                 PolicyReport.model_validate(
+                    payload if isinstance(payload, dict) else json.loads(payload)
+                )
+            )
+        return out
+
+    def save_memo(self, memo: CreditMemo) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO memos (memo_id, credit_file_id, policy_version, payload) "
+                "VALUES (%s, %s, %s, %s::jsonb) ON CONFLICT (memo_id) DO NOTHING",
+                (
+                    memo.memo_id,
+                    memo.credit_file_id,
+                    memo.policy_version,
+                    memo.model_dump_json(),
+                ),
+            )
+
+    def get_memo(self, memo_id: str) -> CreditMemo | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM memos WHERE memo_id = %s",
+                (memo_id,),
+            ).fetchone()
+        if not row:
+            return None
+        payload = row["payload"]
+        return CreditMemo.model_validate(
+            payload if isinstance(payload, dict) else json.loads(payload)
+        )
+
+    def list_memos(self, credit_file_id: str) -> list[CreditMemo]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM memos WHERE credit_file_id = %s "
+                "ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append(
+                CreditMemo.model_validate(
                     payload if isinstance(payload, dict) else json.loads(payload)
                 )
             )

@@ -17,6 +17,7 @@ from .models import (
     Borrower,
     ComputationPack,
     CreditFile,
+    CreditMemo,
     ExtractedValue,
     FacilityRequest,
     PolicyReport,
@@ -106,5 +107,11 @@ class CreditFileStore(Protocol):
     def list_policy_reports(
         self, credit_file_id: str
     ) -> list[PolicyReport]: ...
+
+    def save_memo(self, memo: CreditMemo) -> None: ...
+
+    def get_memo(self, memo_id: str) -> CreditMemo | None: ...
+
+    def list_memos(self, credit_file_id: str) -> list[CreditMemo]: ...
 
     def ping(self) -> bool: ...

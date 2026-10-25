@@ -30,5 +30,26 @@ class DocumentIntegrityError(CreditError):
     """Stored document bytes no longer match their recorded SHA-256."""
 
 
+class MemoVerificationError(CreditError):
+    """A draft memo failed the figure verifier and was refused storage.
+
+    Carries the offending figures (as rendered) and any policy
+    exceptions the draft omitted, so the refusal names exactly what
+    could not be traced or was left out — a memo the verifier cannot
+    clear never becomes a stored draft.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        untraceable: list[str] | None = None,
+        missing_exceptions: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.untraceable = untraceable or []
+        self.missing_exceptions = missing_exceptions or []
+
+
 class StoreUnavailableError(CreditError):
     """The system-of-record store cannot be reached or migrated."""
