@@ -687,9 +687,10 @@ def verify_review_summary(
     Three checks, all mechanical:
       1. every figure in the rendered text traces into the
          review universe built from the pinned artefacts;
-      2. every locked fact paragraph stands verbatim in the
-         rendered text — a dropped or reworded locked fact is a
-         softened record;
+      2. the locked record — recomputed here from the pinned
+         inputs, never taken from the candidate — stands
+         verbatim in the rendered text: a dropped or reworded
+         locked fact is a softened record;
       3. the narrative carries no denial of a fact the locked
          record states adversely (breaches described as none,
          failed tests as all-passed, open exceptions as full
@@ -697,6 +698,7 @@ def verify_review_summary(
     Any failure raises MemoVerificationError naming the offenders
     — the caller stores nothing."""
     universe = build_review_universe(inputs)
+    canonical_locked = locked_fact_paragraphs(inputs)
     rendered = render_review_summary(locked_facts, paragraphs)
     traces: list[FigureTrace] = []
     offenders: list[str] = []
@@ -717,7 +719,7 @@ def verify_review_summary(
         problems.append(
             "untraceable figure(s): " + "; ".join(offenders)
         )
-    missing_locked = [p for p in locked_facts if p not in rendered]
+    missing_locked = [p for p in canonical_locked if p not in rendered]
     if missing_locked:
         problems.append(
             f"{len(missing_locked)} locked fact paragraph(s) "
@@ -754,8 +756,8 @@ def verify_review_summary(
         composer_profile=composer_profile,
         figure_count=len(traces),
         figures=traces,
-        locked_facts_expected=len(locked_facts),
-        locked_facts_present=len(locked_facts) - len(missing_locked),
+        locked_facts_expected=len(canonical_locked),
+        locked_facts_present=len(canonical_locked) - len(missing_locked),
         verified=True,
     )
 

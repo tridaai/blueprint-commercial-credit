@@ -2942,10 +2942,13 @@ class CreditPipeline:
             (b for b in all_breaches if in_window(b.test_date)),
             key=lambda b: (b.test_date, b.breach_id),
         )
-        open_breaches = [
-            b for b in all_breaches
-            if b.state not in BREACH_TERMINAL_STATES
-        ]
+        open_breaches = sorted(
+            (
+                b for b in all_breaches
+                if b.state not in BREACH_TERMINAL_STATES
+            ),
+            key=lambda b: (b.test_date, b.breach_id),
+        )
         return ReviewInputs(
             credit_file=credit_file,
             covenant_set=covenant_set,
