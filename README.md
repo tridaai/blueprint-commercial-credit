@@ -738,6 +738,57 @@ under its model-risk programme; this blueprint ships the
 plumbing and the discipline around a model — versioning,
 traceability, override control — not a validated model.
 
+## What round 14 adds
+
+The **officer console**: the working surface a credit officer
+actually sits in front of, served by the API at `/console` —
+one static HTML file, inline CSS and vanilla JS, no build
+step and no external assets. It renders three views, all fed
+by the API:
+
+- the **pipeline queue** — every credit file grouped by the
+  stage its own record derives (intake, spreading, memo draft,
+  officer review, committee, approved, declined, monitoring),
+  with its round 9 readiness blocker count computed fresh, its
+  current rating where one stands, and its open breach count;
+- the **due-work board** — breach cases, covenant tests and
+  deliverables, and annual reviews, worst first, in the order
+  the API's own queues return them;
+- the **file workspace** — one credit file in credit-officer
+  order: borrower and facility, the checklist with its policy
+  sources, documents with their recorded SHA-256 hashes,
+  readiness, the spread in both views, the computation pack
+  with every figure's derivation steps expandable, the policy
+  report under its pinned pack version, disagreements, the
+  memo with its verification record and both gates' history,
+  the rating with its factor breakdown and overrides, covenant
+  schedules, test results and breaches, annual review packs
+  and outcomes, and the file's due work.
+
+The console **decides nothing and writes nothing of its own**.
+Its action forms — officer submit/approve/return/flag,
+committee convene/decide with quorum, conditions and coded
+adverse-action reasons, the rating override, breach
+resolution, the annual-review outcome — post to the existing
+gated routes, with the officer's name and role from the
+identity bar; a form will not submit anonymously, and after
+that the API's answer is the whole story. A refusal renders
+as a plain-language error, exactly once — the console never
+retries around one. The coded reasons its forms offer are
+served from the gates' own vocabularies (`/console/vocabularies`),
+so a form can only offer codes the gate recognises.
+
+Rendering is a security property here, because borrower
+documents are untrusted content: the page builds every node
+with `createElement` and assigns every stored string through
+`textContent`. There is no HTML-parsing sink anywhere in the
+file — a script carried in a document filename renders as the
+inert text it is. The test suite and the eval gate both scan
+the page: every path literal in it must be a declared route,
+every declared route must exist in the app, no action may
+live under `/console`, and the page must contain exactly one
+`fetch` call site.
+
 ## The laws (enforced in code, never in prompts)
 
 1. **No model-computed numbers.** Extraction returns values +

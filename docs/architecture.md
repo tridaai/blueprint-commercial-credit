@@ -659,6 +659,64 @@ the evals scan for it.
 `GET /applications/{id}/risk-rating-history`,
 `POST /applications/{id}/risk-ratings/{assignment_id}/override`.
 
+## Officer console (round 14)
+
+The console is a static artefact, not an application: one HTML
+file (`console_page.CONSOLE_HTML`) with inline CSS and vanilla
+JS, served at `GET /console`. It holds no state, runs no
+rules, and computes nothing the API has not already computed.
+Two read models (`console.py`) assemble what no single earlier
+route carries:
+
+- `queue_view` — one row per credit file. The **stage** is a
+  derivation over the same artefacts the gates read, recomputed
+  per request and stored nowhere: a covenant set means
+  monitoring; otherwise the latest memo's derived full status
+  maps to approved / declined / committee / officer review /
+  memo draft; a file with no memo is spreading when a spread
+  stands, intake when not. The readiness blocker count is the
+  round 9 report computed fresh at the requested `as_of` (a
+  file whose readiness cannot compute yet carries `null`,
+  stated, never a borrowed zero); the rating is the round 13
+  current view; open breaches are counted off the round 11
+  list with the same terminal-state set the list itself sorts
+  by.
+- `workspace_view` — one file's artefacts in credit-officer
+  order, each section serialized exactly as its own route
+  serves it (spread and readiness guarded: a young file reads
+  them as absent, not as errors). Due work is the portfolio
+  queue filtered to the file.
+- `vocabularies_view` — the gates' coded vocabularies,
+  imported from the gate modules themselves, so the forms'
+  options and the gates' validation read one constant.
+
+**No console writes.** The page's actions post to gated
+routes from rounds 6, 7, 11, 12 and 13 — the manifest
+(`console.CONSOLE_READS` / `CONSOLE_ACTIONS`) is declared in
+code beside the page, and the tests and eval gate scan the
+page's own path literals against it and against the app's
+route table: a path the page calls that is not declared, a
+declared route that does not exist, or an action under
+`/console` each fail the gate. The page has exactly one
+`fetch` call site (the `api()` helper) so the scan is
+complete by construction. Identity is a page-level discipline
+only — the forms will not submit without an officer name —
+and the gates' own anonymous-act refusals stand behind it.
+
+**Rendering.** All stored strings are assigned through
+`textContent` on `createElement`-built nodes; the file
+contains no HTML-parsing sink (`innerHTML`, `outerHTML`,
+`insertAdjacentHTML`, `document.write`, `eval`), and both the
+tests and the eval gate assert their absence and round-trip a
+script-carrying document filename through the workspace as
+inert data. When a gate refuses, the page shows the API's
+detail once, in plain language — it never retries, rephrases
+or routes around a refusal.
+
+**Surfaces.** `GET /console` (the page),
+`GET /console/queue?as_of=`, `GET /console/workspace/{id}?as_of=`,
+`GET /console/vocabularies`. Nothing else.
+
 ## Storage
 
 PostgreSQL is the deployment store. `migrations/` holds numbered SQL

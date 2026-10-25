@@ -310,6 +310,43 @@ the Hartline file whose cash-flow page is missing:
                             grades visible, and the memo and the
                             annual review pack carry the rating.
 
+Round 14 counters — the officer console, graded against the
+API it renders:
+
+  console_page_failed       GET /console must serve the single
+                            static page (200, HTML, the portfolio
+                            footer, the identity fields).
+                            REQUIRED: 0 failures.
+  console_queue_mismatch    the queue's rows must be the API's
+                            own file list, with the stage the
+                            record derives, the readiness blocker
+                            count the round 9 report computes,
+                            the open breaches the breach list
+                            counts and the rating the scorecard
+                            surface shows. REQUIRED: 0.
+  console_workspace_        the workspace of a fully-worked file
+    missing_kinds           must carry every artefact kind —
+                            checklist, documents with hashes,
+                            spread, computation figures with
+                            derivation steps, the pinned policy
+                            report, the verified memo and its
+                            committee decision, the rating with
+                            its seven traced factors, the
+                            covenant set, test results, breaches,
+                            the review pack, due work.
+                            REQUIRED: 0 missing.
+  console_only_write_path   every path literal in the page must
+                            be a declared console route, every
+                            declared route must exist in the app,
+                            and no action may live under
+                            /console. REQUIRED: 0.
+  console_unescaped_render  the page must contain no
+                            HTML-parsing sink and exactly one
+                            fetch call site, and a script carried
+                            in a document filename must
+                            round-trip through the workspace as
+                            inert data. REQUIRED: 0.
+
 Later rounds add counters as their machinery lands.
 Exit code 0 = GATE: PASS.
 """
@@ -3276,6 +3313,197 @@ def main() -> int:
           f"{'assignments land, the one-grade override lands with both grades visible, memo and review pack carry the rating' if rating_positive else 'FAILED'}")
     if not rating_positive:
         failures.append("a rating positive path did not land")
+
+    # ---------------------------------------------------------------
+    # Round 14: the officer console. A reader and a form set over
+    # the API — graded against the API itself: the page serves,
+    # the queue is the API's own list with the record's own
+    # numbers, the workspace of the fully-worked file carries
+    # every artefact kind, the page's path literals are exactly
+    # the declared routes (and none of the actions is a
+    # console-only write), and stored content has no sink to
+    # render through.
+    # ---------------------------------------------------------------
+    import base64 as _base64
+    import re as _re
+
+    from fastapi.testclient import TestClient as _TestClient
+
+    from commercial_credit import api as _api_module
+    from commercial_credit.console import (
+        CONSOLE_ACTIONS as _CONSOLE_ACTIONS,
+    )
+    from commercial_credit.console import (
+        route_manifest as _route_manifest,
+    )
+    from commercial_credit.console_page import CONSOLE_HTML as _PAGE
+
+    cp = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    ccf, _c_decision = _t_approved(cp)
+    _t_deliver(cp, ccf, 2026, _T_FY2026)
+    cp.run_due_covenant_tests(ccf, as_of=date(2027, 3, 1))
+    cp.assign_rating(ccf, as_of=date(2027, 3, 1))
+    cp.assemble_review_pack(ccf, review_number=1, as_of=date(2027, 3, 1))
+    _api_module.pipeline = cp
+    _api_module.store = cp.store
+    _client = _TestClient(_api_module.app)
+    _as_of = {"as_of": "2027-03-01"}
+
+    page_failed = 0
+    _page_resp = _client.get("/console")
+    if _page_resp.status_code != 200:
+        page_failed += 1
+    if not _page_resp.headers["content-type"].startswith("text/html"):
+        page_failed += 1
+    for _marker in (
+        "https://trida.ai/logos-rounded/trida-rounded.png",
+        "Visit Trida AI →",
+        "View all blueprints →",
+        'id="officer-name"',
+        'id="officer-role"',
+    ):
+        if _marker not in _page_resp.text:
+            page_failed += 1
+    print(f"console_page_failed: {page_failed} (required 0)")
+    if page_failed:
+        failures.append("the console page did not serve to standard")
+
+    queue_mismatch = 0
+    _queue = _client.get("/console/queue", params=_as_of).json()
+    _files = _client.get("/applications").json()
+    if [r["credit_file_id"] for r in _queue] != [
+        f["credit_file_id"] for f in _files
+    ]:
+        queue_mismatch += 1
+    _row = next(r for r in _queue if r["credit_file_id"] == ccf)
+    if _row["stage"] != "monitoring":
+        queue_mismatch += 1
+    _report = _client.get(
+        f"/applications/{ccf}/readiness-report", params=_as_of
+    ).json()
+    if _row["readiness_blockers"] != sum(
+        1 for e in _report["entries"] if e["blocker"]
+    ):
+        queue_mismatch += 1
+    _breaches = _client.get(
+        "/breach-cases", params={**_as_of, "credit_file_id": ccf}
+    ).json()
+    if _row["open_breaches"] != sum(
+        1 for b in _breaches
+        if b["state"] not in ("cured", "waived", "defaulted_path")
+    ):
+        queue_mismatch += 1
+    _ratings = _client.get(f"/applications/{ccf}/risk-ratings").json()
+    if _row["rating"]["final_grade"] != _ratings[-1]["final_grade"]:
+        queue_mismatch += 1
+    print(f"console_queue_mismatch: {queue_mismatch} (required 0)")
+    if queue_mismatch:
+        failures.append("the console queue disagreed with the API")
+
+    _ws = _client.get(
+        f"/console/workspace/{ccf}", params=_as_of
+    ).json()
+    _pack = _ws["computation_packs"][-1] if _ws["computation_packs"] else {}
+    _kinds = {
+        "checklist": bool(_ws["checklist"]),
+        "documents_with_hashes": bool(_ws["documents"]) and all(
+            len(d["sha256"]) == 64 for d in _ws["documents"]
+        ),
+        "spread": bool(_ws["spread"]),
+        "computation_figures_with_steps": any(
+            f["steps"] for f in _pack.get("figures", [])
+        ),
+        "policy_report_pinned": bool(_ws["policy_reports"])
+        and bool(_ws["policy_reports"][-1]["policy_version"]),
+        "memo_verified": bool(_ws["memos"])
+        and _ws["memos"][-1]["verification"]["verified"] is True,
+        "committee_decision": bool(
+            _ws["memos"][-1]["committee"]["decisions"]
+        ),
+        "rating_factors_traced": bool(_ws["ratings"])
+        and len(_ws["ratings"][-1]["assignment"]["factors"]) == 7,
+        "covenant_set": len(_ws["covenant_sets"]) == 1,
+        "covenant_test_results": bool(_ws["covenant_test_results"]),
+        "breach_cases": len(_ws["breach_cases"]) == 3,
+        "annual_review_pack": len(_ws["annual_review_packs"]) == 1,
+        "due_work": bool(_ws["due_work"]),
+    }
+    missing_kinds = sum(1 for ok in _kinds.values() if not ok)
+    print(f"console_workspace_missing_kinds: {missing_kinds} "
+          f"of {len(_kinds)} (required 0)")
+    if missing_kinds:
+        failures.append(
+            "the console workspace missed artefact kinds: "
+            + ", ".join(k for k, ok in _kinds.items() if not ok)
+        )
+
+    def _norm(template: str) -> str:
+        return _re.sub(r"\{[^}]*\}", "{}", template)
+
+    _literals = _re.findall(
+        r"""["'`](/(?:console|applications|covenant-due-work"""
+        r"""|annual-review-due-work|breach-cases)[^"'`\s]*)["'`]""",
+        _PAGE,
+    )
+    _page_paths = {
+        _re.sub(r"\$\{[^}]*\}", "{}", lit.split("?")[0])
+        for lit in _literals
+    }
+    _manifest_paths = {_norm(p) for _, p in _route_manifest()}
+    _app_routes = {
+        (method, _norm(route.path))
+        for route in _api_module.app.routes
+        for method in (getattr(route, "methods", set()) or set())
+        if method in ("GET", "POST")
+    }
+    only_write = 0
+    if _page_paths != _manifest_paths:
+        only_write += 1
+    for _method, _path in _route_manifest():
+        if (_method, _norm(_path)) not in _app_routes:
+            only_write += 1
+    for _, _path in _CONSOLE_ACTIONS:
+        if _path.startswith("/console"):
+            only_write += 1
+    print(f"console_only_write_path: {only_write} (required 0)")
+    if only_write:
+        failures.append("the console surface is not the declared routes")
+
+    unescaped = 0
+    for _sink in ("innerHTML", "outerHTML", "insertAdjacentHTML",
+                  "document.write", "eval("):
+        if _sink in _PAGE:
+            unescaped += 1
+    if _PAGE.count("fetch(") != 1:
+        unescaped += 1
+    _payload = '<script>alert("eval")</script>.json'
+    _registered = _client.post(
+        f"/applications/{ccf}/documents",
+        json={
+            "kind": "financial_statement",
+            "filename": _payload,
+            "content_b64": _base64.b64encode(
+                _t_stmt_doc(2026, _T_FY2026)
+            ).decode(),
+            "period_label": "FY2026",
+        },
+    )
+    if _registered.status_code != 201:
+        unescaped += 1
+    _ws2 = _client.get(
+        f"/console/workspace/{ccf}", params=_as_of
+    ).json()
+    if not any(
+        d["filename"] == _payload for d in _ws2["documents"]
+    ):
+        unescaped += 1
+    if _payload in _PAGE:
+        unescaped += 1
+    print(f"console_unescaped_render: {unescaped} (required 0)")
+    if unescaped:
+        failures.append("stored content could render unescaped")
 
     if failures:
         print("GATE: FAIL")
