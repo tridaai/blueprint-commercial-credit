@@ -190,15 +190,43 @@ disagreements: five material, two immaterial):
                             trace must name the disagreement.
                             REQUIRED: 0 clean presentations.
 
-Later rounds add counters (stale-input committee-ready) as
-their machinery lands. Exit code 0 = GATE: PASS.
+Round 9 counters — committee readiness (law 7), graded on the
+seed borrower (blocked), a purpose-built committee-ready file,
+and a CRE file whose appraisal goes stale:
+
+  readiness_convene_over_   convening an officer-final memo while
+    blocker_accepted        any readiness blocker stands — missing
+                            documents, a non-computable DSCR, a
+                            stale appraisal — must be REFUSED.
+                            REQUIRED: 0 accepted.
+  readiness_stale_blessed_  a readiness report minted while the
+    by_old_report           file was fresh must not bless a
+                            convene at a later date when the
+                            inputs have gone stale: readiness is
+                            recomputed at convene. REQUIRED: 0.
+  readiness_blocker_       a blocker must persist across
+    cleared_without_refresh recomputation, and no waiver parameter,
+                            method or field may exist to clear it.
+                            REQUIRED: 0 clearances.
+  readiness_blocker_        every blocker on the refusal's report
+    unnamed_in_refusal      must be named — key and label — in the
+                            refusal text itself. REQUIRED: 0.
+  readiness_positive_paths  a fresh file convenes; a stale
+                            appraisal blocks, a refreshed appraisal
+                            clears, the convene lands; missing tax
+                            returns block by name; the officer
+                            approval record carries the readiness
+                            report id and blocker count.
+
+Later rounds add counters as their machinery lands.
+Exit code 0 = GATE: PASS.
 """
 
 from __future__ import annotations
 
 import json
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -1332,10 +1360,183 @@ def main() -> int:
         failures.append("an officer gate positive path did not land")
 
     # ---------------------------------------------------------------
+    # The committee-ready fixture (rounds 7 + 9). Since round 9
+    # the committee can only be reached on a committee-ready file,
+    # so the committee fixtures use a purpose-built borrower —
+    # Calloway Precision Manufacturing — whose file is complete by
+    # construction: three-section statements for FY2023–FY2025
+    # (every figure computes), every checklist document on file.
+    # Hand-set anchors under v1: FY2025 EBITDA $420,000 over debt
+    # service $320,000 (DSCR 1.3125, a pass); FY2025 leverage
+    # 5.0000 against the 2.00 ceiling (a fail — credit judgment,
+    # carried as a memo exception, NOT a readiness blocker); no
+    # guarantors (the global test does not apply).
+    # ---------------------------------------------------------------
+    _LABELS = {t.field: t.label for t in TEMPLATE_LINES}
+    _BS = (
+        "cash_and_equivalents", "accounts_receivable", "inventory",
+        "total_current_assets", "net_fixed_assets", "total_assets",
+        "accounts_payable", "current_portion_ltd",
+        "total_current_liabilities", "long_term_debt",
+        "total_liabilities", "total_equity",
+    )
+    _IS = (
+        "revenue", "cost_of_goods_sold", "gross_profit",
+        "operating_expenses", "ebit", "interest_expense", "net_income",
+    )
+    _CF = (
+        "depreciation_and_amortization", "change_in_receivables",
+        "change_in_inventory", "change_in_payables",
+        "net_cash_from_operations", "capital_expenditures",
+        "net_cash_from_investing", "debt_proceeds",
+        "debt_repayments", "net_cash_from_financing",
+        "net_change_in_cash",
+    )
+    _READY_FIGURES = {
+        2023: dict(zip(_BS, (
+            200000, 800000, 1000000, 2000000, 3000000, 5000000,
+            650000, 200000, 1100000, 2900000, 4000000, 1000000,
+        )), **dict(zip(_IS, (
+            7500000, 5250000, 2250000, 1970000, 280000, 90000, 145000,
+        ))), **dict(zip(_CF, (
+            100000, -40000, -50000, 30000, 300000, 50000, -50000,
+            50000, -180000, -130000, 120000,
+        )))),
+        2024: dict(zip(_BS, (
+            250000, 840000, 1110000, 2200000, 3300000, 5500000,
+            700000, 220000, 1200000, 3300000, 4500000, 1000000,
+        )), **dict(zip(_IS, (
+            8200000, 5740000, 2460000, 2140000, 320000, 95000, 170000,
+        ))), **dict(zip(_CF, (
+            110000, -40000, -110000, 50000, 350000, 55000, -55000,
+            80000, -200000, -120000, 175000,
+        )))),
+        2025: dict(zip(_BS, (
+            300000, 900000, 1200000, 2400000, 3600000, 6000000,
+            800000, 240000, 1400000, 3600000, 5000000, 1000000,
+        )), **dict(zip(_IS, (
+            9000000, 6300000, 2700000, 2400000, 300000, 100000, 150000,
+        ))), **dict(zip(_CF, (
+            120000, -60000, -90000, 100000, 380000, 60000, -60000,
+            100000, -220000, -120000, 200000,
+        )))),
+    }
+
+    def _ready_statement_doc(year):
+        figures = _READY_FIGURES[year]
+
+        def page(number, title, fields):
+            return {
+                "page": number, "title": title,
+                "lines": [
+                    {"line": i, "label": _LABELS[f], "value": figures[f]}
+                    for i, f in enumerate(fields, start=1)
+                ],
+            }
+
+        return json.dumps({
+            "document_type": "financial_statement",
+            "borrower": "Calloway Precision Manufacturing, Inc.",
+            "fiscal_year": year, "period_label": f"FY{year}",
+            "basis": "audited",
+            "pages": [
+                page(1, "Balance Sheet", _BS),
+                page(2, "Income Statement", _IS),
+                page(3, "Cash Flow Statement", _CF),
+            ],
+        }).encode()
+
+    def _ready_tax_doc():
+        figures = _READY_FIGURES[2025]
+        return json.dumps({
+            "document_type": "tax_return",
+            "borrower": "Calloway Precision Manufacturing, Inc.",
+            "fiscal_year": 2025, "period_label": "FY2025",
+            "pages": [{
+                "page": 1, "title": "Income Statement (as filed)",
+                "lines": [
+                    {"line": i, "label": _LABELS[f], "value": figures[f]}
+                    for i, f in enumerate(_IS, start=1)
+                ],
+            }],
+        }).encode()
+
+    def _ready_documents():
+        docs = [
+            {
+                "kind": DocumentKind.FINANCIAL_STATEMENT.value,
+                "filename": f"calloway-fy{year}-statements.json",
+                "data_hex": _ready_statement_doc(year).hex(),
+                "period_label": f"FY{year}",
+            }
+            for year in (2023, 2024, 2025)
+        ]
+        docs.append({
+            "kind": DocumentKind.TAX_RETURN.value,
+            "filename": "calloway-business-tax-fy2025.json",
+            "data_hex": _ready_tax_doc().hex(),
+            "period_label": "FY2025",
+        })
+        docs.append({
+            "kind": DocumentKind.TAX_RETURN.value,
+            "filename": "guarantor-personal-tax.json",
+            "data_hex": json.dumps({
+                "document_type": "tax_return",
+                "pages": [{"page": 1, "lines": []}],
+            }).encode().hex(),
+            "period_label": "FY2025",
+        })
+        for kind, filename in (
+            (DocumentKind.PERSONAL_FINANCIAL_STATEMENT, "guarantor-pfs.json"),
+            (DocumentKind.ORG_DOCUMENT, "articles.json"),
+            (DocumentKind.DEBT_SCHEDULE, "debt-schedule.json"),
+            (DocumentKind.INSURANCE_CERTIFICATE, "insurance.json"),
+            (DocumentKind.PROJECTIONS, "projections.json"),
+        ):
+            docs.append({
+                "kind": kind.value, "filename": filename,
+                "data_hex": json.dumps({}).encode().hex(),
+            })
+        return docs
+
+    def _ready_borrower():
+        return Borrower(
+            legal_name="Calloway Precision Manufacturing, Inc.",
+            ein_last4="4417", segment="manufacturing",
+            state_of_formation="NC", years_in_business=14,
+            primary_contact_name="Dana Whitfield",
+            primary_contact_email="dana.whitfield@example.com",
+        )
+
+    def _ready_facility():
+        return FacilityRequest(
+            facility_type=FacilityType.TERM_LOAN,
+            amount=Decimal("1500000"),
+            purpose="CNC machining line expansion",
+            term_months=60, guarantors=[],
+        )
+
+    def _officer_final_for(pipe, credit_file_id, *, as_of):
+        report = pipe.evaluate_policy(
+            credit_file_id, pack_version="v1", as_of=as_of
+        )
+        memo = pipe.compose_memo(
+            credit_file_id, report_id=report.report_id
+        )
+        pipe.submit_memo_for_review(
+            credit_file_id, memo.memo_id,
+            actor="rm-eval", actor_role="relationship_manager",
+        )
+        final = pipe.approve_memo(
+            credit_file_id, memo.memo_id,
+            officer_id=C_OFFICER, officer_role=C_OFFICER_ROLE,
+        )
+        return memo, final
+
     # Round 7: the committee gate, graded on quorum discipline,
     # the decline path's coded reasons, and the positive paths.
-    # Three fresh Hartline files (pinned v1, as in round 6): one
-    # takes the refusal probes and then a landed decline; one the
+    # Three fresh committee-ready files (pinned v1): one takes the
+    # refusal probes and then a landed decline; one the
     # superseded-version probes and a conditional approval; one
     # the defer → re-present → approve path. Zero tolerance: one
     # accepted probe fails the gate.
@@ -1353,32 +1554,12 @@ def main() -> int:
         pipe = CreditPipeline(
             store=InMemoryCreditStore(), documents=LocalDocumentStore()
         )
-        c_borrower, c_facility = ReferenceLosFeed().fetch_application(
-            "LOS-2026-0117"
+        c_file = pipe.open_application(
+            _ready_borrower(), _ready_facility(),
+            documents=_ready_documents(),
         )
-        c_docs = [
-            {
-                "kind": DocumentKind.FINANCIAL_STATEMENT.value,
-                "filename": f"hartline-fy{year}-statements.json",
-                "data_hex": statement_document(year).hex(),
-                "period_label": f"FY{year}",
-            }
-            for year in (2022, 2023, 2024)
-        ]
-        c_file = pipe.open_application(c_borrower, c_facility, documents=c_docs)
-        c_report = pipe.evaluate_policy(
-            c_file.credit_file_id, pack_version="v1", as_of=date(2025, 6, 30)
-        )
-        c_memo = pipe.compose_memo(
-            c_file.credit_file_id, report_id=c_report.report_id
-        )
-        pipe.submit_memo_for_review(
-            c_file.credit_file_id, c_memo.memo_id,
-            actor="rm-eval", actor_role="relationship_manager",
-        )
-        c_final = pipe.approve_memo(
-            c_file.credit_file_id, c_memo.memo_id,
-            officer_id=C_OFFICER, officer_role=C_OFFICER_ROLE,
+        c_memo, c_final = _officer_final_for(
+            pipe, c_file.credit_file_id, as_of=date(2026, 6, 30)
         )
         return pipe, c_file.credit_file_id, c_memo, c_final
 
@@ -1435,12 +1616,13 @@ def main() -> int:
     if no_reasons:
         failures.append("a decline without coded reasons was accepted")
 
-    # Leverage PASSED under v1 (1.5337 vs the 2.00 ceiling).
+    # DSCR PASSED under v1 (1.3125 vs the 1.25 floor).
     passed_test = _refused(lambda: _decide(
         cp1, ccf1, cfinal1.memo_id, outcome="decline",
         adverse_reasons=[AdverseActionReason(
-            code="leverage_above_policy_limit", tie_kind="policy_test",
-            test_id="max_leverage_by_segment",
+            code="debt_service_coverage_below_policy",
+            tie_kind="policy_test",
+            test_id="min_dscr",
         )],
     ))
     print(f"committee_decline_passed_test_accepted: {passed_test} of 1 "
@@ -1483,13 +1665,13 @@ def main() -> int:
         cp1, ccf1, cfinal1.memo_id, outcome="decline",
         adverse_reasons=[
             AdverseActionReason(
-                code="required_documentation_missing",
+                code="leverage_above_policy_limit",
                 tie_kind="policy_test",
-                test_id="required_documents_complete",
+                test_id="max_leverage_by_segment",
             ),
             AdverseActionReason(
                 code="financial_information_insufficient",
-                tie_kind="policy_test", test_id="min_dscr",
+                tie_kind="policy_test", test_id="min_global_dscr",
             ),
         ],
     )
@@ -1498,8 +1680,9 @@ def main() -> int:
         cp1.memo_status(ccf1, cfinal1.memo_id) == "declined"
         and decline.reason_vocabulary == "adverse-action-reasons-v1"
         and "NOTICE OF ACTION TAKEN" in notice
-        and "Required documents on file, by facility type" in notice
-        and "depreciation_and_amortization" in notice
+        and "Maximum leverage by borrower segment" in notice
+        and "5.0000" in notice
+        and "names no guarantors" in notice
     )
     print(f"committee_decline_positive_path: "
           f"{'tied decline landed, notice rendered' if decline_ok else 'FAILED'}")
@@ -1753,6 +1936,228 @@ def main() -> int:
           f"{'memo carries all 5 material disagreements' if memo_disagreement_ok else 'FAILED'}")
     if not memo_disagreement_ok:
         failures.append("the memo did not carry the material disagreements")
+
+    # ---------------------------------------------------------------
+    # Round 9: committee readiness (law 7). The seed borrower is
+    # the blocked file (7 documents missing, DSCR not computable);
+    # the Calloway factory above is the ready file; a CRE variant
+    # carries the stale-appraisal path. Zero tolerance on the four
+    # counters; the positive paths must land.
+    # ---------------------------------------------------------------
+    rp = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    r_file = rp.open_application(borrower, facility, documents=docs)
+    rcf = r_file.credit_file_id
+    r_memo, r_final = _officer_final_for(rp, rcf, as_of=date(2025, 6, 30))
+
+    def _convene(pipe, cf, mid, **kw):
+        kw.setdefault("actor", C_OFFICER)
+        kw.setdefault("actor_role", C_OFFICER_ROLE)
+        return pipe.convene_committee(cf, mid, **kw)
+
+    over_blocker = 0
+    # (a) The seed borrower: missing documents + uncomputable DSCR.
+    over_blocker += _refused(lambda: _convene(
+        rp, rcf, r_final.memo_id, as_of=date(2025, 6, 30)
+    ))
+    # (b) The ready file minus its tax returns.
+    tp = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    t_file = tp.open_application(
+        _ready_borrower(), _ready_facility(),
+        documents=[
+            d for d in _ready_documents()
+            if d["kind"] != DocumentKind.TAX_RETURN.value
+        ],
+    )
+    _, t_final = _officer_final_for(
+        tp, t_file.credit_file_id, as_of=date(2026, 6, 30)
+    )
+    over_blocker += _refused(lambda: _convene(
+        tp, t_file.credit_file_id, t_final.memo_id, as_of=date(2026, 6, 30)
+    ))
+    tax_message = ""
+    try:
+        _convene(
+            tp, t_file.credit_file_id, t_final.memo_id,
+            as_of=date(2026, 6, 30),
+        )
+    except ValidationError as exc:
+        tax_message = str(exc)
+    # (A third blocked convene — the CRE stale appraisal — is
+    # probed on the positive path below, where its refresh lands.)
+    print(f"readiness_convene_over_blocker_accepted: {over_blocker} "
+          f"of 2 blocked convenes accepted (required 0)")
+    if over_blocker:
+        failures.append("a memo was convened over a readiness blocker")
+
+    # An old, fresh report must not bless a later, stale convene.
+    fp = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    f_file = fp.open_application(
+        _ready_borrower(), _ready_facility(), documents=_ready_documents()
+    )
+    fcf = f_file.credit_file_id
+    _, f_final = _officer_final_for(fp, fcf, as_of=date(2026, 6, 30))
+    fresh_report = fp.compute_readiness(
+        fcf, memo_id=f_final.memo_id, as_of=date(2026, 6, 30)
+    )
+    stale_blessed = 0
+    if not fresh_report.ready:
+        stale_blessed += 1  # the fixture itself failed to be ready
+    stale_blessed += _refused(lambda: _convene(
+        fp, fcf, f_final.memo_id, as_of=date(2028, 1, 31)
+    ))
+    print(f"readiness_stale_blessed_by_old_report: {stale_blessed} "
+          f"(required 0)")
+    if stale_blessed:
+        failures.append("an old readiness report blessed a stale file")
+
+    # Blockers clear only on refresh: recomputation changes
+    # nothing, and no waiver surface exists.
+    cleared_without_refresh = 0
+    first = rp.compute_readiness(
+        rcf, memo_id=r_final.memo_id, as_of=date(2025, 6, 30)
+    )
+    second = rp.compute_readiness(
+        rcf, memo_id=r_final.memo_id, as_of=date(2025, 6, 30)
+    )
+    if {e.input_key for e in second.blockers} != {
+        e.input_key for e in first.blockers
+    } or not second.blockers:
+        cleared_without_refresh += 1
+    if any(
+        "waiv" in name or "override" in name
+        for name in dir(CreditPipeline)
+    ):
+        cleared_without_refresh += 1
+    try:
+        rp.convene_committee(
+            rcf, r_final.memo_id, actor=C_OFFICER,
+            actor_role=C_OFFICER_ROLE, waive_blockers=True,
+        )
+        cleared_without_refresh += 1  # a waiver parameter was accepted
+    except TypeError:
+        pass
+    except ValidationError:
+        cleared_without_refresh += 1  # accepted as a kwarg, then refused
+    print(f"readiness_blocker_cleared_without_refresh: "
+          f"{cleared_without_refresh} (required 0)")
+    if cleared_without_refresh:
+        failures.append("a readiness blocker cleared without a refresh")
+
+    # Every blocker named in the refusal.
+    refusal_text = ""
+    try:
+        _convene(rp, rcf, r_final.memo_id, as_of=date(2025, 6, 30))
+    except ValidationError as exc:
+        refusal_text = str(exc)
+    unnamed = sum(
+        1 for e in first.blockers
+        if e.input_key not in refusal_text or e.label not in refusal_text
+    )
+    print(f"readiness_blocker_unnamed_in_refusal: {unnamed} of "
+          f"{len(first.blockers)} blockers unnamed (required 0)")
+    if unnamed:
+        failures.append("a readiness blocker was not named in the refusal")
+
+    # Positive paths: fresh convene lands; the approval record
+    # carries the stamp; stale appraisal blocks, refresh clears,
+    # convene lands; missing tax returns block by name.
+    convened = _convene(fp, fcf, f_final.memo_id, as_of=date(2026, 6, 30))
+    fresh_convene_ok = fp.memo_status(fcf, f_final.memo_id) == "in_committee"
+    approval_event = next(
+        (e for e in rp.store.list_memo_review_events(rcf, r_memo.memo_id)
+         if e.action.startswith("approved")),
+        None,
+    )
+    stamp_report = (
+        rp.store.get_readiness_report(approval_event.readiness_report_id)
+        if approval_event is not None
+        and approval_event.readiness_report_id is not None
+        else None
+    )
+    stamp_ok = (
+        approval_event is not None
+        and approval_event.readiness_blocker_count is not None
+        and approval_event.readiness_blocker_count > 0
+        and stamp_report is not None
+        and stamp_report.blocker_count
+        == approval_event.readiness_blocker_count
+    )
+    tax_named_ok = (
+        "[chk-03] Business tax returns" in tax_message
+        and "[chk-04] Guarantor personal tax returns" in tax_message
+    )
+
+    cre = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    cre_docs = _ready_documents() + [
+        {
+            "kind": kind.value, "filename": filename,
+            "data_hex": json.dumps({}).encode().hex(),
+        }
+        for kind, filename in (
+            (DocumentKind.APPRAISAL, "appraisal-2025.json"),
+            (DocumentKind.RENT_ROLL, "rent-roll.json"),
+            (DocumentKind.LEASES, "leases.json"),
+            (DocumentKind.ENVIRONMENTAL_REPORT, "environmental.json"),
+        )
+    ]
+    cre_file = cre.open_application(
+        Borrower(
+            legal_name="Harborpoint Retail Center LLC",
+            ein_last4="9021", segment="real_estate",
+            state_of_formation="NC", years_in_business=9,
+            primary_contact_name="Marcus Yuen",
+            primary_contact_email="marcus.yuen@example.com",
+        ),
+        FacilityRequest(
+            facility_type=FacilityType.CRE_LOAN,
+            amount=Decimal("4000000"),
+            purpose="Refinance of a stabilized retail center",
+            term_months=84, guarantors=[],
+        ),
+        documents=cre_docs,
+    )
+    cre_cf = cre_file.credit_file_id
+    cre_stored = cre.store.get_credit_file(cre_cf)
+    cre_appraisal = next(
+        d for d in cre_stored.documents if d.kind == DocumentKind.APPRAISAL
+    )
+    cre_appraisal.received_at = datetime(2025, 1, 15, tzinfo=timezone.utc)
+    cre.store.save_credit_file(cre_stored)
+    _, cre_final = _officer_final_for(cre, cre_cf, as_of=date(2026, 6, 30))
+    cre_blocked = _refused(lambda: _convene(
+        cre, cre_cf, cre_final.memo_id, as_of=date(2026, 6, 30)
+    )) == 0
+    cre_stored = cre.store.get_credit_file(cre_cf)
+    new_appraisal = register_document(
+        cre.store, cre.documents, cre_stored,
+        kind=DocumentKind.APPRAISAL, filename="appraisal-2026.json",
+        data=json.dumps({}).encode(),
+    )
+    cre_stored = cre.store.get_credit_file(cre_cf)
+    cre_stored.document(new_appraisal.document_id).received_at = datetime(
+        2026, 6, 1, tzinfo=timezone.utc
+    )
+    cre.store.save_credit_file(cre_stored)
+    _convene(cre, cre_cf, cre_final.memo_id, as_of=date(2026, 6, 30))
+    cre_path_ok = (
+        cre_blocked
+        and cre.memo_status(cre_cf, cre_final.memo_id) == "in_committee"
+    )
+    readiness_positive = (
+        fresh_convene_ok and stamp_ok and tax_named_ok and cre_path_ok
+    )
+    print(f"readiness_positive_paths: "
+          f"{'fresh convene, approval stamp, named tax block, stale-appraisal refresh all landed' if readiness_positive else 'FAILED'}")
+    if not readiness_positive:
+        failures.append("a readiness positive path did not land")
 
     if failures:
         print("GATE: FAIL")
