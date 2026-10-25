@@ -16,10 +16,12 @@ from pathlib import Path
 from .errors import StoreUnavailableError
 from .models import (
     AuditEvent,
+    BreachCase,
     CommitteeDecision,
     ComputationPack,
     CovenantAmendment,
     CovenantSet,
+    CovenantTestResult,
     CreditFile,
     CreditMemo,
     ExtractedValue,
@@ -56,6 +58,10 @@ class InMemoryCreditStore:
         self._covenant_sets: dict[str, CovenantSet] = {}
         self._covenant_set_order: dict[str, list[str]] = {}
         self._amendments: dict[str, list[CovenantAmendment]] = {}
+        self._test_results: dict[str, CovenantTestResult] = {}
+        self._test_result_order: dict[str, list[str]] = {}
+        self._breaches: dict[str, BreachCase] = {}
+        self._breach_order: dict[str, list[str]] = {}
 
     def save_credit_file(self, credit_file: CreditFile) -> None:
         self._files[credit_file.credit_file_id] = credit_file.model_copy(deep=True)
@@ -302,6 +308,58 @@ class InMemoryCreditStore:
             for a in self._amendments.get(credit_file_id, [])
         ]
 
+    def save_covenant_test_result(
+        self, result: CovenantTestResult
+    ) -> None:
+        # Insert-once, like the packs the result pins: the same
+        # test over the same inputs is the same artefact.
+        if result.result_id in self._test_results:
+            return
+        self._test_results[result.result_id] = result.model_copy(deep=True)
+        self._test_result_order.setdefault(
+            result.credit_file_id, []
+        ).append(result.result_id)
+
+    def get_covenant_test_result(
+        self, result_id: str
+    ) -> CovenantTestResult | None:
+        result = self._test_results.get(result_id)
+        return result.model_copy(deep=True) if result else None
+
+    def list_covenant_test_results(
+        self, credit_file_id: str
+    ) -> list[CovenantTestResult]:
+        return [
+            self._test_results[result_id].model_copy(deep=True)
+            for result_id in self._test_result_order.get(credit_file_id, [])
+        ]
+
+    def save_breach_case(self, breach: BreachCase) -> None:
+        # A living record, upserted as its acts accumulate — the
+        # credit file's own pattern. Its events only ever grow.
+        if breach.breach_id not in self._breaches:
+            self._breach_order.setdefault(
+                breach.credit_file_id, []
+            ).append(breach.breach_id)
+        self._breaches[breach.breach_id] = breach.model_copy(deep=True)
+
+    def get_breach_case(self, breach_id: str) -> BreachCase | None:
+        breach = self._breaches.get(breach_id)
+        return breach.model_copy(deep=True) if breach else None
+
+    def list_breach_cases(
+        self, credit_file_id: str | None = None
+    ) -> list[BreachCase]:
+        if credit_file_id is not None:
+            return [
+                self._breaches[breach_id].model_copy(deep=True)
+                for breach_id in self._breach_order.get(credit_file_id, [])
+            ]
+        return [
+            breach.model_copy(deep=True)
+            for breach in self._breaches.values()
+        ]
+
     def ping(self) -> bool:
         return True
 
@@ -363,6 +421,14 @@ class SqliteCreditStore:
                 amendment_id TEXT PRIMARY KEY,
                 credit_file_id TEXT NOT NULL, set_id TEXT NOT NULL,
                 payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS covenant_test_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                result_id TEXT NOT NULL UNIQUE,
+                credit_file_id TEXT NOT NULL, instance_id TEXT NOT NULL,
+                covenant_id TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS breach_cases (
+                breach_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
             """
         )
         self._conn.commit()
@@ -710,6 +776,78 @@ class SqliteCreditStore:
             (credit_file_id,),
         ).fetchall()
         return [CovenantAmendment.model_validate_json(r[0]) for r in rows]
+
+    def save_covenant_test_result(
+        self, result: CovenantTestResult
+    ) -> None:
+        # Insert-once: re-running the same test over the same
+        # inputs stores nothing twice.
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO covenant_test_results "
+                "(result_id, credit_file_id, instance_id, covenant_id, "
+                "payload) VALUES (?, ?, ?, ?, ?)",
+                (
+                    result.result_id, result.credit_file_id,
+                    result.instance_id, result.covenant_id,
+                    result.model_dump_json(),
+                ),
+            )
+
+    def get_covenant_test_result(
+        self, result_id: str
+    ) -> CovenantTestResult | None:
+        row = self._conn.execute(
+            "SELECT payload FROM covenant_test_results "
+            "WHERE result_id = ?",
+            (result_id,),
+        ).fetchone()
+        return CovenantTestResult.model_validate_json(row[0]) if row else None
+
+    def list_covenant_test_results(
+        self, credit_file_id: str
+    ) -> list[CovenantTestResult]:
+        rows = self._conn.execute(
+            "SELECT payload FROM covenant_test_results "
+            "WHERE credit_file_id = ? ORDER BY id",
+            (credit_file_id,),
+        ).fetchall()
+        return [CovenantTestResult.model_validate_json(r[0]) for r in rows]
+
+    def save_breach_case(self, breach: BreachCase) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO breach_cases (breach_id, credit_file_id, "
+                "payload) VALUES (?, ?, ?) "
+                "ON CONFLICT(breach_id) DO UPDATE SET "
+                "payload = excluded.payload",
+                (
+                    breach.breach_id, breach.credit_file_id,
+                    breach.model_dump_json(),
+                ),
+            )
+
+    def get_breach_case(self, breach_id: str) -> BreachCase | None:
+        row = self._conn.execute(
+            "SELECT payload FROM breach_cases WHERE breach_id = ?",
+            (breach_id,),
+        ).fetchone()
+        return BreachCase.model_validate_json(row[0]) if row else None
+
+    def list_breach_cases(
+        self, credit_file_id: str | None = None
+    ) -> list[BreachCase]:
+        if credit_file_id is not None:
+            rows = self._conn.execute(
+                "SELECT payload FROM breach_cases "
+                "WHERE credit_file_id = ? ORDER BY rowid",
+                (credit_file_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT payload FROM breach_cases ORDER BY rowid"
+            ).fetchall()
+        return [BreachCase.model_validate_json(r[0]) for r in rows]
 
     def ping(self) -> bool:
         try:
@@ -1298,6 +1436,109 @@ class PostgresCreditStore:
             payload = row["payload"]
             out.append(
                 CovenantAmendment.model_validate(
+                    payload if isinstance(payload, dict) else json.loads(payload)
+                )
+            )
+        return out
+
+    def save_covenant_test_result(
+        self, result: CovenantTestResult
+    ) -> None:
+        # Insert-once, like the packs the result pins.
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO covenant_test_results "
+                "(result_id, credit_file_id, instance_id, covenant_id, "
+                "payload) VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (result_id) DO NOTHING",
+                (
+                    result.result_id, result.credit_file_id,
+                    result.instance_id, result.covenant_id,
+                    result.model_dump_json(),
+                ),
+            )
+
+    def get_covenant_test_result(
+        self, result_id: str
+    ) -> CovenantTestResult | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM covenant_test_results "
+                "WHERE result_id = %s",
+                (result_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = row["payload"]
+        return CovenantTestResult.model_validate(
+            payload if isinstance(payload, dict) else json.loads(payload)
+        )
+
+    def list_covenant_test_results(
+        self, credit_file_id: str
+    ) -> list[CovenantTestResult]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM covenant_test_results "
+                "WHERE credit_file_id = %s ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append(
+                CovenantTestResult.model_validate(
+                    payload if isinstance(payload, dict) else json.loads(payload)
+                )
+            )
+        return out
+
+    def save_breach_case(self, breach: BreachCase) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO breach_cases "
+                "(breach_id, credit_file_id, payload) "
+                "VALUES (%s, %s, %s) "
+                "ON CONFLICT (breach_id) DO UPDATE SET "
+                "payload = EXCLUDED.payload",
+                (
+                    breach.breach_id, breach.credit_file_id,
+                    breach.model_dump_json(),
+                ),
+            )
+
+    def get_breach_case(self, breach_id: str) -> BreachCase | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM breach_cases WHERE breach_id = %s",
+                (breach_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = row["payload"]
+        return BreachCase.model_validate(
+            payload if isinstance(payload, dict) else json.loads(payload)
+        )
+
+    def list_breach_cases(
+        self, credit_file_id: str | None = None
+    ) -> list[BreachCase]:
+        with self._connect() as conn:
+            if credit_file_id is not None:
+                rows = conn.execute(
+                    "SELECT payload FROM breach_cases "
+                    "WHERE credit_file_id = %s ORDER BY id",
+                    (credit_file_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT payload FROM breach_cases ORDER BY id"
+                ).fetchall()
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append(
+                BreachCase.model_validate(
                     payload if isinstance(payload, dict) else json.loads(payload)
                 )
             )

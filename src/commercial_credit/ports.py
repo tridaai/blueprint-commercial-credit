@@ -15,10 +15,12 @@ from typing import Protocol, runtime_checkable
 from .models import (
     AuditEvent,
     Borrower,
+    BreachCase,
     CommitteeDecision,
     ComputationPack,
     CovenantAmendment,
     CovenantSet,
+    CovenantTestResult,
     CreditFile,
     CreditMemo,
     ExtractedValue,
@@ -176,5 +178,33 @@ class CreditFileStore(Protocol):
     def list_covenant_amendments(
         self, credit_file_id: str
     ) -> list[CovenantAmendment]: ...
+
+    # -- Covenant test results and breach cases (round 11) --------
+    # A test result is content-addressed and insert-once, like the
+    # packs it pins: re-running the same test over the same inputs
+    # stores nothing twice. A breach case is a living record — it
+    # is upserted as its recorded acts accumulate, the way the
+    # credit file itself is; its event history inside the payload
+    # is append-only, and there is no delete path for either.
+
+    def save_covenant_test_result(
+        self, result: CovenantTestResult
+    ) -> None: ...
+
+    def get_covenant_test_result(
+        self, result_id: str
+    ) -> CovenantTestResult | None: ...
+
+    def list_covenant_test_results(
+        self, credit_file_id: str
+    ) -> list[CovenantTestResult]: ...
+
+    def save_breach_case(self, breach: BreachCase) -> None: ...
+
+    def get_breach_case(self, breach_id: str) -> BreachCase | None: ...
+
+    def list_breach_cases(
+        self, credit_file_id: str | None = None
+    ) -> list[BreachCase]: ...
 
     def ping(self) -> bool: ...
