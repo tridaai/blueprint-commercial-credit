@@ -276,12 +276,47 @@ taken through their first review year:
                             records its committee referral, and
                             the v1-to-v2 differences are named.
 
+Round 13 counters — the risk-rating scorecard, a coded stand-in
+for the bank's own rating model, graded on the approved file and
+the Hartline file whose cash-flow page is missing:
+
+  rating_factor_score_      every factor's band, score and
+    wrong                   weighted contribution on the graded
+                            fixture, plus the composite and the
+                            grade — and the breach year's
+                            re-grade. REQUIRED: 0 wrong.
+  rating_missing_input_     a figure that cannot compute must
+    zero_filled             land in its named missing-data band
+                            with the missing input named — never
+                            zero-filled, never skipped.
+                            REQUIRED: 0.
+  rating_override_          an override beyond one grade from
+    unlawful_accepted       the assigned grade, uncoded,
+                            uncountersigned or self-countersigned
+                            must be refused. REQUIRED: 0 accepted.
+  rating_used_as_approval   no code path from a rating to a
+                            decision: the gates neither import
+                            nor consult the scorecard, and a rated
+                            file with no gate action stands
+                            undecided. REQUIRED: 0.
+  rating_history_rewritten  registering a second scorecard
+                            version must not alter an existing
+                            assignment by a byte, and the history
+                            labels the comparison cross-version.
+                            REQUIRED: 0.
+  rating_positive_paths     assignments land (the approved file
+                            and the file with missing figures),
+                            a one-grade override lands with both
+                            grades visible, and the memo and the
+                            annual review pack carry the rating.
+
 Later rounds add counters as their machinery lands.
 Exit code 0 = GATE: PASS.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from datetime import date, datetime, timezone
@@ -2095,12 +2130,19 @@ def main() -> int:
         cleared_without_refresh += 1
     # (Round 11 note: waive_breach is the one waiv-named method —
     # it resolves a covenant breach on a committee decision's
-    # authority and cannot touch a readiness blocker; the scan
-    # below therefore names it as the only allowed match.)
+    # authority and cannot touch a readiness blocker. Round 12
+    # added _overrides_for, a private lookup; round 13 adds
+    # override_rating, which moves a risk rating's final grade
+    # under its own discipline, and list_rating_overrides, a
+    # read-only listing. None of them can touch a readiness
+    # blocker, so the scan names exactly those four.)
     if [
         name for name in dir(CreditPipeline)
         if "waiv" in name or "override" in name
-    ] != ["waive_breach"]:
+    ] != [
+        "_overrides_for", "list_rating_overrides",
+        "override_rating", "waive_breach",
+    ]:
         cleared_without_refresh += 1
     try:
         rp.convene_committee(
@@ -2989,6 +3031,251 @@ def main() -> int:
           f"{'pack assembles complete over the breach year, affirm lands countersigned and the instance completes, watchlist lands, escalation records its referral, v1-to-v2 differences named' if review_positive else 'FAILED'}")
     if not review_positive:
         failures.append("an annual review positive path did not land")
+
+    # ---------------------------------------------------------------
+    # Round 13: the risk-rating scorecard. A coded stand-in for
+    # the bank's own rating model — it grades, it never decides.
+    # The graded fixture is hand-computed factor by factor; a
+    # missing figure lands in its named band, never at zero; the
+    # override is bounded, coded and countersigned; history is
+    # append-only across scorecard versions. Zero tolerance.
+    # ---------------------------------------------------------------
+    from commercial_credit import committee as _committee_mod
+    from commercial_credit import officer_gate as _officer_mod
+    from commercial_credit.scorecard import (
+        get_scorecard as _get_scorecard,
+        register_scorecard as _register_scorecard,
+    )
+
+    kp = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    kcf, _k_decision = _t_approved(kp)
+    k_assignment = kp.assign_rating(kcf, as_of=date(2026, 6, 30))
+    k_factors = {
+        f.factor_id: f for f in k_assignment.factors
+    }
+    _graded = {
+        # factor: (input value, band, score, weighted contribution)
+        "leverage": ("5.0000", "leverage_at_most_5_00", 8, "1.60"),
+        "dscr": ("1.3125", "dscr_at_least_1_25", 5, "1.25"),
+        "liquidity": (
+            "1.7143", "current_ratio_at_least_1_50", 4, "0.60"
+        ),
+        "profitability_trend": (
+            "-0.0040", "margin_trend_at_least_-0_0050", 5, "0.50"
+        ),
+    }
+    factor_wrong = 0
+    for _fid, (_val, _band, _score, _contrib) in _graded.items():
+        _f = k_factors[_fid]
+        if (
+            str(_f.input_value) != _val or _f.band_id != _band
+            or _f.score != _score
+            or str(_f.weighted_contribution) != _contrib
+        ):
+            factor_wrong += 1
+    for _fid, (_cat, _score) in {
+        "covenant_compliance": ("no_test_history", 5),
+        "breach_history": ("no_breach_history", 2),
+        "statement_quality": ("audited_statements_clean", 2),
+    }.items():
+        _f = k_factors[_fid]
+        if _f.input_category != _cat or _f.score != _score:
+            factor_wrong += 1
+    if (
+        str(k_assignment.composite_score) != "4.85"
+        or k_assignment.assigned_grade != 5
+        or k_assignment.assigned_band != "watch"
+    ):
+        factor_wrong += 1
+    # The breach year re-grades on the same file.
+    _t_deliver(kp, kcf, 2026, _T_FY2026)
+    kp.run_due_covenant_tests(kcf, as_of=date(2027, 3, 1))
+    k_regrade = kp.assign_rating(kcf, as_of=date(2027, 3, 1))
+    if (
+        str(k_regrade.composite_score) != "7.05"
+        or k_regrade.assigned_grade != 7
+        or k_regrade.assigned_band != "special mention"
+    ):
+        factor_wrong += 1
+    print(f"rating_factor_score_wrong: {factor_wrong} of 9 graded "
+          f"checks (required 0)")
+    if factor_wrong:
+        failures.append("a scorecard factor scored wrong")
+
+    # Missing figures: named bands, missing inputs named.
+    hp13 = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    _hb, _hf = ReferenceLosFeed().fetch_application("LOS-2026-0117")
+    hcf13 = hp13.open_application(
+        _hb, _hf,
+        documents=[
+            {
+                "kind": DocumentKind.FINANCIAL_STATEMENT.value,
+                "filename": f"hartline-fy{year}-statements.json",
+                "data_hex": statement_document(year).hex(),
+                "period_label": f"FY{year}",
+            }
+            for year in (2022, 2023, 2024)
+        ],
+    ).credit_file_id
+    h_assignment = hp13.assign_rating(hcf13, as_of=date(2026, 6, 30))
+    h_factors = {f.factor_id: f for f in h_assignment.factors}
+    zero_filled = 0
+    for _fid in ("dscr", "profitability_trend"):
+        _f = h_factors[_fid]
+        if (
+            _f.input_value is not None
+            or not _f.band_id.endswith("_insufficient_data")
+            or not _f.missing_inputs
+        ):
+            zero_filled += 1
+    for _f in h_assignment.factors:
+        if _f.kind == "figure" and _f.input_value is None and (
+            not _f.band_id.endswith("_insufficient_data")
+        ):
+            zero_filled += 1
+    print(f"rating_missing_input_zero_filled: {zero_filled} "
+          f"(required 0)")
+    if zero_filled:
+        failures.append("a missing rating input was zero-filled "
+                        "or skipped")
+
+    # The override's discipline, probed on the first assignment:
+    # beyond one grade, uncoded, uncountersigned,
+    # self-countersigned, and a no-op move are all refused.
+    unlawful = 0
+    _k_aid = k_assignment.assignment_id
+    unlawful += _refused(lambda: kp.override_rating(
+        kcf, _k_aid, officer_id=C_OFFICER,
+        officer_role=C_OFFICER_ROLE, new_grade=7,
+        reason_code="collateral_strength",
+        countersigner_id="officer-eval-two",
+        countersigner_role="senior_credit_officer",
+    ))
+    unlawful += _refused(lambda: kp.override_rating(
+        kcf, _k_aid, officer_id=C_OFFICER,
+        officer_role=C_OFFICER_ROLE, new_grade=4,
+        reason_code="gut_feel",
+        countersigner_id="officer-eval-two",
+        countersigner_role="senior_credit_officer",
+    ))
+    unlawful += _refused(lambda: kp.override_rating(
+        kcf, _k_aid, officer_id=C_OFFICER,
+        officer_role=C_OFFICER_ROLE, new_grade=4,
+        reason_code="collateral_strength",
+    ))
+    unlawful += _refused(lambda: kp.override_rating(
+        kcf, _k_aid, officer_id=C_OFFICER,
+        officer_role=C_OFFICER_ROLE, new_grade=4,
+        reason_code="collateral_strength",
+        countersigner_id=C_OFFICER,
+        countersigner_role=C_OFFICER_ROLE,
+    ))
+    unlawful += _refused(lambda: kp.override_rating(
+        kcf, _k_aid, officer_id=C_OFFICER,
+        officer_role=C_OFFICER_ROLE, new_grade=5,
+        reason_code="collateral_strength",
+        countersigner_id="officer-eval-two",
+        countersigner_role="senior_credit_officer",
+    ))
+    print(f"rating_override_unlawful_accepted: {unlawful} of 5 "
+          f"probes accepted (required 0)")
+    if unlawful:
+        failures.append("an unlawful rating override was accepted")
+
+    # The rating is an input, never a decision: the gates do not
+    # import or consult the scorecard, no gate signature takes a
+    # rating, and a rated file with no gate action stands
+    # undecided with its memo a draft.
+    used_as_approval = 0
+    for _mod in (_committee_mod, _officer_mod):
+        _src = inspect.getsource(_mod).lower()
+        if "scorecard" in _src or "ratingassignment" in _src:
+            used_as_approval += 1
+    for _fn in (
+        CreditPipeline.decide_committee,
+        CreditPipeline.convene_committee,
+        CreditPipeline.approve_memo,
+    ):
+        if any(
+            "rating" in _name
+            for _name in inspect.signature(_fn).parameters
+        ):
+            used_as_approval += 1
+    _h_memo = hp13.compose_memo(hcf13)
+    if hp13.memo_status(hcf13, _h_memo.memo_id) != "draft":
+        used_as_approval += 1
+    if hp13.store.list_committee_decisions(hcf13):
+        used_as_approval += 1
+    print(f"rating_used_as_approval: {used_as_approval} "
+          f"(required 0)")
+    if used_as_approval:
+        failures.append("a rating was used as an approval")
+
+    # History: a second registered version appends; the v1
+    # artefact stands byte-identical; the comparison is labelled.
+    _v1_json = kp.get_rating_assignment(
+        kcf, k_regrade.assignment_id
+    ).model_dump_json()
+    _register_scorecard(_get_scorecard("1").model_copy(update={
+        "version": "eval-2",
+        "note": "Eval-registered second version.",
+    }))
+    _k_v2 = kp.assign_rating(
+        kcf, as_of=date(2027, 3, 1), scorecard_version="eval-2"
+    )
+    rewritten = 0
+    if kp.get_rating_assignment(
+        kcf, k_regrade.assignment_id
+    ).model_dump_json() != _v1_json:
+        rewritten += 1
+    _k_history = kp.rating_history(kcf)
+    if (
+        len(_k_history) != 3
+        or _k_history[-1]["assignment"].assignment_id
+        != _k_v2.assignment_id
+        or _k_history[-1]["cross_version"] is not True
+    ):
+        rewritten += 1
+    print(f"rating_history_rewritten: {rewritten} (required 0)")
+    if rewritten:
+        failures.append("a scorecard version change rewrote "
+                        "rating history")
+
+    # Positive paths: both assignments landed; the one-grade
+    # override lands with both grades visible; the memo states
+    # the rating; the review pack carries it with its breakdown.
+    _k_override = kp.override_rating(
+        kcf, _k_aid, officer_id=C_OFFICER,
+        officer_role=C_OFFICER_ROLE, new_grade=4,
+        reason_code="collateral_strength",
+        countersigner_id="officer-eval-two",
+        countersigner_role="senior_credit_officer",
+    )
+    _k_view = kp.rating_view(
+        kp.get_rating_assignment(kcf, _k_aid)
+    )
+    _k_memo = kp.compose_memo(kcf)
+    _k_pack = kp.assemble_review_pack(
+        kcf, review_number=1, as_of=date(2027, 3, 1)
+    )
+    rating_positive = (
+        h_assignment.assigned_grade == 5
+        and _k_view["assigned_grade"] == 5
+        and _k_view["final_grade"] == 4
+        and _k_memo.rating_assignment_id == _k_v2.assignment_id
+        and _k_memo.rating_grade == 7
+        and _k_pack.rating_assignment_id == _k_v2.assignment_id
+        and len(_k_pack.rating_factors) == 7
+        and _k_pack.summary.verification.verified
+    )
+    print(f"rating_positive_paths: "
+          f"{'assignments land, the one-grade override lands with both grades visible, memo and review pack carry the rating' if rating_positive else 'FAILED'}")
+    if not rating_positive:
+        failures.append("a rating positive path did not land")
 
     if failures:
         print("GATE: FAIL")

@@ -581,6 +581,84 @@ insert-once, in all three stores.
 idempotently for due/overdue instances that have neither an
 outcome nor a pack.
 
+## Risk ratings (round 13)
+
+The scorecard is `src/commercial_credit/scorecard.py` (the
+definition registry, the derivations, the override discipline)
+plus pipeline services and migration `0012_risk_ratings.sql`.
+
+**The definition.** `aldergrove-scorecard` is a `ScorecardDefinition`
+held as data: seven `ScorecardFactorDef`s — five figure factors
+read a computation-pack figure key (`latest`, or
+`period_change` = latest minus earliest for the margin trend)
+and three are coded file facts — each with `ScorecardBand`s
+(numeric ranges or categories; exactly one `is_missing_data`
+band on every figure factor) and a weight, plus
+`ScorecardGradeBand`s covering grades 1–10 exactly once.
+`register_scorecard` validates the whole definition (weights
+sum to exactly 1, band coverage disjoint and total, file-fact
+bands equal to the derivation's category set) and refuses to
+re-register a version with different content.
+
+**The assignment.** `assign_rating` recomputes the file's
+computation pack through the round-3 engine and grades against
+the pack's own figures. Figure factors resolve the figure from
+the pack: a `not_computable` figure lands in the missing-data
+band with its `missing_inputs` carried onto the factor record;
+`derivation_steps` are the figure's own step keys, so the
+factor's trace walks figure → steps → spread lines exactly as
+the memo verifier's does. File-fact derivations are pure
+functions of stored artefacts: covenant compliance reads the
+current head results (later results supersede; restated
+results keep standing against the current spread) with
+precedence failed > not-evaluable > awaiting-inputs > all-passed
+> no-history; breach history reads breaches opened in the 365
+days before `as_of` by state; statement quality reads the
+latest period's statement sources against the material
+disagreements. Composite = Σ(score × weight) at 2dp; grade =
+composite rounded HALF_UP, clamped to the scale. The
+artefact is content-addressed (`rating-<hash[:16]>` over
+scorecard id+version, pack id, spread id, `as_of` and every
+factor row) and insert-once: recomputation over the same
+artefacts returns the stored assignment; a new pack produces a
+new assignment beside it.
+
+**The override.** `RatingOverride` is a separate
+content-addressed artefact. `validate_override` refuses:
+non-officer actor or countersigner, a countersigner equal to
+the officer, an uncoded reason (vocabulary
+`rating-override-reasons-v1`; `other` requires a note), a
+no-op move, and any final grade more than 1 from the
+**assigned** grade — the bound is on the assignment, so a
+chain of overrides cannot walk the grade further; each records
+its chain position (`previous_grade`,
+`supersedes_override_id`). `final_grade_of` walks the chain by
+supersession; `rating_view` exposes assigned and final grades
+together, and that view is the only shape the API returns.
+
+**Wiring.** The memo's header facts gain the file's current
+rating (assignment id, scorecard version, assigned and final
+grades, override id) — grades and versions render as
+code-spanned artefact citations, deliberately outside the
+figure verifier's extraction grammar, because the assignment
+artefact is where the numbers live and the memo cites it
+rather than restating it. The annual review pack pins the same
+assignment plus its full factor breakdown and states it in a
+locked-fact paragraph that recomputes identically under
+`check_review_summary`. History is a read model over the
+stored assignments: each entry carries its scorecard version
+and a `cross_version` label when it differs from its
+predecessor's. The officer gate and committee modules import
+nothing from the scorecard and no gate signature accepts a
+rating — the separation is structural, and both the tests and
+the evals scan for it.
+
+**Surfaces.** `POST /applications/{id}/risk-rating` (assign;
+201 + rating view), `GET /applications/{id}/risk-ratings`,
+`GET /applications/{id}/risk-ratings/{assignment_id}`,
+`GET /applications/{id}/risk-rating-history`,
+`POST /applications/{id}/risk-ratings/{assignment_id}/override`.
+
 ## Storage
 
 PostgreSQL is the deployment store. `migrations/` holds numbered SQL

@@ -671,6 +671,73 @@ outcome, and the decided memo the committee machinery acts on.
 An instance closes exactly once; the next year's instance
 already stands derived from the anchor.
 
+## What round 13 adds
+
+A bank grades its borrowers on a 1–10 risk-rating scale, and
+the rating feeds pricing, monitoring intensity and portfolio
+reporting — so the rating's own record has to be as disciplined
+as the credit file's. This round adds the **risk-rating
+scorecard**: a versioned definition, `aldergrove-scorecard`,
+held as data — seven factors (leverage, DSCR, liquidity,
+profitability trend, covenant compliance, breach history,
+statement quality), each with its input, its band thresholds
+and its weight, the weights summing to exactly 1, and the grade
+bands (1–4 pass, 5–6 watch, 7 special mention, 8 substandard,
+9 doubtful, 10 loss) in the definition itself. A definition
+that does not validate — weights off unity, a figure factor
+without a missing-data band, grade bands that do not cover
+1–10 exactly once — is refused at registration, and a
+registered version is never silently replaced.
+
+An **assignment** is a content-addressed artefact that reads
+the file's stored computation pack and spread and records, for
+every factor, the input value and the trace that produced it
+(figure key → computation steps) or the coded file-fact
+category, the band hit, the factor score and the weighted
+contribution. The composite is the weighted sum in Decimal,
+and the grade is the composite rounded to the 1–10 scale. A
+figure that cannot compute — no cash-flow page, no DSCR —
+scores its **named missing-data band** with the missing input
+named on the assignment: never zero-filled, never silently
+skipped. Recomputation over the same artefacts returns the
+identical artefact.
+
+The rating is an **input, never a decision**. It is wired in as
+one: the memo states the current rating in its header facts
+when one exists, and the annual review pack carries the rating
+with its full factor breakdown in its locked record — where it
+says, in so many words, that the rating decides nothing. The
+officer gate and the committee neither import nor consult the
+scorecard; the gates' behaviour on a rated file is identical
+to their behaviour on an unrated one, and the evals assert it.
+
+**Overrides** carry the same discipline as every other human
+act in this repo. A named credit officer may move the final
+grade at most **one grade** from the assigned grade, for a
+coded reason from the versioned vocabulary
+`rating-override-reasons-v1`, countersigned by a second,
+different officer. The override is its own artefact beside the
+assignment — the assignment is never edited — and both grades
+stay visible everywhere the rating is shown: assigned and
+final. A larger move, an uncoded reason, a self-countersign
+are refused mechanically; a further override is still bound by
+the assigned grade, so a chain cannot walk the grade away one
+step at a time.
+
+**History is append-only.** Assignments accumulate per file;
+registering a new scorecard version grades going forward and
+leaves every earlier assignment byte-identical under its own
+version, and the history view labels any comparison across
+versions as cross-version — the grades are not directly
+comparable, and the record says so.
+
+One honesty note, in the repo's pattern: the scorecard shipped
+here is a **coded stand-in** for the bank's own rating model.
+A real bank's model is validated, back-tested and governed
+under its model-risk programme; this blueprint ships the
+plumbing and the discipline around a model — versioning,
+traceability, override control — not a validated model.
+
 ## The laws (enforced in code, never in prompts)
 
 1. **No model-computed numbers.** Extraction returns values +
@@ -714,6 +781,10 @@ already stands derived from the anchor.
   generated borrower documents; a document-AI adapter slots behind
   the same port in a deployment and inherits the same provenance
   contract. No claim is made about scanned PDFs today.
+- The risk-rating scorecard (round 13) is a coded stand-in for
+  the bank's own rating model: the versioning, traceability and
+  override discipline are real; the factor bands are illustrative,
+  not a validated, back-tested model.
 - There is no real LOS or core-banking integration — ports and a
   reference feed only.
 - The sample borrower book is generated for this blueprint, with
