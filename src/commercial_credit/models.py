@@ -404,3 +404,204 @@ class Spread(BaseModel):
     lines: list[SpreadLine]
     unmapped: list[UnmappedEntry] = Field(default_factory=list)
     adjustments: list[SpreadAdjustment] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------
+# Round 3: the computation engine. Every figure the engine produces
+# is a stored artefact carrying its full derivation: a chain of steps
+# whose inputs name spread lines (with their provenance chain),
+# supplemental figures (with provenance), earlier figures, or — in a
+# global pack — named eliminations. A figure whose required inputs
+# are absent is not estimated: it is recorded as not computable,
+# naming what is missing.
+# ---------------------------------------------------------------------
+
+
+class StepInput(BaseModel):
+    """One input to one computation step.
+
+    `kind` says where the value came from:
+      spread_line — a cell of the spread (line, period, view), with
+                    the provenance chain of the extraction that fed
+                    the cell and the ids of any adjustments folded
+                    into an adjusted-view value;
+      supplemental — a figure supplied to the computation run itself
+                    (e.g. capital lease payments from a debt
+                    schedule), carrying its own provenance;
+      figure      — the result of another computed figure (this pack,
+                    or an entity pack of a global combination);
+      step        — the result of an earlier step of the same figure;
+      elimination — a named global-cash-flow elimination.
+    """
+
+    kind: str
+    value: Decimal
+    line_key: str | None = None
+    fiscal_year: int | None = None
+    view: str | None = None
+    provenance: list[Provenance] = Field(default_factory=list)
+    adjustment_ids: list[str] = Field(default_factory=list)
+    figure_key: str | None = None
+    pack_id: str | None = None
+    entity: str | None = None
+    step_key: str | None = None
+    elimination_name: str | None = None
+
+
+class ComputationStep(BaseModel):
+    """One recorded arithmetic step of a figure's derivation.
+
+    Results are quantized as they are recorded — money to the cent,
+    ratios to 4 decimal places, ROUND_HALF_UP — so the trace replays
+    to exactly the figure the pack reports.
+    """
+
+    step_key: str
+    label: str
+    operation: str  # carry | add | subtract | sum | divide
+    inputs: list[StepInput]
+    result: Decimal
+    notes: str = ""
+
+
+class ComputedFigure(BaseModel):
+    """One computed figure: a ratio, a coverage measure, or a
+    derived money amount (EBITDA, debt service, global cash flow…).
+
+    `status` is "computed" only when every required input was
+    present; otherwise the figure names its missing inputs and
+    carries no value. There is no third state — a figure is never
+    quietly approximated.
+    """
+
+    key: str
+    label: str
+    unit: str  # "USD" | "ratio"
+    fiscal_year: int | None = None
+    entity: str = ""
+    value: Decimal | None = None
+    status: str  # computed | not_computable
+    missing_inputs: list[str] = Field(default_factory=list)
+    steps: list[ComputationStep] = Field(default_factory=list)
+    notes: str = ""
+
+
+class CovenantDefinition(BaseModel):
+    """A covenant test supplied to the computation run: the metric,
+    the operator, the threshold, the period it applies to.
+
+    Definitions are *given* to this round — the covenant store and
+    its scheduler are round 10, the policy pack round 4. The engine
+    computes headroom against whatever definitions it is handed and
+    records them in the pack, so a headroom figure always names the
+    definition it was measured against.
+    """
+
+    name: str = Field(min_length=1)
+    metric_key: str = Field(min_length=1)
+    operator: str = Field(pattern=r"^(>=|<=|>|<)$")
+    threshold: Decimal
+    fiscal_year: int
+    require_capital_leases: bool = False
+
+
+class CovenantResult(BaseModel):
+    """Headroom of one metric against one given definition.
+
+    `headroom` is the signed distance from the metric to the safe
+    side of the threshold (value − threshold for a floor, threshold
+    − value for a ceiling); negative headroom is a breach on the
+    historical figures. `headroom_pct` is headroom over |threshold|.
+    """
+
+    name: str
+    metric_key: str
+    fiscal_year: int
+    operator: str
+    threshold: Decimal
+    value: Decimal | None = None
+    status: str  # computed | not_computable
+    compliant: bool | None = None
+    headroom: Decimal | None = None
+    headroom_pct: Decimal | None = None
+    missing_inputs: list[str] = Field(default_factory=list)
+
+
+class Elimination(BaseModel):
+    """A named elimination in a global (combined) cash-flow view.
+
+    Combining a borrower with its guarantors double-counts whatever
+    flows between them — rent the borrower pays a guarantor's
+    property company, intercompany debt service. An elimination
+    removes a named amount from the combined cash flow or the
+    combined debt service, for a stated reason. It is a record, not
+    an edit: both entities' own figures stand untouched.
+    """
+
+    name: str = Field(min_length=1)
+    fiscal_year: int
+    amount: Decimal
+    target: str = Field(pattern=r"^(cash_flow|debt_service)$")
+    reason: str
+
+
+def require_valid_elimination(elimination: Elimination) -> None:
+    """Receiving-side check for eliminations, defence in depth
+    behind the model validators. An elimination without a name,
+    without a reason, or of a non-positive amount is refused — an
+    unexplained removal from a combined view is exactly what the
+    record exists to prevent."""
+    if not elimination.name or not elimination.name.strip():
+        raise ValidationError("an elimination requires a name")
+    if not elimination.reason or not elimination.reason.strip():
+        raise ValidationError(
+            f"elimination {elimination.name!r} requires a stated reason"
+        )
+    if elimination.amount is None or elimination.amount <= 0:
+        raise ValidationError(
+            f"elimination {elimination.name!r} must remove a positive amount"
+        )
+    if elimination.target not in ("cash_flow", "debt_service"):
+        raise ValidationError(
+            f"elimination {elimination.name!r} targets "
+            f"{elimination.target!r}, not cash_flow or debt_service"
+        )
+
+
+class ExclusionRecord(BaseModel):
+    """A guarantor named for a global view but left out of it, with
+    the reason on the record. Exclusion is only ever explicit: the
+    request must opt in, and the pack carries the record forever."""
+
+    entity: str
+    reason: str
+
+
+class ComputationPack(BaseModel):
+    """The stored artefact of one computation run.
+
+    Like the spread, the pack is content-addressed: `inputs_hash`
+    covers the engine version, the spread it ran over, the view,
+    every supplemental figure and covenant definition (and, for a
+    global pack, the entity packs combined and the eliminations
+    applied), and `pack_id` is derived from it. Recomputing the same
+    inputs returns the identical pack — the same id, the same bytes.
+    The pack carries no timestamps and no random ids.
+    """
+
+    pack_id: str
+    credit_file_id: str
+    spread_id: str
+    entity: str
+    scope: str  # entity | global
+    engine_version: str
+    view: str  # adjusted | unadjusted
+    inputs_hash: str
+    entities: list[str] = Field(default_factory=list)
+    entity_pack_ids: list[str] = Field(default_factory=list)
+    supplemental: list[ExtractedValue] = Field(default_factory=list)
+    covenant_definitions: list[CovenantDefinition] = Field(default_factory=list)
+    eliminations: list[Elimination] = Field(default_factory=list)
+    exclusions: list[ExclusionRecord] = Field(default_factory=list)
+    figures: list[ComputedFigure] = Field(default_factory=list)
+    covenant_results: list[CovenantResult] = Field(default_factory=list)
