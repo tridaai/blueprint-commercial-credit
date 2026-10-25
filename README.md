@@ -227,8 +227,60 @@ draft may exist at all:
   handling lands. Whichever profile drafts, the verifier — not
   the drafter — decides whether the memo may be stored.
 
-Later rounds add the credit-officer and committee gates with
-coded adverse-action reasons, and the covenant monitoring loop.
+Later rounds add the committee gate with coded adverse-action
+reasons, and the covenant monitoring loop.
+
+## What round 6 adds
+
+The credit officer gate — the first human gate, where the draft
+memo is decided by a named person, and every edit they make is
+evidence:
+
+- **Named officers, or nobody acts** — every gate action records
+  who acted and in what role. Submitting a draft for review is
+  open to any named actor; approving, returning and flagging
+  require a credit officer role (credit officer, senior credit
+  officer, chief credit officer). An anonymous or role-less
+  action is refused mechanically, before anything else is
+  looked at.
+- **Approval mints a new artefact** — the officer approves as-is
+  or with paragraph edits to the narrative sections (the
+  recommendation and conditions placeholders are theirs to
+  complete). Approval never edits the draft in place: it stores
+  an officer-final memo — status `officer_approved`,
+  committee-ready — naming the draft it supersedes and the
+  officer who approved it. A memo's live review status (draft /
+  in review / returned / approved) is derived from its recorded
+  review events (migration 0006), never stored on the artefact.
+- **Edits face the verifier again** — an edited memo is a
+  candidate until the round-5 figure verifier has cleared the
+  full edited text: one untraceable figure refuses the approval
+  and stores nothing. The policy exceptions section is locked at
+  this gate — it renders the pinned policy report verbatim, so
+  no exception can be dropped or softened by editing it; the
+  officer discusses exceptions in the risks section instead.
+- **Every approval records its diff** — a `MemoDiff` stores the
+  section-level changes (paragraphs before/after) and the
+  figure-level changes (figures added, removed, or altered in
+  place, each with the artefact + field it traced to on its
+  side). An approval as-is records an empty diff — "the officer
+  changed nothing" is itself on the record.
+- **Returns are coded, and returns reopen nothing** — a return
+  for rework names reasons from a versioned vocabulary
+  (`officer-return-reasons-v1`); a note may ride alongside but
+  never substitutes for a code, and the vocabulary version is
+  recorded on the return. A returned memo cannot be approved or
+  resubmitted — it is recomposed into a new draft version that
+  supersedes it, and the officer who returned it may decide the
+  recomposition.
+- **Flags the committee will see** — an officer may flag an item
+  for committee attention (the flags ride onto the officer-final
+  memo at approval), or declare a conflict of interest — which
+  bars that officer from approving the memo, by name of the
+  flag, so a different officer must decide.
+
+The committee gate — the second human gate, with coded
+adverse-action reasons (design law 3) — is round 7.
 
 ## The laws (enforced in code, never in prompts)
 

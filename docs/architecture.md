@@ -205,6 +205,53 @@ report or a pack version explicitly, stores the memo
 content-addressed, and audits `memo_composed` the first time
 those inputs are seen.
 
+## Credit officer gate (round 6)
+
+`officer_gate.py` holds the gate's discipline — identity checks,
+the coded return vocabulary, status derivation, edit application
+and diff computation — and `CreditPipeline` runs the workflow
+over the stores. The gate acts on the stored draft memo, not
+inside the intake graph: states move draft → in_officer_review →
+officer_approved | returned, and the transitions are enforced in
+code.
+
+No action is anonymous. Every action is a stored, append-only
+`MemoReviewEvent` (migration 0006) naming the actor and their
+role, mirrored onto the file's audit trail under the same actor;
+approvals, returns and flags additionally require a credit
+officer role. A memo's review status is DERIVED from its event
+stream by `derive_status` — artefacts are never mutated, so the
+stored draft stays byte-identical to what the verifier cleared
+in round 5, and reads overlay the derived status.
+
+Approval builds a candidate from the draft — the officer's
+paragraph edits applied (tables are machine-rendered and not
+editable; the `policy_exceptions` section is locked, as it
+renders the pinned policy report verbatim) — and runs it through
+the same `verify_memo` as the draft. Only a cleared candidate is
+stored, as a new content-addressed artefact: status
+`officer_approved`, `supersedes_memo_id` naming the draft,
+`reviewed_by` naming the officer, and the memo's committee flags
+carried over. Alongside it, `compute_memo_diff` records the
+`MemoDiff`: per-section paragraph before/after, and figure
+changes computed by walking each section's traced figure
+occurrences in reading order — a same-position swap is one
+`altered` change with both sides' trace sources, never a silent
+remove-plus-add.
+
+Returns carry codes from `RETURN_REASON_CODES`
+(`officer-return-reasons-v1`); the version is stamped on the
+event. A returned memo is terminal as a draft: `recompose_memo`
+composes a fresh draft from the file's current pinned artefacts,
+stamps the supersession lineage on it, and gives it its own
+review life. Flags come in two kinds — `committee_attention`,
+carried onto the final memo for round 7's committee, and
+`conflict_of_interest`, which makes `approve_memo` refuse that
+officer's approval by name of the flag. The API exposes the
+whole gate: submit, approve, return, flag, recompose, plus a
+memo's version history (its supersession chain with derived
+statuses, its events, and its diff) and the diff record itself.
+
 ## Storage
 
 PostgreSQL is the deployment store. `migrations/` holds numbered SQL
