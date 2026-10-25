@@ -483,11 +483,16 @@ def test_no_waiver_surface_exists():
             "waiv" in name or "override" in name or name == "force"
             for name in params
         ), fn.__name__
-    # No method that waives or overrides anything.
-    assert not [
+    # No method that waives or overrides anything — with one
+    # named exception that is not a readiness surface at all:
+    # round 11's waive_breach resolves a covenant BREACH, only
+    # on a committee decision's authority, and cannot touch a
+    # readiness blocker (its parameters name a breach and a
+    # decision, never a file's readiness).
+    assert [
         name for name in dir(CreditPipeline)
         if "waiv" in name or "override" in name
-    ]
+    ] == ["waive_breach"]
     # No waiver field on the report or its entries.
     for model in (ReadinessReport, ReadinessEntry):
         assert not any(

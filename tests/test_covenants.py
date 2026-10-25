@@ -579,8 +579,12 @@ def test_there_is_no_in_place_covenant_mutation_surface():
             "save_covenant_set", "get_covenant_set",
             "list_covenant_sets", "save_covenant_amendment",
             "list_covenant_amendments",
+            # Round 11: test results join the covenant surface
+            # (breach cases carry no "covenant" in their names).
+            "save_covenant_test_result", "get_covenant_test_result",
+            "list_covenant_test_results",
         }, (cls.__name__, names)
-    # And the pipeline's covenant surface is exactly the round's.
+    # And the pipeline's covenant surface is exactly the rounds'.
     pipeline_fns = {
         n for n in dir(CreditPipeline)
         if ("covenant" in n or n == "record_closing")
@@ -591,6 +595,9 @@ def test_there_is_no_in_place_covenant_mutation_surface():
         "get_covenant_set", "list_covenant_amendments",
         "covenant_schedule", "covenant_due_work", "tick_covenants",
         "amend_covenant",
+        # Round 11: test execution and result history.
+        "run_due_covenant_tests", "run_covenant_test",
+        "covenant_test_results", "covenant_history",
     }
     assert inspect.signature(
         CreditPipeline.amend_covenant
