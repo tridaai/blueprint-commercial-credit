@@ -109,6 +109,48 @@ definitions *given* to the run (metric, operator, threshold,
 period); storing covenant definitions and scheduling their tests is
 round 10, and the lending-policy pack is round 4.
 
+## Policy (round 4)
+
+`policy.py` holds the packs as data: an id (`aldergrove-policy`), a
+version, an effective window, an issuing note, the stated capital
+base, and the test set. A `PolicyTest` names its kind (figure or
+file_fact), the exact inputs it reads, its operator/threshold (or
+segment threshold table), its severity, and the citation text of
+the policy it encodes; model validation refuses a test that names
+no input. Two versions ship — v1 (2025 issue) and v2 (2026
+refresh), differing only in three tightened numbers — and packs are
+never edited in place: a policy change is a new version.
+
+`evaluate_policy` is a pure function of (credit file, borrower
+pack, optional global pack, pinned version, as-of date). Figure
+tests read the figure for the most recent fiscal year in the pack;
+when that figure is not computable, the outcome is *not_evaluable*
+carrying the figure's own missing-input list — the evaluator has
+no code path from a missing figure to a pass, and the eval gate
+re-verifies every pass against its pack (silent-pass counter,
+required 0). Applicability is read from file facts: the global
+DSCR test requires guarantors named on the facility and a global
+pack handed in; the appraisal test applies only to facility types
+the pack lists. Ages are complete calendar months — statements
+from the fiscal year-end (31 December of the pack's latest year),
+appraisals from the most recent appraisal document's received
+date — against the evaluation's as-of date, which the report
+records.
+
+The output is a `PolicyReport`, content-addressed like the packs
+it reads: the report id hashes the pack version and a digest of
+the pack itself, the computation pack ids, the as-of date, and a
+digest of exactly the credit-file facts the tests read, so the id
+moves when — and only when — an input moves. Reports are stored
+behind the credit-file port (migration 0004) and never overwritten:
+a re-evaluation under a newer version appends a new report. The
+pipeline's policy node evaluates under the current version at
+intake; `CreditPipeline.evaluate_policy` pins a version explicitly
+and appends a `PolicyHistoryEntry` (pack, version, report id,
+as-of) to the credit file the first time those inputs are seen.
+The memo (round 5) will quote the report and its pinned version;
+the gates (rounds 6–7) will read blocker failures from it.
+
 ## Storage
 
 PostgreSQL is the deployment store. `migrations/` holds numbered SQL

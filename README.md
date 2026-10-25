@@ -145,6 +145,45 @@ with a figure verifier, the credit-officer and committee gates with
 coded adverse-action reasons, and the covenant monitoring loop. The
 round map is in `docs/architecture.md`.
 
+## What round 4 adds
+
+The policy pack — lending policy as versioned code (design law 2),
+run against every credit file the pipeline opens:
+
+- **Eight coded tests, each citing the policy it encodes** —
+  maximum leverage by borrower segment (total liabilities over
+  tangible net worth), minimum DSCR for the borrower and, where
+  owners guarantee the facility, for the combined global view,
+  minimum fixed-charge coverage, maximum single-borrower
+  concentration against the bank's stated capital base,
+  required-documents completeness by facility type (the round-1
+  checklist), and age limits on the financial statements and on
+  appraisals. Each test names the exact inputs it reads — a
+  computation figure, or a fact of the credit file — and its
+  severity: blocker or warning.
+- **A third outcome, stated plainly** — besides pass and fail, a
+  test can be *not evaluable*: its input figure could not be
+  computed, no global pack was combined, the document it ages is
+  not on file. The outcome names the missing input. A DSCR the
+  statements cannot support is never a silent pass — the sample
+  borrower's report says exactly that, naming depreciation &
+  amortisation. The eval gate re-checks every figure-test pass
+  against the pack it read; the silent-pass counter is required
+  to be zero.
+- **Version discipline** — evaluating a file pins ONE pack version
+  and records it in the file's policy history; the report is a
+  stored, content-addressed artefact (re-evaluating unchanged
+  inputs reproduces it byte for byte). Two versions ship: v2
+  tightens the minimum DSCR to 1.35×, the hospitality leverage
+  ceiling to 1.75×, and the statement-age limit to 15 months. A
+  borrower at exactly 1.30× passes v1 and fails v2 — and its v1
+  report stays on the record, untouched, because a policy change
+  never silently re-judges an in-flight credit.
+
+Later rounds add cited memo drafting with a figure verifier, the
+credit-officer and committee gates with coded adverse-action
+reasons, and the covenant monitoring loop.
+
 ## The laws (enforced in code, never in prompts)
 
 1. **No model-computed numbers.** Extraction returns values +
