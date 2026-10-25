@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import logging
 from datetime import date
+from decimal import Decimal
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from .checklist import generate_checklist
 from .committee import (
+
     ADVERSE_REASONS_VERSION,
     DEFERRAL_REASONS_VERSION,
     OUTCOMES,
@@ -47,6 +49,16 @@ from .computations import (
     compute_entity_pack,
     compute_global_pack,
 )
+from .covenants import (
+    amendment_record,
+    build_covenant_set,
+    current_covenants,
+    derive_schedule,
+    due_work,
+    frequency_from_cadence,
+    get_covenant_or_raise,
+    validate_amendment,
+)
 from .documents import read_document_verified, register_document
 from .errors import NotFoundError, ValidationError
 from .extraction import OfflineReferenceExtractor, receive_extraction
@@ -58,7 +70,9 @@ from .models import (
     CommitteeDecision,
     CommitteeMember,
     ComputationPack,
+    CovenantAmendment,
     CovenantDefinition,
+    CovenantSet,
     CreditFile,
     CreditFileStatus,
     CreditMemo,
@@ -1395,6 +1409,23 @@ class CreditPipeline:
                 for i, c in enumerate(conditions)
             ]
             stored_conditions = validate_conditions(numbered, inputs)
+            # Round 10: an approval's conditions become covenants.
+            # The scheduler must be able to read every condition's
+            # cadence as a frequency BEFORE the decision is stored —
+            # a condition that cannot be scheduled refuses the
+            # decision here, while nothing has been recorded, not
+            # the covenant set after it.
+            for condition in stored_conditions:
+                if condition.type in (
+                    "financial_covenant", "reporting_requirement"
+                ):
+                    frequency_from_cadence(
+                        condition.due_cadence,
+                        what=(
+                            f"committee condition "
+                            f"{condition.condition_id!r}"
+                        ),
+                    )
         elif conditions:
             raise ValidationError(
                 f"a {outcome} decision carries no conditions; "
@@ -1503,6 +1534,15 @@ class CreditPipeline:
             )
         self._audit(credit_file_id, "committee_decision_recorded", detail,
                     actor=recorder_id)
+        if outcome in ("approve", "approve_with_conditions"):
+            # Round 10 (law 6): an approval starts the facility's
+            # monitoring life. The covenant set is created from
+            # this decision — its conditions plus the policy
+            # template — in the same act, so an approved credit
+            # can never exist without its covenant set.
+            self._create_covenant_set_for_decision(
+                inputs.credit_file, decision, memo, actor=recorder_id
+            )
         return decision
 
     def list_committee_decisions(
@@ -1580,6 +1620,400 @@ class CreditPipeline:
             )
         credit_file = self._load(credit_file_id)
         return render_adverse_action_notice(decision, memo, report, credit_file)
+
+    # -- Covenants (round 10) -----------------------------------------
+    #
+    # Law 6: covenants are clocks + math. An approval creates the
+    # set; the schedule is derived from the set in code, never
+    # stored; the tick records first-seen due/overdue crossings on
+    # the audit trail; amendments supersede, never edit.
+
+    def record_closing(
+        self,
+        credit_file_id: str,
+        *,
+        closing_date: date,
+        actor: str,
+        actor_role: str,
+    ) -> CreditFile:
+        """Record the facility's closing date — the anchor fact
+        every covenant test date derives from.
+
+        Recording is an audited act by a named actor. Re-recording
+        the same date is a no-op. Recording a DIFFERENT date is a
+        correction: the new date governs, and the audit names both
+        dates — the closing date is never silently edited, the
+        same discipline the covenants themselves live under."""
+        require_identity(actor, actor_role, what="a closing record")
+        credit_file = self._load(credit_file_id)
+        if credit_file.closing_date == closing_date:
+            return credit_file
+        previous = credit_file.closing_date
+        updated = credit_file.model_copy(update={
+            "closing_date": closing_date,
+            "updated_at": utcnow(),
+        })
+        self.store.save_credit_file(updated)
+        if previous is None:
+            self._audit(
+                credit_file_id,
+                "facility_closed",
+                f"facility closing recorded: {closing_date.isoformat()} "
+                f"by {actor} ({actor_role}); covenant schedules "
+                "anchor on this date",
+                actor=actor,
+            )
+        else:
+            self._audit(
+                credit_file_id,
+                "closing_date_corrected",
+                f"closing date corrected from {previous.isoformat()} "
+                f"to {closing_date.isoformat()} by {actor} "
+                f"({actor_role}); schedules re-derive from the "
+                "corrected date",
+                actor=actor,
+            )
+        return updated
+
+    def _create_covenant_set_for_decision(
+        self,
+        credit_file: CreditFile,
+        decision: CommitteeDecision,
+        memo: CreditMemo,
+        *,
+        actor: str,
+    ) -> CovenantSet:
+        """Create (once) the covenant set an approval brings into
+        being. Insert-once end to end: a second call for the same
+        decision returns the stored set unchanged."""
+        existing = [
+            s for s in self.store.list_covenant_sets(credit_file.credit_file_id)
+            if s.decision_id == decision.decision_id
+        ]
+        if existing:
+            return existing[0]
+        covenant_set = build_covenant_set(
+            credit_file,
+            decision,
+            policy_version=memo.policy_version,
+            policy_pack_id=memo.policy_pack_id,
+            created_by=actor,
+        )
+        self.store.save_covenant_set(covenant_set)
+        detail = (
+            f"covenant set {covenant_set.set_id} created from "
+            f"decision {decision.decision_id} (memo {decision.memo_id}) "
+            f"under policy pack {covenant_set.policy_pack_id} "
+            f"{covenant_set.policy_version}: "
+            f"{len(covenant_set.covenants)} covenant(s), "
+            f"{len(covenant_set.deliverables)} reporting "
+            f"deliverable(s); state {covenant_set.state}"
+        )
+        if covenant_set.state == "awaiting_closing_date":
+            detail += (
+                "; no closing date on file — the set exists, its "
+                "schedule waits for the closing record"
+            )
+        self._audit(
+            credit_file.credit_file_id,
+            "covenant_set_created",
+            detail,
+            actor=actor,
+        )
+        return covenant_set
+
+    def create_covenant_set(
+        self,
+        credit_file_id: str,
+        *,
+        decision_id: str,
+        actor: str,
+    ) -> CovenantSet:
+        """Create the covenant set for a recorded approval —
+        the explicit form of the act decide_committee performs
+        automatically. Refuses, by name, a decision that is not
+        an approval of a memo on this file."""
+        credit_file = self._load(credit_file_id)
+        decision = self.store.get_committee_decision(decision_id)
+        if decision is None or decision.credit_file_id != credit_file_id:
+            raise NotFoundError(
+                f"committee decision {decision_id} not found on "
+                f"credit file {credit_file_id}"
+            )
+        memo = self._get_memo_raw(credit_file_id, decision.memo_id)
+        return self._create_covenant_set_for_decision(
+            credit_file, decision, memo, actor=actor
+        )
+
+    def list_covenant_sets(
+        self, credit_file_id: str
+    ) -> list[CovenantSet]:
+        self._load(credit_file_id)
+        return self.store.list_covenant_sets(credit_file_id)
+
+    def get_covenant_set(
+        self, credit_file_id: str, set_id: str
+    ) -> CovenantSet:
+        self._load(credit_file_id)
+        covenant_set = self.store.get_covenant_set(set_id)
+        if covenant_set is None or covenant_set.credit_file_id != credit_file_id:
+            raise NotFoundError(
+                f"covenant set {set_id} not found on credit file "
+                f"{credit_file_id}"
+            )
+        return covenant_set
+
+    def list_covenant_amendments(
+        self, credit_file_id: str
+    ) -> list[CovenantAmendment]:
+        self._load(credit_file_id)
+        return self.store.list_covenant_amendments(credit_file_id)
+
+    def _effective_set(
+        self, credit_file: CreditFile, covenant_set: CovenantSet
+    ) -> CovenantSet:
+        """The set as it stands for scheduling: its stored record,
+        with the file's closing date applied when the set was
+        created before one existed. The stored artefact is never
+        rewritten — the derivation reads the current fact, and the
+        set's own pin (the decision, the pack) is untouched."""
+        if covenant_set.closing_date is None and credit_file.closing_date:
+            return covenant_set.model_copy(update={
+                "state": "active",
+                "closing_date": credit_file.closing_date,
+            })
+        return covenant_set
+
+    def _spread_years(self, credit_file_id: str) -> set[int]:
+        """The fiscal years the file's current spread covers —
+        the availability fact the schedule derives states from."""
+        try:
+            spread = self.get_spread(credit_file_id)
+        except NotFoundError:
+            return set()
+        return set(spread.periods)
+
+    def covenant_schedule(
+        self,
+        credit_file_id: str,
+        *,
+        as_of: date,
+        set_id: str | None = None,
+    ) -> dict:
+        """One file's covenant schedule at `as_of`: the set (with
+        its current, amendment-aware covenants), and every derived
+        instance — covenant tests and reporting deliverables —
+        with its state and the inputs it needs named."""
+        credit_file = self._load(credit_file_id)
+        sets = self.store.list_covenant_sets(credit_file_id)
+        if set_id is not None:
+            sets = [s for s in sets if s.set_id == set_id]
+            if not sets:
+                raise NotFoundError(
+                    f"covenant set {set_id} not found on credit "
+                    f"file {credit_file_id}"
+                )
+        amendments = self.store.list_covenant_amendments(credit_file_id)
+        spread_years = self._spread_years(credit_file_id)
+        views = []
+        for covenant_set in sets:
+            effective = self._effective_set(credit_file, covenant_set)
+            current = current_covenants(effective, amendments)
+            derivable = effective.model_copy(update={
+                "covenants": current,
+            })
+            instances = derive_schedule(
+                derivable, as_of=as_of, spread_years=spread_years
+            )
+            views.append({
+                "covenant_set": effective,
+                "current_covenants": current,
+                "instances": instances,
+            })
+        return {
+            "credit_file_id": credit_file_id,
+            "borrower": credit_file.borrower.legal_name,
+            "as_of": as_of,
+            "sets": views,
+        }
+
+    def covenant_due_work(self, *, as_of: date) -> list[dict]:
+        """The portfolio due-work queue at `as_of`: every instance
+        standing at overdue / due / awaiting_inputs / due_soon
+        across every credit file, in the queue's order — what is
+        due, for which borrower, needing which inputs."""
+        queue: list[dict] = []
+        for credit_file in self.store.list_credit_files():
+            schedule = self.covenant_schedule(
+                credit_file.credit_file_id, as_of=as_of
+            )
+            instances = [
+                instance
+                for view in schedule["sets"]
+                for instance in view["instances"]
+            ]
+            for instance in due_work(instances, as_of=as_of):
+                queue.append({
+                    "borrower": credit_file.borrower.legal_name,
+                    "credit_file_id": credit_file.credit_file_id,
+                    "instance": instance,
+                })
+        order = {"overdue": 0, "due": 1, "awaiting_inputs": 2, "due_soon": 3}
+        queue.sort(key=lambda entry: (
+            order[entry["instance"].state],
+            entry["instance"].test_date,
+            entry["instance"].name,
+        ))
+        return queue
+
+    def tick_covenants(
+        self, *, as_of: date, credit_file_id: str | None = None
+    ) -> dict:
+        """The scheduler tick at `as_of`: walk every set's derived
+        schedule and record, on the credit file's audit trail, the
+        first sighting of each instance standing at due or
+        overdue. Idempotent by construction: a crossing already on
+        the audit trail is never recorded twice, so the tick can
+        run as often as the bank likes."""
+        files = (
+            [self._load(credit_file_id)]
+            if credit_file_id is not None
+            else self.store.list_credit_files()
+        )
+        recorded: list[dict] = []
+        checked = 0
+        for credit_file in files:
+            schedule = self.covenant_schedule(
+                credit_file.credit_file_id, as_of=as_of
+            )
+            seen = {
+                (event.action, event.detail)
+                for event in self.store.list_audit(credit_file.credit_file_id)
+            }
+            for view in schedule["sets"]:
+                checked += 1
+                for instance in view["instances"]:
+                    if instance.state not in ("due", "overdue"):
+                        continue
+                    kind_word = (
+                        "covenant test"
+                        if instance.kind == "covenant_test"
+                        else "reporting deliverable"
+                    )
+                    action = (
+                        f"{'covenant_test' if instance.kind == 'covenant_test' else 'covenant_deliverable'}"
+                        f"_{instance.state}"
+                    )
+                    detail = (
+                        f"{kind_word} {instance.instance_id} "
+                        f"({instance.name}, {instance.period_label}, "
+                        f"test date {instance.test_date.isoformat()}) "
+                        f"first seen {instance.state} at as_of "
+                        f"{as_of.isoformat()}"
+                    )
+                    if (action, detail) in seen:
+                        continue
+                    self._audit(
+                        credit_file.credit_file_id, action, detail
+                    )
+                    seen.add((action, detail))
+                    recorded.append({
+                        "credit_file_id": credit_file.credit_file_id,
+                        "borrower": credit_file.borrower.legal_name,
+                        "instance_id": instance.instance_id,
+                        "kind": instance.kind,
+                        "name": instance.name,
+                        "state": instance.state,
+                        "test_date": instance.test_date,
+                        "action": action,
+                    })
+        return {
+            "as_of": as_of,
+            "sets_checked": checked,
+            "crossings_recorded": recorded,
+        }
+
+    def amend_covenant(
+        self,
+        credit_file_id: str,
+        covenant_id: str,
+        *,
+        author_id: str,
+        author_role: str,
+        reason_code: str,
+        decision_id: str,
+        threshold: Decimal | None = None,
+        operator: str | None = None,
+        frequency: str | None = None,
+        grace_days: int | None = None,
+        note: str = "",
+    ) -> CovenantAmendment:
+        """Amend one covenant — by supersession, never by edit.
+
+        Validates the whole discipline in covenants.py (named
+        author with an amending role, coded reason, an authorising
+        approval on this file, a change that changes something),
+        mints the next version, and stores it as a
+        CovenantAmendment beside the untouched set. The set's
+        stored bytes are identical before and after; only the
+        derived current covenants move."""
+        self._load(credit_file_id)
+        amendments = self.store.list_covenant_amendments(credit_file_id)
+        target_set: CovenantSet | None = None
+        current = None
+        for covenant_set in self.store.list_covenant_sets(credit_file_id):
+            try:
+                current = get_covenant_or_raise(
+                    covenant_set, amendments, covenant_id
+                )
+                target_set = covenant_set
+                break
+            except NotFoundError:
+                continue
+        if target_set is None or current is None:
+            raise NotFoundError(
+                f"covenant {covenant_id} not found on credit file "
+                f"{credit_file_id}"
+            )
+        decision = self.store.get_committee_decision(decision_id)
+        amended = validate_amendment(
+            current,
+            author_id=author_id,
+            author_role=author_role,
+            reason_code=reason_code,
+            note=note,
+            decision=decision,
+            new_threshold=threshold,
+            new_operator=operator,
+            new_frequency=frequency,
+            new_grace_days=grace_days,
+        )
+        record = amendment_record(
+            target_set,
+            current,
+            amended,
+            author_id=author_id,
+            author_role=author_role,
+            reason_code=reason_code,
+            decision_id=decision_id,
+            note=note,
+        )
+        self.store.save_covenant_amendment(record)
+        self._audit(
+            credit_file_id,
+            "covenant_amended",
+            f"covenant {current.covenant_id} ({current.name}) "
+            f"amended by {author_id} ({author_role}): "
+            f"{current.operator} {current.threshold} -> "
+            f"{amended.operator} {amended.threshold}, frequency "
+            f"{current.frequency} -> {amended.frequency}, grace "
+            f"{current.grace_days}d -> {amended.grace_days}d; new "
+            f"version {amended.version} is {amended.covenant_id}; "
+            f"reason {reason_code} ({record.amendment_id}); "
+            f"authorised by decision {decision_id}",
+            actor=author_id,
+        )
+        return record
 
     def add_adjustment(
         self, credit_file_id: str, adjustment: SpreadAdjustment

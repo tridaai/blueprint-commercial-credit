@@ -24,8 +24,13 @@ re-presentment requirements), and read the decision record, its
 conditions, and the generated adverse-action notice. Round 8 adds
 the disagreements view: the spread's disagreement records between
 source types — list and detail — with the spread itself carrying
-the flags. Every request carries a request id into the structured
-logs.
+the flags. Round 9 adds committee readiness: the per-file report
+and its outstanding-items rendering. Round 10 adds covenants:
+recording the facility closing date, the covenant sets approvals
+create, the derived schedule (test dates, states, named required
+inputs) at a requested as_of, the portfolio due-work queue, the
+scheduler tick, and covenant amendment by supersession. Every
+request carries a request id into the structured logs.
 """
 
 from __future__ import annotations
@@ -748,4 +753,158 @@ def get_adverse_action_notice(credit_file_id: str, memo_id: str) -> dict:
         "memo_id": memo_id,
         "decision_id": declines[-1].decision_id if declines else None,
         "text": text,
+    }
+
+
+# -- covenants (round 10) ---------------------------------------------
+# The closing record, the sets approvals create, the derived
+# schedule, the due-work queue, the scheduler tick, and amendment by
+# supersession. Nothing here edits a covenant: the amendment route
+# records a new version beside the old, exactly as the pipeline does.
+
+
+class RecordClosingRequest(BaseModel):
+    closing_date: date
+    actor: str
+    actor_role: str
+
+
+@app.post("/applications/{credit_file_id}/closing", status_code=201)
+def record_closing(credit_file_id: str, body: RecordClosingRequest) -> dict:
+    _file_or_404(credit_file_id)
+    credit_file = pipeline.record_closing(
+        credit_file_id,
+        closing_date=body.closing_date,
+        actor=body.actor,
+        actor_role=body.actor_role,
+    )
+    return credit_file.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/covenant-sets")
+def list_covenant_sets(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return [
+        s.model_dump(mode="json")
+        for s in pipeline.list_covenant_sets(credit_file_id)
+    ]
+
+
+@app.get("/applications/{credit_file_id}/covenant-sets/{set_id}")
+def get_covenant_set(credit_file_id: str, set_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    return pipeline.get_covenant_set(
+        credit_file_id, set_id
+    ).model_dump(mode="json")
+
+
+def _schedule_view(schedule: dict) -> dict:
+    return {
+        "credit_file_id": schedule["credit_file_id"],
+        "borrower": schedule["borrower"],
+        "as_of": schedule["as_of"].isoformat(),
+        "sets": [
+            {
+                "covenant_set": view["covenant_set"].model_dump(mode="json"),
+                "current_covenants": [
+                    c.model_dump(mode="json")
+                    for c in view["current_covenants"]
+                ],
+                "instances": [
+                    i.model_dump(mode="json") for i in view["instances"]
+                ],
+            }
+            for view in schedule["sets"]
+        ],
+    }
+
+
+@app.get("/applications/{credit_file_id}/covenant-schedule")
+def get_covenant_schedule(
+    credit_file_id: str, as_of: date, set_id: str | None = None
+) -> dict:
+    _file_or_404(credit_file_id)
+    schedule = pipeline.covenant_schedule(
+        credit_file_id, as_of=as_of, set_id=set_id
+    )
+    return _schedule_view(schedule)
+
+
+@app.get("/applications/{credit_file_id}/covenant-amendments")
+def list_covenant_amendments(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return [
+        a.model_dump(mode="json")
+        for a in pipeline.list_covenant_amendments(credit_file_id)
+    ]
+
+
+class AmendCovenantRequest(BaseModel):
+    author_id: str
+    author_role: str
+    reason_code: str
+    decision_id: str
+    threshold: Decimal | None = None
+    operator: str | None = None
+    frequency: str | None = None
+    grace_days: int | None = None
+    note: str = ""
+
+
+@app.post(
+    "/applications/{credit_file_id}/covenants/{covenant_id}/amendments",
+    status_code=201,
+)
+def amend_covenant(
+    credit_file_id: str, covenant_id: str, body: AmendCovenantRequest
+) -> dict:
+    _file_or_404(credit_file_id)
+    record = pipeline.amend_covenant(
+        credit_file_id,
+        covenant_id,
+        author_id=body.author_id,
+        author_role=body.author_role,
+        reason_code=body.reason_code,
+        decision_id=body.decision_id,
+        threshold=body.threshold,
+        operator=body.operator,
+        frequency=body.frequency,
+        grace_days=body.grace_days,
+        note=body.note,
+    )
+    return record.model_dump(mode="json")
+
+
+@app.get("/covenant-due-work")
+def get_covenant_due_work(as_of: date) -> list[dict]:
+    return [
+        {
+            "borrower": entry["borrower"],
+            "credit_file_id": entry["credit_file_id"],
+            "instance": entry["instance"].model_dump(mode="json"),
+        }
+        for entry in pipeline.covenant_due_work(as_of=as_of)
+    ]
+
+
+class CovenantTickRequest(BaseModel):
+    as_of: date
+    credit_file_id: str | None = None
+
+
+@app.post("/covenant-scheduler/tick")
+def tick_covenants(body: CovenantTickRequest) -> dict:
+    result = pipeline.tick_covenants(
+        as_of=body.as_of, credit_file_id=body.credit_file_id
+    )
+    return {
+        "as_of": result["as_of"].isoformat(),
+        "sets_checked": result["sets_checked"],
+        "crossings_recorded": [
+            {
+                **crossing,
+                "test_date": crossing["test_date"].isoformat(),
+            }
+            for crossing in result["crossings_recorded"]
+        ],
     }
