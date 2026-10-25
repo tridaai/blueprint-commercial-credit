@@ -14,7 +14,14 @@ import threading
 from pathlib import Path
 
 from .errors import StoreUnavailableError
-from .models import AuditEvent, CreditFile, ExtractedValue, Spread, SpreadAdjustment
+from .models import (
+    AuditEvent,
+    ComputationPack,
+    CreditFile,
+    ExtractedValue,
+    Spread,
+    SpreadAdjustment,
+)
 
 
 class InMemoryCreditStore:
@@ -25,6 +32,8 @@ class InMemoryCreditStore:
         self._adjustments: dict[str, list[SpreadAdjustment]] = {}
         self._spreads: dict[str, dict[str, Spread]] = {}
         self._spread_order: dict[str, list[str]] = {}
+        self._packs: dict[str, ComputationPack] = {}
+        self._pack_order: dict[str, list[str]] = {}
 
     def save_credit_file(self, credit_file: CreditFile) -> None:
         self._files[credit_file.credit_file_id] = credit_file.model_copy(deep=True)
@@ -80,6 +89,24 @@ class InMemoryCreditStore:
             for spread_id in self._spread_order.get(credit_file_id, [])
         ]
 
+    def save_computation_pack(self, pack: ComputationPack) -> None:
+        # Content-addressed: the same pack id is the same artefact.
+        # Storing it twice records it once.
+        if pack.pack_id in self._packs:
+            return
+        self._packs[pack.pack_id] = pack.model_copy(deep=True)
+        self._pack_order.setdefault(pack.credit_file_id, []).append(pack.pack_id)
+
+    def get_computation_pack(self, pack_id: str) -> ComputationPack | None:
+        pack = self._packs.get(pack_id)
+        return pack.model_copy(deep=True) if pack else None
+
+    def list_computation_packs(self, credit_file_id: str) -> list[ComputationPack]:
+        return [
+            self._packs[pack_id].model_copy(deep=True)
+            for pack_id in self._pack_order.get(credit_file_id, [])
+        ]
+
     def ping(self) -> bool:
         return True
 
@@ -108,6 +135,9 @@ class SqliteCreditStore:
                 credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS spreads (
                 spread_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS computation_packs (
+                pack_id TEXT PRIMARY KEY,
                 credit_file_id TEXT NOT NULL, payload TEXT NOT NULL);
             """
         )
@@ -200,6 +230,29 @@ class SqliteCreditStore:
             (credit_file_id,),
         ).fetchall()
         return [Spread.model_validate_json(r[0]) for r in rows]
+
+    def save_computation_pack(self, pack: ComputationPack) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO computation_packs (pack_id, credit_file_id, payload) "
+                "VALUES (?, ?, ?) ON CONFLICT(pack_id) DO NOTHING",
+                (pack.pack_id, pack.credit_file_id, pack.model_dump_json()),
+            )
+
+    def get_computation_pack(self, pack_id: str) -> ComputationPack | None:
+        row = self._conn.execute(
+            "SELECT payload FROM computation_packs WHERE pack_id = ?",
+            (pack_id,),
+        ).fetchone()
+        return ComputationPack.model_validate_json(row[0]) if row else None
+
+    def list_computation_packs(self, credit_file_id: str) -> list[ComputationPack]:
+        rows = self._conn.execute(
+            "SELECT payload FROM computation_packs WHERE credit_file_id = ? "
+            "ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [ComputationPack.model_validate_json(r[0]) for r in rows]
 
     def ping(self) -> bool:
         try:
@@ -385,6 +438,44 @@ class PostgresCreditStore:
             payload = row["payload"]
             out.append(
                 Spread.model_validate(
+                    payload if isinstance(payload, dict) else json.loads(payload)
+                )
+            )
+        return out
+
+    def save_computation_pack(self, pack: ComputationPack) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO computation_packs (pack_id, credit_file_id, payload) "
+                "VALUES (%s, %s, %s::jsonb) ON CONFLICT (pack_id) DO NOTHING",
+                (pack.pack_id, pack.credit_file_id, pack.model_dump_json()),
+            )
+
+    def get_computation_pack(self, pack_id: str) -> ComputationPack | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM computation_packs WHERE pack_id = %s",
+                (pack_id,),
+            ).fetchone()
+        if not row:
+            return None
+        payload = row["payload"]
+        return ComputationPack.model_validate(
+            payload if isinstance(payload, dict) else json.loads(payload)
+        )
+
+    def list_computation_packs(self, credit_file_id: str) -> list[ComputationPack]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM computation_packs WHERE credit_file_id = %s "
+                "ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append(
+                ComputationPack.model_validate(
                     payload if isinstance(payload, dict) else json.loads(payload)
                 )
             )

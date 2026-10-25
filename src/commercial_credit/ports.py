@@ -15,6 +15,7 @@ from typing import Protocol, runtime_checkable
 from .models import (
     AuditEvent,
     Borrower,
+    ComputationPack,
     CreditFile,
     ExtractedValue,
     FacilityRequest,
@@ -88,5 +89,13 @@ class CreditFileStore(Protocol):
     def get_latest_spread(self, credit_file_id: str) -> Spread | None: ...
 
     def list_spreads(self, credit_file_id: str) -> list[Spread]: ...
+
+    def save_computation_pack(self, pack: ComputationPack) -> None: ...
+
+    def get_computation_pack(self, pack_id: str) -> ComputationPack | None: ...
+
+    def list_computation_packs(
+        self, credit_file_id: str
+    ) -> list[ComputationPack]: ...
 
     def ping(self) -> bool: ...

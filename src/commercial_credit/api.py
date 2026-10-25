@@ -5,7 +5,11 @@ or inline borrower + facility), the generated checklist, document
 registration with hash recording, verified reads, the extraction
 pass, and the audit trail. Round 2 adds the spread: the multi-period
 spread for a credit file, its adjustments, and the adjusted view.
-Every request carries a request id into the structured logs.
+Round 3 adds computations: the deterministic engine's pack for a
+credit file (with supplemental figures and covenant definitions the
+caller hands in), stored packs by id, and the global cash-flow view
+combining the borrower with guarantor spreads. Every request
+carries a request id into the structured logs.
 """
 
 from __future__ import annotations
@@ -27,9 +31,13 @@ from .logging_setup import configure_logging, request_id_var
 from .models import (
     AdjustmentReasonCode,
     Borrower,
+    CovenantDefinition,
     DocumentKind,
+    Elimination,
+    ExtractedValue,
     FacilityRequest,
     Provenance,
+    Spread,
     SpreadAdjustment,
 )
 from .pipeline import CreditPipeline
@@ -235,3 +243,78 @@ def add_adjustment(credit_file_id: str, body: AddAdjustmentRequest) -> dict:
         "adjustment": adjustment.model_dump(mode="json"),
         "spread": spread.model_dump(mode="json"),
     }
+
+
+class ComputeRequest(BaseModel):
+    view: str = "adjusted"
+    supplemental: list[ExtractedValue] = []
+    covenant_definitions: list[CovenantDefinition] = []
+
+
+@app.get("/applications/{credit_file_id}/computations")
+def get_computations(credit_file_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    pack = pipeline.compute_metrics(credit_file_id)
+    return pack.model_dump(mode="json")
+
+
+@app.post("/applications/{credit_file_id}/computations", status_code=201)
+def compute(credit_file_id: str, body: ComputeRequest) -> dict:
+    _file_or_404(credit_file_id)
+    pack = pipeline.compute_metrics(
+        credit_file_id,
+        view=body.view,
+        supplemental=body.supplemental,
+        covenant_definitions=body.covenant_definitions,
+    )
+    return pack.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/computations/packs")
+def list_computation_packs(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return [
+        p.model_dump(mode="json")
+        for p in store.list_computation_packs(credit_file_id)
+    ]
+
+
+@app.get("/applications/{credit_file_id}/computations/{pack_id}")
+def get_computation_pack(credit_file_id: str, pack_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    pack = store.get_computation_pack(pack_id)
+    if pack is None or pack.credit_file_id != credit_file_id:
+        raise NotFoundError(f"computation pack {pack_id} not found")
+    return pack.model_dump(mode="json")
+
+
+class GuarantorSpreadInput(BaseModel):
+    entity: str
+    spread: Spread
+    extractions: list[ExtractedValue] = []
+
+
+class GlobalComputeRequest(BaseModel):
+    view: str = "adjusted"
+    guarantors: list[GuarantorSpreadInput] = []
+    eliminations: list[Elimination] = []
+    expected_guarantors: list[str] = []
+    exclude_missing_guarantors: bool = False
+
+
+@app.post(
+    "/applications/{credit_file_id}/computations/global", status_code=201
+)
+def compute_global(credit_file_id: str, body: GlobalComputeRequest) -> dict:
+    _file_or_404(credit_file_id)
+    pack = pipeline.compute_global(
+        credit_file_id,
+        guarantor_spreads={
+            g.entity: (g.spread, g.extractions) for g in body.guarantors
+        },
+        eliminations=body.eliminations,
+        expected_guarantors=body.expected_guarantors,
+        exclude_missing_guarantors=body.exclude_missing_guarantors,
+        view=body.view,
+    )
+    return pack.model_dump(mode="json")
