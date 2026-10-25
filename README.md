@@ -338,8 +338,9 @@ codes tied to evidence (design law 3):
   in_committee → committee_approved |
   committee_approved_conditional | declined | deferred.
 
-Later rounds add staleness blocks and the covenant monitoring
-loop that schedules round 7's conditions.
+Round 9 gates this transition on committee readiness (below);
+later rounds add the covenant monitoring loop that schedules
+round 7's conditions.
 
 ## What round 8 adds
 
@@ -413,8 +414,74 @@ that, end to end:
   disagreements are content of the spread artefact, stored in
   its payload like the packs and memos.
 
-Later rounds add staleness blocks (round 9) and the covenant
-monitoring loop that schedules round 7's conditions.
+## What round 9 adds
+
+Committee readiness — design law 7 made mechanical. A memo may
+be impeccable and its file still unfit for the committee: a tax
+return missing, statements gone stale, a figure the computation
+could not produce. This round is the engine that says so, in one
+place, before anyone convenes:
+
+- **One consolidated ReadinessReport** — a content-addressed,
+  stored artefact (migration `0008`) listing every required
+  input for the file's facility type with its state:
+  `present_fresh`, `present_stale` (with the age and the limit it
+  breached), `missing`, or `not_evaluable_input` (a figure the
+  computation needs that is not computable, naming the missing
+  source input). Three requirement sources are consolidated, not
+  listed separately: the round 1 policy-cited checklist, the
+  round 4 policy pack's statement-age and appraisal limits, and
+  the computation pack's not-computable figures — each entry
+  linked to the policy tests that read it.
+- **Freshness rules are data** — statement age reads its limit
+  from the pinned policy pack's `financial_statement_age` test
+  (18 months under v1, 15 under v2 — the same file reads
+  differently under each, from the pack, never from a constant);
+  appraisals read the pack's `appraisal_age` limit; insurance
+  certificates (12 months), tax returns (18) and interim
+  statements (6) carry theirs in a versioned readiness policy
+  (`aldergrove-readiness` v1). A policy test that *fails* is not
+  a blocker — it is credit judgment, carried as a memo exception.
+  A test that does not apply to the file at all (a global test on
+  an unguaranteed facility) is not entered either. Figure gaps
+  block for the pack's latest fiscal period — the period the
+  tests and the memo read; an earlier period's gap (the first
+  year's debt service needs a pre-window year the checklist does
+  not require) is recorded with its missing input named, and does
+  not block.
+- **The block** — the round 7 convene action recomputes
+  readiness at convene time, over the memo's pinned artefacts and
+  the file as it stands, and refuses while any blocker stands.
+  The refusal **names every blocker** — key, label, state,
+  detail — and the API surfaces that text in the 422 body. A
+  report minted earlier cannot bless the convene: computed
+  fresh-at-2026, the same file is refused at 2028 when its
+  statements have aged past the limit. Officer approval (round
+  6) still lands on a blocked file — but the approval event and
+  the MemoDiff carry the readiness report id and blocker count,
+  so the block is on the record from that moment, never a
+  surprise at convene.
+- **No waivers** — a blocker clears only when the input itself
+  refreshes: a new appraisal received makes the stale-appraisal
+  blocker clear, and nothing else does. There is deliberately no
+  override flag, no note-waiver, no waive method anywhere in the
+  codebase — the tests and evals prove the surface does not
+  exist (a caller passing a waiver keyword is refused by the
+  signature itself). The only exception path remains the
+  committee's own conditional approval or deferral (round 7) —
+  a credit decision about a *ready* file, never a readiness
+  override.
+- **The borrower-facing list** — the report renders the named
+  outstanding-items list an RM would send ("Business tax
+  returns: not on file."), generated from the blocker entries,
+  never hand-typed, so the ask can never drift from the block.
+  New API surface: `GET /applications/{id}/readiness-report`
+  (current, computed at `?as_of=`), `GET
+  /applications/{id}/readiness-reports[/{report_id}]`, and `GET
+  /applications/{id}/outstanding-items`.
+
+Later rounds add the covenant monitoring loop that schedules
+round 7's conditions.
 
 ## The laws (enforced in code, never in prompts)
 
