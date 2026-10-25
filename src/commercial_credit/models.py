@@ -310,7 +310,7 @@ def require_valid_adjustment(adjustment: SpreadAdjustment) -> None:
     """Receiving-side check for adjustments, defence in depth behind
     the model validators (which a model_construct call can bypass).
     Raises ValidationError on the first defect found."""
-    if adjustment.source is None:
+    if not isinstance(adjustment.source, Provenance):
         raise ValidationError(
             f"adjustment {adjustment.adjustment_id} has no source provenance"
         )
