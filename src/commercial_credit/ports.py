@@ -15,6 +15,7 @@ from typing import Protocol, runtime_checkable
 from .models import (
     AuditEvent,
     Borrower,
+    CommitteeDecision,
     ComputationPack,
     CreditFile,
     CreditMemo,
@@ -129,5 +130,15 @@ class CreditFileStore(Protocol):
     def get_memo_diff_by_final(self, memo_id: str) -> MemoDiff | None: ...
 
     def list_memo_diffs(self, credit_file_id: str) -> list[MemoDiff]: ...
+
+    def save_committee_decision(self, decision: CommitteeDecision) -> None: ...
+
+    def get_committee_decision(
+        self, decision_id: str
+    ) -> CommitteeDecision | None: ...
+
+    def list_committee_decisions(
+        self, credit_file_id: str, memo_id: str | None = None
+    ) -> list[CommitteeDecision]: ...
 
     def ping(self) -> bool: ...

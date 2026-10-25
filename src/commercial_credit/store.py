@@ -16,6 +16,7 @@ from pathlib import Path
 from .errors import StoreUnavailableError
 from .models import (
     AuditEvent,
+    CommitteeDecision,
     ComputationPack,
     CreditFile,
     CreditMemo,
@@ -45,6 +46,8 @@ class InMemoryCreditStore:
         self._review_events: dict[str, list[MemoReviewEvent]] = {}
         self._diffs: dict[str, MemoDiff] = {}
         self._diff_order: dict[str, list[str]] = {}
+        self._decisions: dict[str, CommitteeDecision] = {}
+        self._decision_order: dict[str, list[str]] = {}
 
     def save_credit_file(self, credit_file: CreditFile) -> None:
         self._files[credit_file.credit_file_id] = credit_file.model_copy(deep=True)
@@ -197,6 +200,33 @@ class InMemoryCreditStore:
             for diff_id in self._diff_order.get(credit_file_id, [])
         ]
 
+    def save_committee_decision(self, decision: CommitteeDecision) -> None:
+        # Append-only and content-addressed: a recorded decision is
+        # never rewritten; a deferral superseded at re-presentment
+        # is a second record, not an edit of the first.
+        if decision.decision_id in self._decisions:
+            return
+        self._decisions[decision.decision_id] = decision.model_copy(deep=True)
+        self._decision_order.setdefault(decision.credit_file_id, []).append(
+            decision.decision_id
+        )
+
+    def get_committee_decision(
+        self, decision_id: str
+    ) -> CommitteeDecision | None:
+        decision = self._decisions.get(decision_id)
+        return decision.model_copy(deep=True) if decision else None
+
+    def list_committee_decisions(
+        self, credit_file_id: str, memo_id: str | None = None
+    ) -> list[CommitteeDecision]:
+        return [
+            self._decisions[decision_id].model_copy(deep=True)
+            for decision_id in self._decision_order.get(credit_file_id, [])
+            if memo_id is None
+            or self._decisions[decision_id].memo_id == memo_id
+        ]
+
     def ping(self) -> bool:
         return True
 
@@ -243,6 +273,10 @@ class SqliteCreditStore:
                 diff_id TEXT PRIMARY KEY,
                 credit_file_id TEXT NOT NULL, from_memo_id TEXT NOT NULL,
                 to_memo_id TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS committee_decisions (
+                decision_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, memo_id TEXT NOT NULL,
+                outcome TEXT NOT NULL, payload TEXT NOT NULL);
             """
         )
         self._conn.commit()
@@ -468,6 +502,46 @@ class SqliteCreditStore:
             (credit_file_id,),
         ).fetchall()
         return [MemoDiff.model_validate_json(r[0]) for r in rows]
+
+    def save_committee_decision(self, decision: CommitteeDecision) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO committee_decisions (decision_id, credit_file_id, memo_id, outcome, payload) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(decision_id) DO NOTHING",
+                (
+                    decision.decision_id,
+                    decision.credit_file_id,
+                    decision.memo_id,
+                    decision.outcome,
+                    decision.model_dump_json(),
+                ),
+            )
+
+    def get_committee_decision(
+        self, decision_id: str
+    ) -> CommitteeDecision | None:
+        row = self._conn.execute(
+            "SELECT payload FROM committee_decisions WHERE decision_id = ?",
+            (decision_id,),
+        ).fetchone()
+        return CommitteeDecision.model_validate_json(row[0]) if row else None
+
+    def list_committee_decisions(
+        self, credit_file_id: str, memo_id: str | None = None
+    ) -> list[CommitteeDecision]:
+        if memo_id is None:
+            rows = self._conn.execute(
+                "SELECT payload FROM committee_decisions "
+                "WHERE credit_file_id = ? ORDER BY rowid",
+                (credit_file_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT payload FROM committee_decisions "
+                "WHERE credit_file_id = ? AND memo_id = ? ORDER BY rowid",
+                (credit_file_id, memo_id),
+            ).fetchall()
+        return [CommitteeDecision.model_validate_json(r[0]) for r in rows]
 
     def ping(self) -> bool:
         try:
@@ -874,6 +948,62 @@ class PostgresCreditStore:
             payload = row["payload"]
             out.append(
                 MemoDiff.model_validate(
+                    payload if isinstance(payload, dict) else json.loads(payload)
+                )
+            )
+        return out
+
+    def save_committee_decision(self, decision: CommitteeDecision) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO committee_decisions (decision_id, credit_file_id, memo_id, outcome, payload) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb) ON CONFLICT (decision_id) DO NOTHING",
+                (
+                    decision.decision_id,
+                    decision.credit_file_id,
+                    decision.memo_id,
+                    decision.outcome,
+                    decision.model_dump_json(),
+                ),
+            )
+
+    def get_committee_decision(
+        self, decision_id: str
+    ) -> CommitteeDecision | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM committee_decisions WHERE decision_id = %s",
+                (decision_id,),
+            ).fetchone()
+        if not row:
+            return None
+        payload = row["payload"]
+        return CommitteeDecision.model_validate(
+            payload if isinstance(payload, dict) else json.loads(payload)
+        )
+
+    def list_committee_decisions(
+        self, credit_file_id: str, memo_id: str | None = None
+    ) -> list[CommitteeDecision]:
+        with self._connect() as conn:
+            if memo_id is None:
+                rows = conn.execute(
+                    "SELECT payload FROM committee_decisions "
+                    "WHERE credit_file_id = %s ORDER BY id",
+                    (credit_file_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT payload FROM committee_decisions "
+                    "WHERE credit_file_id = %s AND memo_id = %s "
+                    "ORDER BY id",
+                    (credit_file_id, memo_id),
+                ).fetchall()
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append(
+                CommitteeDecision.model_validate(
                     payload if isinstance(payload, dict) else json.loads(payload)
                 )
             )
