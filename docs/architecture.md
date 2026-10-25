@@ -148,8 +148,62 @@ pipeline's policy node evaluates under the current version at
 intake; `CreditPipeline.evaluate_policy` pins a version explicitly
 and appends a `PolicyHistoryEntry` (pack, version, report id,
 as-of) to the credit file the first time those inputs are seen.
-The memo (round 5) will quote the report and its pinned version;
+The memo (round 5) quotes the report and its pinned version;
 the gates (rounds 6–7) will read blocker failures from it.
+
+## Memo drafting and the figure verifier (round 5)
+
+`memo.py` turns the pinned artefacts into the draft credit memo —
+and is where design law 1 is enforced hardest, because prose is
+where figures escape their provenance. A `CreditMemo` is a stored,
+content-addressed artefact (migration 0005): its header pins the
+borrower and facility, the spread id, the computation pack id, the
+policy pack id + version and the report id, and the report's as-of
+date. Its sections are fixed in shape: request summary, borrower
+overview, financial analysis (per-period narrative plus spread and
+computed-measures tables), strengths, risks and mitigants, policy
+exceptions, and two placeholders — recommendation and conditions —
+that the credit officer completes at the gate (round 6). The memo
+states facts and policy outcomes; it never recommends.
+
+Drafting goes through a composer port with named profiles. The
+default `offline` profile is deterministic: it assembles the
+narrative from the structured artefacts, formatting every figure
+through the module's helpers (`fmt_money`, `fmt_ratio`,
+`fmt_percent`), so the same inputs reproduce the identical memo,
+id included. A `live` profile is defined behind the same port for
+a model-backed drafter and refuses to compose until a provider key
+is wired — there is no silent fallback.
+
+The verifier is code over the final rendered text, not over the
+composer's intentions. Rendering produces the memo exactly as read
+(header, sections, tables); artefact ids and pack versions are
+rendered in code spans and are not figures, and neither are ISO
+dates, FY tags or policy section references. Everything else
+numeric — $-amounts, ×-ratios, percents, bare counts — is
+extracted and must equal a value in the trace universe built from
+the pinned inputs: computation-pack figures, covenant results and
+supplemental inputs; spread line values in both views and their
+period changes; policy thresholds, the values the tests read, and
+pack facts such as the capital base; and stated facts of the
+credit file (facility amount and term, years in business,
+guarantor ownership, checklist and document counts, fiscal
+years). An untraceable figure refuses the memo — it is never
+stored as a draft — and the refusal names the figures. The traces
+that cleared (figure as rendered → source artefact + field, per
+occurrence) are stored with the memo as its verification record
+and served by the API.
+
+Exceptions integrity is structural, not editorial: the exceptions
+section carries the test ids it accounts for, and the verifier
+requires them to be exactly the pinned report's non-pass outcomes.
+A dropped blocker fail — or a not_evaluable rewritten as a pass —
+fails verification even when every figure in the doctored text
+still traces. The pipeline's memo node composes at intake from
+the policy node's report; `CreditPipeline.compose_memo` pins a
+report or a pack version explicitly, stores the memo
+content-addressed, and audits `memo_composed` the first time
+those inputs are seen.
 
 ## Storage
 

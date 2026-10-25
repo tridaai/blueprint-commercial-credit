@@ -184,6 +184,52 @@ Later rounds add cited memo drafting with a figure verifier, the
 credit-officer and committee gates with coded adverse-action
 reasons, and the covenant monitoring loop.
 
+## What round 5 adds
+
+Memo drafting — and the figure verifier that decides whether a
+draft may exist at all:
+
+- **A structured draft memo, pinned to its sources** — a stored,
+  content-addressed artefact (migration 0005) whose header pins
+  the spread, the computation pack, the policy pack and version,
+  the policy report and its as-of date, all by id. Sections:
+  request summary, borrower overview, financial analysis
+  (per-period narrative plus spread and computed-measures
+  tables), strengths, risks and mitigants, policy exceptions,
+  and placeholders for the recommendation and the conditions —
+  the memo states facts and policy outcomes; the recommendation
+  is the credit officer's to make, at the gate in round 6.
+- **The figure verifier (design law 1, enforced on prose)** —
+  before a memo can be stored as a draft, every numeric figure
+  in its final rendered text and tables is extracted and traced:
+  it must equal a figure in the pinned computation pack, a
+  spread line value, a policy threshold or outcome value, or a
+  stated fact of the credit file. One untraceable figure — a
+  number altered by a cent, a transposed ratio, a figure
+  invented out of thin air — and the memo is refused storage,
+  with the offending figures named. The traces that cleared are
+  stored with the memo as its verification record, so any figure
+  a reader questions can be walked back to its artefact and
+  field through the API.
+- **Exceptions that cannot be dropped or softened** — the
+  exceptions section must account for exactly the pinned
+  report's non-pass outcomes, by test id: every blocker fail and
+  every not_evaluable, carried in full. The check is structural,
+  in the verifier, so a draft that omits one — or rewrites a
+  not_evaluable as a pass — is refused even if every figure in
+  the doctored text still traces.
+- **Drafting behind a profile port** — the default `offline`
+  profile is a deterministic composer that assembles the
+  narrative from the structured artefacts and invents nothing
+  (the eval gate property-checks that across the fixtures); a
+  `live` profile is defined behind the same port for a
+  model-backed drafter, not configured until provider-key
+  handling lands. Whichever profile drafts, the verifier — not
+  the drafter — decides whether the memo may be stored.
+
+Later rounds add the credit-officer and committee gates with
+coded adverse-action reasons, and the covenant monitoring loop.
+
 ## The laws (enforced in code, never in prompts)
 
 1. **No model-computed numbers.** Extraction returns values +
