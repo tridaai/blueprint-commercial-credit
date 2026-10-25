@@ -855,22 +855,22 @@ function breachPanel(ws) {
   const decisions = [];
   for (const mv of ws.memos || []) for (const d of (mv.committee && mv.committee.decisions) || []) decisions.push(d);
   const decisionSelect = h("select", null, decisions.map((d) => h("option", { value: d.decision_id }, d.decision_id.slice(0, 14) + "… · " + d.outcome)));
-  function act(kind, extra) {
+  function act(path, extra, label) {
     const who = requireIdentity(); if (!who) return;
     const body = Object.assign({ actor_id: who.id, actor_role: who.role, note: note.value }, extra || {});
-    runAction(err, () => post(`/applications/${state.fileId}/breach-cases/${select.value}/${kind}`, body), "Breach action recorded: " + kind + ".");
+    runAction(err, () => post(path, body), "Breach action recorded: " + label + ".");
   }
   const children = [
     h("div", { "class": "formrow" }, fieldEl("Open breach", select), fieldEl("Note", note),
-      h("button", { "class": "btn small", type: "button", onClick: () => act("review") }, "Mark under review")),
+      h("button", { "class": "btn small", type: "button", onClick: () => act(`/applications/${state.fileId}/breach-cases/${select.value}/review`, null, "review") }, "Mark under review")),
     h("div", { "class": "formrow" }, fieldEl("Escalation reason (" + state.vocab.breach_reasons.version + ")", escReason),
-      h("button", { "class": "btn small ghost", type: "button", onClick: () => act("escalate", { reason_code: escReason.value }) }, "Escalate")),
+      h("button", { "class": "btn small ghost", type: "button", onClick: () => act(`/applications/${state.fileId}/breach-cases/${select.value}/escalate`, { reason_code: escReason.value }, "escalate") }, "Escalate")),
     h("div", { "class": "formrow" }, fieldEl("Curing test result (a later pass on the same covenant)", cureSelect),
-      h("button", { "class": "btn small ghost", type: "button", onClick: () => act("cure", { cure_result_id: cureSelect.value }) }, "Record cure")),
+      h("button", { "class": "btn small ghost", type: "button", onClick: () => act(`/applications/${state.fileId}/breach-cases/${select.value}/cure`, { cure_result_id: cureSelect.value }, "cure") }, "Record cure")),
     h("div", { "class": "formrow" }, fieldEl("Committee decision authorising the waiver", decisionSelect),
-      h("button", { "class": "btn small ghost", type: "button", onClick: () => act("waive", { decision_id: decisionSelect.value }) }, "Waive on committee authority")),
+      h("button", { "class": "btn small ghost", type: "button", onClick: () => act(`/applications/${state.fileId}/breach-cases/${select.value}/waive`, { decision_id: decisionSelect.value }, "waive") }, "Waive on committee authority")),
     h("div", { "class": "formrow" }, fieldEl("Default reason (" + state.vocab.breach_reasons.version + ")", defReason),
-      h("button", { "class": "btn small danger", type: "button", onClick: () => act("default", { reason_code: defReason.value }) }, "Move to default path")),
+      h("button", { "class": "btn small danger", type: "button", onClick: () => act(`/applications/${state.fileId}/breach-cases/${select.value}/default`, { reason_code: defReason.value }, "default") }, "Move to default path")),
     err
   ];
   return panel("Breach resolution (round 11)", "A waiver stands only on a committee decision of this file; a cure stands only on a later passing re-test of the same covenant. The API checks both — a free-text waiver cannot be sent from here.", children);
