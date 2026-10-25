@@ -188,6 +188,129 @@ def ground_truth() -> dict[tuple[int, str], Decimal]:
     }
 
 
+# ---------------------------------------------------------------------
+# Round 8: Hartline's other witnesses.
+#
+# The audited statements are not the only documents that report
+# Hartline's FY2024. The tax return tells a lower story — revenue
+# $469,000 under the audit, with cost of goods, gross profit, EBIT
+# and net income following it down — and the management accounts
+# tell a slightly higher one. The audited-vs-tax differences are
+# the material disagreements the round-8 fixture exists to grade;
+# the management differences on inventory and total current assets
+# are real but small, the immaterial control. Operating expenses
+# and interest expense agree across all three sources exactly, so
+# the fixture also proves the engine does not manufacture
+# disagreements where the witnesses concur.
+# ---------------------------------------------------------------------
+
+HARTLINE_TAX_FIGURES: dict[int, dict[str, str]] = {
+    2024: {
+        "revenue": "11905000",
+        "cost_of_goods_sold": "8412000",
+        "gross_profit": "3493000",
+        "operating_expenses": "2814600",
+        "ebit": "678400",
+        "interest_expense": "251700",
+        "net_income": "402300",
+    },
+}
+
+# Management's own FY2024 accounts: the audited figures, except
+# revenue a touch higher and the two balance-sheet lines below.
+HARTLINE_MANAGEMENT_OVERRIDES: dict[int, dict[str, str]] = {
+    2024: {
+        "revenue": "12410000",
+        "inventory": "1945500",
+        "total_current_assets": "3964500",
+    },
+}
+
+
+def tax_return_document(fiscal_year: int) -> bytes:
+    """Hartline's business tax return for a fiscal year, rendered
+    in the same structured shape as the statements: an income
+    statement page whose lines extraction reads with provenance.
+    Only the income statement is rendered — the return's balance
+    sheet detail is not part of this fixture."""
+    figures = HARTLINE_TAX_FIGURES[fiscal_year]
+    rows = [
+        (field, label)
+        for field, label in _INCOME_LABELS
+        if field in figures
+    ]
+    payload = {
+        "document_type": "tax_return",
+        "borrower": "Hartline Manufacturing, Inc.",
+        "fiscal_year": fiscal_year,
+        "period_label": f"FY{fiscal_year}",
+        "basis": "tax",
+        "pages": [
+            {
+                "page": 1,
+                "title": "Tax Return — Income Statement",
+                "lines": [
+                    {"line": idx, "label": label, "value": figures[field]}
+                    for idx, (field, label) in enumerate(rows, start=1)
+                ],
+            }
+        ],
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def management_statement_document(fiscal_year: int) -> bytes:
+    """Hartline's management accounts for a fiscal year: the full
+    statement, internally prepared, declaring a management basis —
+    the document kind is a financial statement, the source type is
+    not the audit."""
+    figures = dict(HARTLINE_FIGURES[fiscal_year])
+    figures.update(HARTLINE_MANAGEMENT_OVERRIDES.get(fiscal_year, {}))
+
+    def page(number: int, title: str, rows: list[tuple[str, str]]) -> dict:
+        return {
+            "page": number,
+            "title": title,
+            "lines": [
+                {"line": idx, "label": label, "value": figures[field]}
+                for idx, (field, label) in enumerate(rows, start=1)
+            ],
+        }
+
+    payload = {
+        "document_type": "financial_statement",
+        "borrower": "Hartline Manufacturing, Inc.",
+        "fiscal_year": fiscal_year,
+        "period_label": f"FY{fiscal_year}",
+        "basis": "management",
+        "pages": [
+            page(1, "Balance Sheet", _BALANCE_SHEET_LABELS),
+            page(2, "Income Statement", _INCOME_LABELS),
+        ],
+    }
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def hartline_disagreement_documents() -> list[dict]:
+    """The round-8 fixture documents as pipeline document ops:
+    Hartline's FY2024 tax return and FY2024 management accounts,
+    to be registered alongside the audited statements."""
+    return [
+        {
+            "kind": "tax_return",
+            "filename": "hartline-fy2024-tax-return.json",
+            "data_hex": tax_return_document(2024).hex(),
+            "period_label": "FY2024",
+        },
+        {
+            "kind": "financial_statement",
+            "filename": "hartline-fy2024-management-statements.json",
+            "data_hex": management_statement_document(2024).hex(),
+            "period_label": "FY2024",
+        },
+    ]
+
+
 class ReferenceLosFeed:
     """Reference LOS feed: the sample application, served by ref.
 
