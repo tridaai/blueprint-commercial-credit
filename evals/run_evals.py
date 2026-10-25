@@ -126,9 +126,41 @@ Round 6 counters — the credit officer gate:
     for_edited_approval     as-is — records its MemoDiff.
                             REQUIRED: 0 missing.
 
-Later rounds add counters (stale-input committee-ready, decline
-without coded reasons) as their machinery lands. Exit code
-0 = GATE: PASS.
+Round 7 counters — the committee gate:
+
+  committee_single_         a committee of one — quorum stated
+    member_accepted         as 1, one member under a quorum of
+                            2, or the approving officer alone —
+                            must each be REFUSED: a quorum is at
+                            least two, mechanically (law 4).
+                            REQUIRED: 0 accepted.
+  committee_decline_        a decline with no adverse-action
+    without_reasons_        reasons, or with only a free-text
+    accepted                note, must be REFUSED: the decline
+                            path carries coded reasons or it does
+                            not exist (law 3). REQUIRED: 0.
+  committee_decline_        a decline reason citing a policy
+    passed_test_accepted    test the memo's pinned report
+                            records as a PASS must be REFUSED,
+                            the offender named. REQUIRED: 0.
+  committee_untraceable_    a decline tied to a figure the memo's
+    accepted                verification record never traced or
+                            to a document that is on file, and a
+                            conditional approval whose covenant
+                            threshold does not trace, must each be
+                            REFUSED. REQUIRED: 0 accepted.
+  committee_decision_on_    convening or deciding the superseded
+    superseded_accepted     draft instead of the officer-final
+                            memo must be REFUSED. REQUIRED: 0.
+  committee_positive_paths  quorum approval; conditional
+                            approval with traced conditions;
+                            decline with tied reasons and a
+                            rendered adverse-action notice; and
+                            defer → re-present → approve on the
+                            same artefact, two decisions on record.
+
+Later rounds add counters (stale-input committee-ready) as
+their machinery lands. Exit code 0 = GATE: PASS.
 """
 
 from __future__ import annotations
@@ -169,8 +201,11 @@ from commercial_credit.memo import (  # noqa: E402
 from commercial_credit.extraction import receive_extraction  # noqa: E402
 from commercial_credit.models import (  # noqa: E402
     AdjustmentReasonCode,
+    AdverseActionReason,
     Borrower,
     BorrowerSegment,
+    CommitteeCondition,
+    CommitteeMember,
     CreditFile,
     DocumentKind,
     Elimination,
@@ -1262,6 +1297,251 @@ def main() -> int:
           f"{'edited approval + return/recompose/approve landed' if gate_positive else 'FAILED'}")
     if not gate_positive:
         failures.append("an officer gate positive path did not land")
+
+    # ---------------------------------------------------------------
+    # Round 7: the committee gate, graded on quorum discipline,
+    # the decline path's coded reasons, and the positive paths.
+    # Three fresh Hartline files (pinned v1, as in round 6): one
+    # takes the refusal probes and then a landed decline; one the
+    # superseded-version probes and a conditional approval; one
+    # the defer → re-present → approve path. Zero tolerance: one
+    # accepted probe fails the gate.
+    # ---------------------------------------------------------------
+    C_OFFICER = "officer-eval"
+    C_OFFICER_ROLE = "credit_officer"
+    C_CHAIR = "chair-eval"
+    C_MEMBER = "member-eval"
+    C_MEMBERS = [
+        CommitteeMember(member_id=C_CHAIR, member_role="committee_chair"),
+        CommitteeMember(member_id=C_MEMBER, member_role="committee_member"),
+    ]
+
+    def _committee_file():
+        pipe = CreditPipeline(
+            store=InMemoryCreditStore(), documents=LocalDocumentStore()
+        )
+        c_borrower, c_facility = ReferenceLosFeed().fetch_application(
+            "LOS-2026-0117"
+        )
+        c_docs = [
+            {
+                "kind": DocumentKind.FINANCIAL_STATEMENT.value,
+                "filename": f"hartline-fy{year}-statements.json",
+                "data_hex": statement_document(year).hex(),
+                "period_label": f"FY{year}",
+            }
+            for year in (2022, 2023, 2024)
+        ]
+        c_file = pipe.open_application(c_borrower, c_facility, documents=c_docs)
+        c_report = pipe.evaluate_policy(
+            c_file.credit_file_id, pack_version="v1", as_of=date(2025, 6, 30)
+        )
+        c_memo = pipe.compose_memo(
+            c_file.credit_file_id, report_id=c_report.report_id
+        )
+        pipe.submit_memo_for_review(
+            c_file.credit_file_id, c_memo.memo_id,
+            actor="rm-eval", actor_role="relationship_manager",
+        )
+        c_final = pipe.approve_memo(
+            c_file.credit_file_id, c_memo.memo_id,
+            officer_id=C_OFFICER, officer_role=C_OFFICER_ROLE,
+        )
+        return pipe, c_file.credit_file_id, c_memo, c_final
+
+    def _decide(pipe, cf, mid, **overrides):
+        kwargs = dict(
+            recorder_id=C_CHAIR, recorder_role="committee_chair",
+            members=list(C_MEMBERS), outcome="approve",
+        )
+        kwargs.update(overrides)
+        return pipe.decide_committee(cf, mid, **kwargs)
+
+    def _refused(fn) -> int:
+        try:
+            fn()
+        except (ValidationError, MemoVerificationError):
+            return 0
+        return 1
+
+    # File 1: the refusal probes, then a properly tied decline.
+    cp1, ccf1, cdraft1, cfinal1 = _committee_file()
+    cp1.convene_committee(
+        ccf1, cfinal1.memo_id, actor=C_OFFICER, actor_role=C_OFFICER_ROLE
+    )
+    single_member = 0
+    single_member += _refused(lambda: _decide(
+        cp1, ccf1, cfinal1.memo_id,
+        members=C_MEMBERS[:1], quorum_required=1,
+    ))
+    single_member += _refused(lambda: _decide(
+        cp1, ccf1, cfinal1.memo_id, members=C_MEMBERS[:1],
+    ))
+    single_member += _refused(lambda: _decide(
+        cp1, ccf1, cfinal1.memo_id,
+        recorder_id=C_OFFICER, recorder_role=C_OFFICER_ROLE,
+        members=[CommitteeMember(
+            member_id=C_OFFICER, member_role=C_OFFICER_ROLE
+        )],
+    ))
+    print(f"committee_single_member_accepted: {single_member} of 3 "
+          f"single-member decisions accepted (required 0)")
+    if single_member:
+        failures.append("the committee gate accepted a single-member decision")
+
+    no_reasons = 0
+    no_reasons += _refused(lambda: _decide(
+        cp1, ccf1, cfinal1.memo_id, outcome="decline",
+    ))
+    no_reasons += _refused(lambda: _decide(
+        cp1, ccf1, cfinal1.memo_id, outcome="decline",
+        note="The committee was not comfortable.",
+    ))
+    print(f"committee_decline_without_reasons_accepted: {no_reasons} "
+          f"of 2 reasonless declines accepted (required 0)")
+    if no_reasons:
+        failures.append("a decline without coded reasons was accepted")
+
+    # Leverage PASSED under v1 (1.5337 vs the 2.00 ceiling).
+    passed_test = _refused(lambda: _decide(
+        cp1, ccf1, cfinal1.memo_id, outcome="decline",
+        adverse_reasons=[AdverseActionReason(
+            code="leverage_above_policy_limit", tie_kind="policy_test",
+            test_id="max_leverage_by_segment",
+        )],
+    ))
+    print(f"committee_decline_passed_test_accepted: {passed_test} of 1 "
+          f"passed-test declines accepted (required 0)")
+    if passed_test:
+        failures.append("a decline citing a passed policy test was accepted")
+
+    untraceable = 0
+    untraceable += _refused(lambda: _decide(
+        cp1, ccf1, cfinal1.memo_id, outcome="decline",
+        adverse_reasons=[AdverseActionReason(
+            code="key_figure_shortfall", tie_kind="figure",
+            figure_text="$9,999,999.99", figure_value="9999999.99",
+            figure_source="computation pack, invented figure",
+        )],
+    ))
+    untraceable += _refused(lambda: _decide(
+        cp1, ccf1, cfinal1.memo_id, outcome="decline",
+        adverse_reasons=[AdverseActionReason(
+            code="required_documentation_missing", tie_kind="file_fact",
+            checklist_item_id="chk-01",  # statements: on file
+        )],
+    ))
+    untraceable += _refused(lambda: _decide(
+        cp1, ccf1, cfinal1.memo_id,
+        outcome="approve_with_conditions",
+        conditions=[CommitteeCondition(
+            condition_id="", type="financial_covenant",
+            metric_key="dscr", operator=">=",
+            threshold=Decimal("1.37"),  # traces to nothing pinned
+            due_cadence="quarterly",
+        )],
+    ))
+    print(f"committee_untraceable_accepted: {untraceable} of 3 "
+          f"untraceable ties/thresholds accepted (required 0)")
+    if untraceable:
+        failures.append("an untraceable decline tie or condition was accepted")
+
+    decline = _decide(
+        cp1, ccf1, cfinal1.memo_id, outcome="decline",
+        adverse_reasons=[
+            AdverseActionReason(
+                code="required_documentation_missing",
+                tie_kind="policy_test",
+                test_id="required_documents_complete",
+            ),
+            AdverseActionReason(
+                code="financial_information_insufficient",
+                tie_kind="policy_test", test_id="min_dscr",
+            ),
+        ],
+    )
+    notice = cp1.get_adverse_action_notice(ccf1, cfinal1.memo_id)
+    decline_ok = (
+        cp1.memo_status(ccf1, cfinal1.memo_id) == "declined"
+        and decline.reason_vocabulary == "adverse-action-reasons-v1"
+        and "NOTICE OF ACTION TAKEN" in notice
+        and "Required documents on file, by facility type" in notice
+        and "depreciation_and_amortization" in notice
+    )
+    print(f"committee_decline_positive_path: "
+          f"{'tied decline landed, notice rendered' if decline_ok else 'FAILED'}")
+    if not decline_ok:
+        failures.append("the tied decline / notice path did not land")
+
+    # File 2: superseded-version probes, then a conditional approval
+    # whose covenant threshold (1.25) is the v1 policy floor itself.
+    cp2, ccf2, cdraft2, cfinal2 = _committee_file()
+    superseded = 0
+    superseded += _refused(lambda: cp2.convene_committee(
+        ccf2, cdraft2.memo_id, actor=C_OFFICER, actor_role=C_OFFICER_ROLE
+    ))
+    superseded += _refused(lambda: _decide(cp2, ccf2, cdraft2.memo_id))
+    print(f"committee_decision_on_superseded_accepted: {superseded} "
+          f"of 2 superseded-version attempts accepted (required 0)")
+    if superseded:
+        failures.append("the committee acted on a superseded memo version")
+
+    cp2.convene_committee(
+        ccf2, cfinal2.memo_id, actor=C_OFFICER, actor_role=C_OFFICER_ROLE
+    )
+    conditional = _decide(
+        cp2, ccf2, cfinal2.memo_id,
+        outcome="approve_with_conditions",
+        conditions=[CommitteeCondition(
+            condition_id="", type="financial_covenant",
+            metric_key="dscr", operator=">=",
+            threshold=Decimal("1.25"), due_cadence="quarterly",
+        )],
+    )
+    conditional_ok = (
+        cp2.memo_status(ccf2, cfinal2.memo_id)
+        == "committee_approved_conditional"
+        and conditional.conditions[0].threshold_trace is not None
+        and "min_dscr" in conditional.conditions[0].threshold_trace
+    )
+    print(f"committee_conditional_positive_path: "
+          f"{'traced conditions stored' if conditional_ok else 'FAILED'}")
+    if not conditional_ok:
+        failures.append("the conditional approval path did not land")
+
+    # File 3: defer (coded, with named requirements), re-present,
+    # approve — two decisions on the one artefact.
+    cp3, ccf3, cdraft3, cfinal3 = _committee_file()
+    cp3.convene_committee(
+        ccf3, cfinal3.memo_id, actor=C_OFFICER, actor_role=C_OFFICER_ROLE
+    )
+    _decide(
+        cp3, ccf3, cfinal3.memo_id, outcome="defer",
+        deferral_reasons=["awaiting_required_documents"],
+        representment_requirements=["chk-03 (Business tax returns) on file"],
+    )
+    deferred_ok = cp3.memo_status(ccf3, cfinal3.memo_id) == "deferred"
+    cp3.convene_committee(
+        ccf3, cfinal3.memo_id, actor=C_OFFICER, actor_role=C_OFFICER_ROLE
+    )
+    _decide(cp3, ccf3, cfinal3.memo_id, outcome="approve")
+    represent_ok = (
+        deferred_ok
+        and cp3.memo_status(ccf3, cfinal3.memo_id) == "committee_approved"
+        and [d.outcome for d in cp3.list_committee_decisions(
+            ccf3, cfinal3.memo_id
+        )] == ["defer", "approve"]
+    )
+    print(f"committee_defer_represent_positive_path: "
+          f"{'defer -> re-present -> approve landed' if represent_ok else 'FAILED'}")
+    if not represent_ok:
+        failures.append("the defer / re-present path did not land")
+
+    committee_positive = decline_ok and conditional_ok and represent_ok
+    print(f"committee_positive_paths: "
+          f"{'approve/conditional/decline/defer-represent landed' if committee_positive else 'FAILED'}")
+    if not committee_positive:
+        failures.append("a committee positive path did not land")
 
     if failures:
         print("GATE: FAIL")
