@@ -83,9 +83,31 @@ Round 4 counters — the policy pack:
                             same pinned version over unchanged
                             inputs reproduces the identical report.
 
-Later rounds add counters (untraceable memo figure, stale-input
-committee-ready, decline without coded reasons) as their machinery
-lands. Exit code 0 = GATE: PASS.
+Round 5 counters — memo drafting + the figure verifier:
+
+  memo_figure_trace_        every figure in every composed memo's
+    completeness            rendered text carries a trace into the
+                            pinned artefacts, re-extracted here from
+                            the rendered text itself. REQUIRED:
+                            100% — one untraced figure fails.
+  memo_untraceable_         tamper cases — a figure altered by one
+    acceptance              cent, a transposed ratio, an invented
+                            figure — must each be REFUSED by the
+                            verifier. REQUIRED: 0 accepted.
+  memo_exceptions_omission  the exceptions section of every graded
+                            memo accounts for exactly its report's
+                            non-pass outcomes, by test id; a memo
+                            tampered to drop one must be refused.
+                            REQUIRED: 0 omissions.
+  memo_determinism          composing over identical inputs
+                            reproduces the identical memo id.
+  memo_composer_figure_     property check across the fixtures:
+    discipline              every number the offline composer emits
+                            exists in the inputs it composed from.
+
+Later rounds add counters (stale-input committee-ready, decline
+without coded reasons) as their machinery lands. Exit code
+0 = GATE: PASS.
 """
 
 from __future__ import annotations
@@ -109,7 +131,19 @@ from commercial_credit.documents import (  # noqa: E402
     read_document_verified,
     register_document,
 )
-from commercial_credit.errors import CreditError, ProvenanceError  # noqa: E402
+from commercial_credit.errors import (  # noqa: E402
+    CreditError,
+    MemoVerificationError,
+    ProvenanceError,
+)
+from commercial_credit.memo import (  # noqa: E402
+    MemoInputs,
+    build_trace_universe,
+    compose_memo,
+    extract_figures,
+    render_memo,
+    verify_memo,
+)
 from commercial_credit.extraction import receive_extraction  # noqa: E402
 from commercial_credit.models import (  # noqa: E402
     AdjustmentReasonCode,
@@ -858,6 +892,163 @@ def main() -> int:
           f"{'identical report on re-evaluation' if deterministic else 'MISMATCH'}")
     if not deterministic:
         failures.append("policy re-evaluation did not reproduce the identical report")
+
+    # ---------------------------------------------------------------
+    # Round 5: memo drafting + the figure verifier. Memos are
+    # composed over the graded artefacts — the seed borrower (pinned
+    # v1 report, via the pipeline), the clean-pass file with its
+    # global pack, the coverage borrower under v1 and v2, and the
+    # leverage-fail file — and graded on trace completeness,
+    # tamper refusal, exceptions integrity, determinism, and the
+    # offline composer's figure discipline.
+    # ---------------------------------------------------------------
+    hartline_inputs = MemoInputs(
+        credit_file=r3.store.get_credit_file(r3_file.credit_file_id),
+        spread=r3.get_spread(r3_file.credit_file_id),
+        pack=hartline_pack,
+        policy_report=hartline_report,
+    )
+    hartline_memo = r3.compose_memo(
+        r3_file.credit_file_id, report_id=hartline_report.report_id
+    )
+    memo_cases: list[tuple[object, MemoInputs]] = [
+        (hartline_memo, hartline_inputs),
+        (None, MemoInputs(
+            credit_file=clean_file, spread=cov_spread, pack=cov_pack,
+            policy_report=clean_report, global_pack=clean_global,
+        )),
+        (None, MemoInputs(
+            credit_file=disc_file, spread=cov_spread, pack=cov_pack,
+            policy_report=v1_report,
+        )),
+        (None, MemoInputs(
+            credit_file=disc_file, spread=cov_spread, pack=cov_pack,
+            policy_report=v2_report,
+        )),
+        (None, MemoInputs(
+            credit_file=_policy_file("cf-eval-levfail"),
+            spread=lev_spread, pack=lev_pack, policy_report=lev_report,
+        )),
+    ]
+    graded_memos = []
+    for memo, inputs in memo_cases:
+        if memo is None:
+            memo = compose_memo(
+                inputs.credit_file, inputs.spread, inputs.pack,
+                inputs.policy_report, global_pack=inputs.global_pack,
+            )
+        graded_memos.append((memo, inputs))
+
+    # Figure-trace completeness, re-extracted from the rendered
+    # text here — the verifier's own count is not taken on trust.
+    figures_total = 0
+    figures_traced = 0
+    for memo, _inputs in graded_memos:
+        extracted = extract_figures(render_memo(memo))
+        figures_total += len(extracted)
+        if len(memo.verification.figures) == len(extracted):
+            figures_traced += len(extracted)
+    trace_completeness = (
+        figures_traced / figures_total if figures_total else 0.0
+    )
+    print(f"memo_figure_trace_completeness: {figures_traced}/{figures_total} "
+          f"= {trace_completeness:.3f} (required 1.000)")
+    if trace_completeness != 1.0:
+        failures.append("a composed memo carries an untraced figure")
+
+    # Composer figure discipline: every number in the rendered text
+    # exists in the inputs the memo was composed from.
+    discipline_violations = 0
+    for memo, inputs in graded_memos:
+        universe = build_trace_universe(inputs)
+        for figure in extract_figures(render_memo(memo)):
+            if figure.value not in universe:
+                discipline_violations += 1
+    print(f"memo_composer_figure_discipline: {discipline_violations} "
+          f"violations over {len(graded_memos)} memos (required 0)")
+    if discipline_violations:
+        failures.append("the offline composer emitted a figure outside its inputs")
+
+    # Tamper cases: each altered memo must be REFUSED, the offender
+    # named. Acceptance of even one fails the gate.
+    def _tamper(memo, section_key, old, new):
+        tampered = memo.model_copy(deep=True)
+        section = tampered.section(section_key)
+        for i, paragraph in enumerate(section.paragraphs):
+            if old in paragraph:
+                section.paragraphs[i] = paragraph.replace(old, new, 1)
+                return tampered
+        for table in section.tables:
+            for r, row in enumerate(table.rows):
+                for c, cell in enumerate(row):
+                    if old in cell:
+                        table.rows[r][c] = cell.replace(old, new, 1)
+                        return tampered
+        raise AssertionError(f"{old!r} not in section {section_key!r}")
+
+    tamper_cases = [
+        _tamper(hartline_memo, "financial_analysis",
+                "$2,202,000.00", "$2,202,000.01"),  # one cent
+        _tamper(hartline_memo, "financial_analysis",
+                "2.2590×", "2.2950×"),  # transposed ratio
+    ]
+    invented = hartline_memo.model_copy(deep=True)
+    invented.section("strengths").paragraphs.append(
+        "The borrower also holds $7,777,777.77 in unencumbered reserves."
+    )
+    tamper_cases.append(invented)
+    accepted = 0
+    for tampered in tamper_cases:
+        try:
+            verify_memo(tampered, hartline_inputs)
+            accepted += 1
+        except MemoVerificationError:
+            pass
+    print(f"memo_untraceable_acceptance: {accepted} of "
+          f"{len(tamper_cases)} tamper cases accepted (required 0)")
+    if accepted:
+        failures.append("the figure verifier accepted a tampered memo")
+
+    # Exceptions integrity: listed == the report's non-pass outcomes
+    # on every graded memo, and a memo tampered to drop one refused.
+    omissions = 0
+    for memo, inputs in graded_memos:
+        expected = [
+            o.test_id for o in inputs.policy_report.non_pass_outcomes()
+        ]
+        if memo.verification.exceptions_listed != expected:
+            omissions += 1
+    dropped = hartline_memo.model_copy(deep=True)
+    dropped_section = dropped.section("policy_exceptions")
+    dropped_section.exception_test_ids.remove("min_dscr")
+    dropped_section.paragraphs = [
+        p for p in dropped_section.paragraphs
+        if not p.startswith("Minimum debt service coverage (borrower)")
+    ]
+    try:
+        verify_memo(dropped, hartline_inputs)
+        omissions += 1  # an omission the verifier accepted
+    except MemoVerificationError:
+        pass
+    print(f"memo_exceptions_omission: {omissions} over "
+          f"{len(graded_memos)} graded memos + 1 drop case (required 0)")
+    if omissions:
+        failures.append("a memo omitted a policy exception")
+
+    # Determinism: identical inputs reproduce the identical memo id.
+    recomposed = compose_memo(
+        disc_file, cov_spread, cov_pack, v1_report
+    )
+    memo_deterministic = (
+        recomposed.memo_id == graded_memos[2][0].memo_id
+        and r3.compose_memo(
+            r3_file.credit_file_id, report_id=hartline_report.report_id
+        ).memo_id == hartline_memo.memo_id
+    )
+    print(f"memo_determinism: "
+          f"{'identical memo id on recomposition' if memo_deterministic else 'MISMATCH'}")
+    if not memo_deterministic:
+        failures.append("memo recomposition did not reproduce the identical memo")
 
     if failures:
         print("GATE: FAIL")
