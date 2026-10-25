@@ -3,16 +3,15 @@
 ## Shape
 
 ```
-LOS ──► intake ──► checklist ──► document intake ──► extraction ──► spreading ──► [later rounds:
-        (LangGraph pipeline)        (S3 port,          (port: values    (template,     computation →
-                                     SHA-256 recorded)   + provenance)   adjustments)   policy → memo →
-                                                                          officer gate →
-                                                                          committee gate →
-                                                                          covenant loop]
+LOS ──► intake ──► checklist ──► document intake ──► extraction ──► spreading ──► computation ──► [later rounds:
+        (LangGraph pipeline)        (S3 port,          (port: values    (template,     (engine:        policy → memo →
+                                     SHA-256 recorded)   + provenance)   adjustments)   ratios, DSCR,   officer gate →
+                                                                                       global CF)      committee gate →
+                                                                                                       covenant loop]
 ```
 
-The pipeline is a LangGraph graph (`pipeline.py`). Rounds 1–2 wire
-the first five nodes end to end; later rounds extend the graph to the
+The pipeline is a LangGraph graph (`pipeline.py`). Rounds 1–3 wire
+the first six nodes end to end; later rounds extend the graph to the
 right, with the two human gates as graph interrupts. The same
 compiled graph serves the API, the demo and the evals — there is one
 spine, not three near-copies.
@@ -24,7 +23,7 @@ spine, not three near-copies.
 | `LosFeed` | application ref → borrower + facility request | `ReferenceLosFeed` (sample application) |
 | `DocumentStore` | put/get/exists over S3-compatible storage | `S3DocumentStore` (boto3), `LocalDocumentStore` (double) |
 | `Extractor` | document → values, **every value with provenance** | `OfflineReferenceExtractor` (generated structured documents) |
-| `CreditFileStore` | credit files, extractions, audit | `PostgresCreditStore`, `SqliteCreditStore`, `InMemoryCreditStore` (doubles) |
+| `CreditFileStore` | credit files, extractions, audit, spreads, computation packs | `PostgresCreditStore`, `SqliteCreditStore`, `InMemoryCreditStore` (doubles) |
 
 Swapping a port implementation is a wiring change (`wiring.py`),
 never a pipeline change.
@@ -70,6 +69,45 @@ extractions remain in the store. Adjustments are validated on receipt
 (`require_valid_adjustment` + taxonomy membership) before they are
 stored, and the spread carries both the unadjusted values and the
 derived adjusted view per line and period.
+
+## Computation (round 3)
+
+`computations.py` is a pure engine over the spread. Its definitions
+are written down in the module itself — debt service is scheduled
+principal (the prior period's current portion of long-term debt)
+plus interest plus capital lease payments when a provenanced figure
+supplies them; EBITDA is operating income plus depreciation &
+amortisation on the pack's view, the R2 adjustments named in its
+derivation; tangible net worth deducts intangibles exactly as the
+statements report them. Two honesty rules apply uniformly: a
+required input that is absent makes the figure *not computable*,
+naming the input (nothing is zero-filled); an optional component
+the statements do not report is recorded as "not reported" and left
+out, so the artefact always shows which components entered.
+
+Every figure carries its derivation as recorded steps. Step inputs
+name spread lines with the provenance chain of the extraction that
+fed the cell (plus adjustment ids and sources on the adjusted
+view), supplemental figures with their provenance, earlier figures,
+or — in a global pack — named eliminations. `verify_trace`
+re-performs each step's arithmetic and walks every chain to its
+leaves; the eval gate requires completeness of 1.000. A run's
+output is a `ComputationPack`, content-addressed like the spread:
+engine version, spread id, view, supplemental figures and covenant
+definitions hash into the pack id, so recomputation converges on
+the stored artefact (migration 0003) instead of duplicating it.
+
+Global cash flow combines entity packs — the borrower's and one per
+guarantor spread — applying eliminations as first-class records: an
+elimination names its amount, its target (combined cash flow or
+combined debt service) and its reason, and an unexplained one is
+refused on receipt (`require_valid_elimination`). A guarantor named
+for the global view with no spread is likewise refused, unless the
+caller explicitly excludes them; the pack then carries an exclusion
+record naming them. Covenant headroom is computed against
+definitions *given* to the run (metric, operator, threshold,
+period); storing covenant definitions and scheduling their tests is
+round 10, and the lending-policy pack is round 4.
 
 ## Storage
 

@@ -99,11 +99,51 @@ The spreading engine — the deterministic heart of the workflow:
   the new version and records it (document, SHA-256, version number);
   the superseded extraction stays in the store, retrievable.
 
-Later rounds add the deterministic ratio and covenant computation
-engine, the versioned policy pack, cited memo drafting with a figure
-verifier, the credit-officer and committee gates with coded
-adverse-action reasons, and the covenant monitoring loop. The round
-map is in `docs/architecture.md`.
+## What round 3 adds
+
+The deterministic computation engine — every number a credit
+officer will ever quote, computed in code from the spread:
+
+- **The full ratio set, defined in writing** — liquidity (current
+  and quick ratios, working capital), leverage (funded debt,
+  debt/EBITDA, liabilities over tangible net worth), coverage
+  (DSCR, fixed-charge coverage), profitability (margins, ROA, ROE)
+  and cash flow (operating cash flow, free cash flow, cash
+  conversion). Debt service is spelled out: scheduled principal —
+  the prior period's current portion of long-term debt — plus
+  interest, plus capital lease payments when a provenanced figure
+  for them is supplied.
+- **EBITDA with its working shown** — operating income plus
+  depreciation & amortisation, on the adjusted view, with the R2
+  adjustments it rests on named in the derivation.
+- **Derivation traces, mechanically verified** — every figure is a
+  chain of recorded steps whose inputs name the spread line, the
+  period and the extraction provenance behind the cell. A verifier
+  walks the chains and re-performs the arithmetic; the eval gate
+  requires 100% trace completeness.
+- **Global cash flow** — borrower and guarantors combined, with
+  eliminations as named, reasoned records (intercompany rent,
+  intercompany debt service). A guarantor with no spread is refused
+  entry to the combined view unless the caller explicitly excludes
+  them — and the exclusion is recorded on the pack.
+- **Covenant headroom against given definitions** — metric,
+  operator, threshold and period supplied to the run; the result
+  states the value, the headroom and whether the historical figures
+  comply. (Storing covenants and scheduling their tests is round
+  10; the policy pack is round 4.)
+- **Computation packs as stored artefacts** — a pack is
+  content-addressed: recomputing the same spread with the same
+  supplemental figures and definitions returns the identical pack,
+  byte for byte. A figure whose inputs are absent is recorded as
+  *not computable*, naming what is missing — nothing is zero-filled
+  or estimated. The sample borrower's statements carry no
+  cash-flow page, so its EBITDA and cash-flow figures say exactly
+  that, naming depreciation & amortisation as the missing input.
+
+Later rounds add the versioned policy pack, cited memo drafting
+with a figure verifier, the credit-officer and committee gates with
+coded adverse-action reasons, and the covenant monitoring loop. The
+round map is in `docs/architecture.md`.
 
 ## The laws (enforced in code, never in prompts)
 
