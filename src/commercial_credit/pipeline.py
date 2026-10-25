@@ -24,7 +24,7 @@ what must change before the memo comes back.
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import TypedDict
 
@@ -59,13 +59,39 @@ from .covenants import (
     get_covenant_or_raise,
     validate_amendment,
 )
+from .covenant_testing import (
+    BREACH_DEFAULT_REASON_CODES,
+    BREACH_ESCALATION_REASON_CODES,
+    breach_id_for,
+    compare,
+    lineage_root,
+    period_sources_for,
+    require_breach_actor,
+    result_standing,
+    test_result_id,
+    validate_breach_transition,
+    validate_cure,
+    validate_waiver_decision,
+)
 from .documents import read_document_verified, register_document
 from .errors import NotFoundError, ValidationError
 from .extraction import OfflineReferenceExtractor, receive_extraction
 from .models import (
+    BREACH_CURED,
+    BREACH_DEFAULTED,
+    BREACH_ESCALATED,
+    BREACH_UNDER_REVIEW,
+    BREACH_WAIVED,
+    RESULT_SUPERSEDED_BY_RESTATEMENT,
+    TEST_AWAITING_INPUTS,
+    TEST_FAIL,
+    TEST_NOT_EVALUABLE,
+    TEST_PASS,
     AdverseActionReason,
     AuditEvent,
     Borrower,
+    BreachCase,
+    BreachEvent,
     CommitteeCondition,
     CommitteeDecision,
     CommitteeMember,
@@ -73,6 +99,7 @@ from .models import (
     CovenantAmendment,
     CovenantDefinition,
     CovenantSet,
+    CovenantTestResult,
     CreditFile,
     CreditFileStatus,
     CreditMemo,
@@ -1927,11 +1954,698 @@ class CreditPipeline:
                         "test_date": instance.test_date,
                         "action": action,
                     })
+        # Round 11: the tick also executes the tests that stand
+        # due — re-spreading and recomputing through the existing
+        # engines, recording results, opening breach cases on
+        # failures. Idempotent the same way: a test already
+        # recorded over the same inputs records nothing twice.
+        tests_recorded: list[dict] = []
+        breaches_opened: list[dict] = []
+        for credit_file in files:
+            ran = self._run_due_tests(credit_file, as_of=as_of)
+            tests_recorded.extend(ran["results"])
+            breaches_opened.extend(ran["breaches"])
         return {
             "as_of": as_of,
             "sets_checked": checked,
             "crossings_recorded": recorded,
+            "tests_recorded": tests_recorded,
+            "breaches_opened": breaches_opened,
         }
+
+    # ------------------------------------------------------------------
+    # Round 11: covenant test execution and breach cases. Round
+    # 10 derived the schedule; this section runs the tests on it.
+    # A test re-spreads the period through the existing spreading
+    # engine and recomputes the covenant's metric through the
+    # existing computation engine — no new math lives here; the
+    # figure is read out of the stored pack's own covenant result
+    # and compared against the covenant's threshold. A failure
+    # opens a breach case automatically; resolutions are coded
+    # acts of named officers, recorded on the case and the audit
+    # trail. Nothing here deletes or silently closes anything.
+    # ------------------------------------------------------------------
+
+    def _current_spread(self, credit_file_id: str):
+        """The file's current spread — rebuilt, per the pipeline's
+        own convention, so standing and readiness can never lag a
+        restated document or a fresh extraction behind the store.
+        Falls back to the latest stored spread when a rebuild is
+        impossible (a file with nothing extracted yet)."""
+        try:
+            return self.get_spread(credit_file_id)
+        except (ValidationError, NotFoundError):
+            return self.store.get_latest_spread(credit_file_id)
+
+    def _head_result(
+        self, results: list[CovenantTestResult], instance_id: str
+    ) -> CovenantTestResult | None:
+        """The current result for one instance: the latest
+        recorded result no other recorded result supersedes."""
+        mine = [r for r in results if r.instance_id == instance_id]
+        if not mine:
+            return None
+        superseded = {
+            r.supersedes_result_id for r in mine if r.supersedes_result_id
+        }
+        heads = [r for r in mine if r.result_id not in superseded]
+        return heads[-1] if heads else mine[-1]
+
+    def _execute_covenant_test(
+        self,
+        credit_file: CreditFile,
+        view: dict,
+        instance: CovenantTestInstance,
+        *,
+        as_of: date,
+        strict: bool,
+    ) -> tuple[CovenantTestResult | None, bool]:
+        """Run (or stand) one covenant test instance. Returns the
+        instance's head result and whether this call recorded it.
+        `strict` is the single-instance API path: an instance that
+        is not yet due is refused by name. The scheduler path is
+        lenient: not-due instances are simply skipped."""
+        credit_file_id = credit_file.credit_file_id
+        covenant = next(
+            c for c in view["current_covenants"]
+            if c.covenant_id == instance.covenant_id
+        )
+        results = self.store.list_covenant_test_results(credit_file_id)
+        head = self._head_result(results, instance.instance_id)
+        spread = self._current_spread(credit_file_id)
+        inputs_ready = (
+            instance.fiscal_year is not None
+            and spread is not None
+            and instance.fiscal_year in spread.periods
+        )
+        supersedes: str | None = None
+        if head is not None and head.fiscal_year != instance.fiscal_year:
+            # A point-in-time instance whose current period moved
+            # when newer statements arrived: the recorded result
+            # tested the period that was current on its day, and
+            # the instance now owes a test over the new period.
+            supersedes = head.result_id
+        elif head is not None:
+            if head.outcome == TEST_AWAITING_INPUTS:
+                if not inputs_ready:
+                    return head, False
+                supersedes = head.result_id
+            elif result_standing(head, spread) == (
+                RESULT_SUPERSEDED_BY_RESTATEMENT
+            ):
+                self._audit(
+                    credit_file_id, "covenant_retest_scheduled",
+                    f"test result {head.result_id} for "
+                    f"{instance.name} ({instance.period_label}) is "
+                    f"superseded by a restatement of its period: a "
+                    f"re-test is scheduled",
+                )
+                supersedes = head.result_id
+            else:
+                return head, False
+        elif instance.state not in ("due", "overdue", "awaiting_inputs"):
+            if strict:
+                raise ValidationError(
+                    f"covenant test instance {instance.instance_id} "
+                    f"({instance.name}, {instance.period_label}) "
+                    f"stands at {instance.state!r} at "
+                    f"{as_of.isoformat()}: a test runs when it is "
+                    "due, not before"
+                )
+            return None, False
+
+        if not inputs_ready:
+            # The statements have not arrived: the test stands at
+            # awaiting_inputs, blocked on the borrower — recorded,
+            # so the wait is on the file, naming what is missing.
+            result = CovenantTestResult(
+                result_id=test_result_id(
+                    instance_id=instance.instance_id,
+                    covenant_id=covenant.covenant_id,
+                    spread_id=None,
+                    computation_pack_id=None,
+                    outcome=TEST_AWAITING_INPUTS,
+                    supersedes_result_id=supersedes,
+                ),
+                credit_file_id=credit_file_id,
+                set_id=view["covenant_set"].set_id,
+                instance_id=instance.instance_id,
+                covenant_id=covenant.covenant_id,
+                covenant_version=covenant.version,
+                covenant_name=covenant.name,
+                metric_key=covenant.metric_key,
+                operator=covenant.operator,
+                threshold=covenant.threshold,
+                test_date=instance.test_date,
+                period_label=instance.period_label,
+                fiscal_year=instance.fiscal_year,
+                outcome=TEST_AWAITING_INPUTS,
+                missing_inputs=list(instance.required_inputs),
+                supersedes_result_id=supersedes,
+                is_retest=supersedes is not None,
+                as_of=as_of,
+            )
+            created = (
+                self.store.get_covenant_test_result(result.result_id)
+                is None
+            )
+            if created:
+                self.store.save_covenant_test_result(result)
+                self._audit(
+                    credit_file_id, "covenant_test_awaiting_inputs",
+                    f"covenant test {instance.instance_id} "
+                    f"({instance.name}, {instance.period_label}) "
+                    f"cannot run: awaiting inputs — "
+                    f"{'; '.join(result.missing_inputs)}",
+                )
+            return result, created
+
+        # The inputs exist: re-spread and recompute through the
+        # existing engines, with this covenant as the definition,
+        # tested over the instance's fiscal year.
+        definition = CovenantDefinition(
+            name=covenant.name,
+            metric_key=covenant.metric_key,
+            operator=covenant.operator,
+            threshold=covenant.threshold,
+            fiscal_year=instance.fiscal_year,
+        )
+        pack = self.compute_metrics(
+            credit_file_id, covenant_definitions=[definition]
+        )
+        spread = next(
+            s for s in self.store.list_spreads(credit_file_id)
+            if s.spread_id == pack.spread_id
+        )
+        engine_result = next(
+            (
+                cr for cr in pack.covenant_results
+                if cr.name == covenant.name
+                and cr.metric_key == covenant.metric_key
+                and cr.fiscal_year == instance.fiscal_year
+            ),
+            None,
+        )
+        if engine_result is None:  # pragma: no cover - engine contract
+            raise ValidationError(
+                f"the computation pack {pack.pack_id} carries no "
+                f"result for covenant {covenant.name!r}: the test "
+                "cannot be recorded without the engine's figure"
+            )
+        if engine_result.status == "not_computable":
+            outcome = TEST_NOT_EVALUABLE
+            figure = None
+            headroom = None
+            missing = list(engine_result.missing_inputs)
+        else:
+            figure = engine_result.value
+            headroom = engine_result.headroom
+            missing = []
+            outcome = (
+                TEST_PASS
+                if compare(figure, covenant.operator, covenant.threshold)
+                else TEST_FAIL
+            )
+        result = CovenantTestResult(
+            result_id=test_result_id(
+                instance_id=instance.instance_id,
+                covenant_id=covenant.covenant_id,
+                spread_id=pack.spread_id,
+                computation_pack_id=pack.pack_id,
+                outcome=outcome,
+                supersedes_result_id=supersedes,
+            ),
+            credit_file_id=credit_file_id,
+            set_id=view["covenant_set"].set_id,
+            instance_id=instance.instance_id,
+            covenant_id=covenant.covenant_id,
+            covenant_version=covenant.version,
+            covenant_name=covenant.name,
+            metric_key=covenant.metric_key,
+            operator=covenant.operator,
+            threshold=covenant.threshold,
+            test_date=instance.test_date,
+            period_label=instance.period_label,
+            fiscal_year=instance.fiscal_year,
+            spread_id=pack.spread_id,
+            computation_pack_id=pack.pack_id,
+            figure_value=figure,
+            headroom=headroom,
+            outcome=outcome,
+            missing_inputs=missing,
+            period_sources=period_sources_for(spread, instance.fiscal_year),
+            supersedes_result_id=supersedes,
+            is_retest=supersedes is not None,
+            as_of=as_of,
+        )
+        created = (
+            self.store.get_covenant_test_result(result.result_id) is None
+        )
+        if not created:
+            return result, False
+        self.store.save_covenant_test_result(result)
+        figure_word = (
+            f"figure {figure}" if figure is not None else "no figure"
+        )
+        self._audit(
+            credit_file_id, "covenant_test_recorded",
+            f"covenant test {instance.instance_id} "
+            f"({instance.name}, {instance.period_label}) recorded "
+            f"{outcome}: {figure_word} against "
+            f"{covenant.operator} {covenant.threshold} "
+            f"(pack {pack.pack_id}, spread {pack.spread_id})",
+        )
+        if outcome == TEST_FAIL:
+            self._open_breach(credit_file, view, covenant, result)
+        return result, True
+
+    def _open_breach(
+        self,
+        credit_file: CreditFile,
+        view: dict,
+        covenant: Covenant,
+        result: CovenantTestResult,
+    ) -> BreachCase:
+        """A failing test opens its breach case — automatically,
+        in the same act, so a failure without a case cannot
+        exist. One breach per failing result, derived from it."""
+        breach = BreachCase(
+            breach_id=breach_id_for(result.result_id),
+            credit_file_id=credit_file.credit_file_id,
+            borrower_name=credit_file.borrower.legal_name,
+            set_id=view["covenant_set"].set_id,
+            covenant_id=covenant.covenant_id,
+            covenant_version=covenant.version,
+            covenant_name=covenant.name,
+            metric_key=covenant.metric_key,
+            operator=covenant.operator,
+            threshold=covenant.threshold,
+            figure_value=result.figure_value,
+            test_result_id=result.result_id,
+            instance_id=result.instance_id,
+            test_date=result.test_date,
+            period_label=result.period_label,
+            cure_deadline=(
+                result.test_date + timedelta(days=covenant.grace_days)
+            ),
+            events=[BreachEvent(
+                action="opened",
+                actor_id="covenant-scheduler",
+                actor_role="system",
+                note=(
+                    f"opened by failing covenant test result "
+                    f"{result.result_id}: figure "
+                    f"{result.figure_value} against "
+                    f"{covenant.operator} {covenant.threshold}; "
+                    f"cure period {covenant.grace_days} days"
+                ),
+            )],
+        )
+        self.store.save_breach_case(breach)
+        self._audit(
+            credit_file.credit_file_id, "breach_opened",
+            f"breach {breach.breach_id} opened on "
+            f"{credit_file.borrower.legal_name}: {covenant.name} "
+            f"({result.period_label}) figure {result.figure_value} "
+            f"against {covenant.operator} {covenant.threshold}; "
+            f"cure deadline {breach.cure_deadline.isoformat()}",
+        )
+        return breach
+
+    def _run_due_tests(
+        self, credit_file: CreditFile, *, as_of: date
+    ) -> dict:
+        """Every due covenant test on one file, executed: results
+        recorded, breaches opened. Deliverable instances are not
+        tests and are never executed here."""
+        schedule = self.covenant_schedule(
+            credit_file.credit_file_id, as_of=as_of
+        )
+        recorded: list[dict] = []
+        breaches: list[dict] = []
+        for view in schedule["sets"]:
+            for instance in view["instances"]:
+                if instance.kind != "covenant_test":
+                    continue
+                result, created = self._execute_covenant_test(
+                    credit_file, view, instance,
+                    as_of=as_of, strict=False,
+                )
+                if result is None or not created:
+                    continue
+                recorded.append({
+                    "credit_file_id": credit_file.credit_file_id,
+                    "borrower": credit_file.borrower.legal_name,
+                    "result": result,
+                })
+                if result.outcome == TEST_FAIL:
+                    breach = self.store.get_breach_case(
+                        breach_id_for(result.result_id)
+                    )
+                    if breach is not None:
+                        breaches.append({
+                            "credit_file_id": credit_file.credit_file_id,
+                            "borrower": credit_file.borrower.legal_name,
+                            "breach": breach,
+                        })
+        return {"results": recorded, "breaches": breaches}
+
+    def run_due_covenant_tests(
+        self, credit_file_id: str, *, as_of: date
+    ) -> dict:
+        """Run every covenant test standing due on one file at
+        `as_of` (the API's run-tests action; the scheduler tick
+        runs the same machinery across the portfolio)."""
+        credit_file = self._load(credit_file_id)
+        return self._run_due_tests(credit_file, as_of=as_of)
+
+    def run_covenant_test(
+        self,
+        credit_file_id: str,
+        instance_id: str,
+        *,
+        as_of: date,
+    ) -> CovenantTestResult:
+        """Run one covenant test instance now. An instance that is
+        not yet due is refused by name — tests are not run early
+        to make a quarter look clean."""
+        credit_file = self._load(credit_file_id)
+        schedule = self.covenant_schedule(credit_file_id, as_of=as_of)
+        for view in schedule["sets"]:
+            for instance in view["instances"]:
+                if instance.instance_id != instance_id:
+                    continue
+                if instance.kind != "covenant_test":
+                    raise ValidationError(
+                        f"instance {instance_id} is a reporting "
+                        "deliverable, not a covenant test: "
+                        "deliverables are received, not run"
+                    )
+                result, _created = self._execute_covenant_test(
+                    credit_file, view, instance,
+                    as_of=as_of, strict=True,
+                )
+                return result
+        raise NotFoundError(
+            f"covenant test instance {instance_id} not found on "
+            f"credit file {credit_file_id}"
+        )
+
+    # -- Results and standing -------------------------------------
+
+    def covenant_test_results(
+        self, credit_file_id: str
+    ) -> list[dict]:
+        """Every recorded test result on a file, each carrying
+        its derived standing against the file's current spread:
+        a result whose period has been restated reads
+        superseded_by_restatement — flagged, never rewritten."""
+        self._load(credit_file_id)
+        spread = self._current_spread(credit_file_id)
+        views = []
+        for result in self.store.list_covenant_test_results(credit_file_id):
+            view = result.model_dump(mode="json")
+            view["standing"] = result_standing(result, spread)
+            views.append(view)
+        return views
+
+    def covenant_history(
+        self, credit_file_id: str, covenant_id: str, *, as_of: date
+    ) -> dict:
+        """One covenant's full history: every recorded result
+        across its versions (amendments included), the breaches
+        they opened, and each result's restatement standing."""
+        credit_file = self._load(credit_file_id)
+        sets = self.store.list_covenant_sets(credit_file_id)
+        amendments = self.store.list_covenant_amendments(credit_file_id)
+        root = lineage_root(covenant_id, sets, amendments)
+        if root is None:
+            raise NotFoundError(
+                f"covenant {covenant_id} not found on credit file "
+                f"{credit_file_id}"
+            )
+        lineage_ids = {
+            result.covenant_id
+            for result in self.store.list_covenant_test_results(
+                credit_file_id
+            )
+            if lineage_root(result.covenant_id, sets, amendments) == root
+        } | {covenant_id}
+        spread = self._current_spread(credit_file_id)
+        result_views = []
+        for result in self.store.list_covenant_test_results(credit_file_id):
+            if result.covenant_id not in lineage_ids:
+                continue
+            view = result.model_dump(mode="json")
+            view["standing"] = result_standing(result, spread)
+            result_views.append(view)
+        result_views.sort(key=lambda v: (v["test_date"], v["result_id"]))
+        breach_views = [
+            self._breach_view(breach, as_of=as_of)
+            for breach in self.store.list_breach_cases(credit_file_id)
+            if breach.covenant_id in lineage_ids
+        ]
+        return {
+            "credit_file_id": credit_file_id,
+            "borrower": credit_file.borrower.legal_name,
+            "covenant_id": covenant_id,
+            "lineage_root": root,
+            "results": result_views,
+            "breaches": breach_views,
+        }
+
+    # -- Breach cases ----------------------------------------------
+
+    def _breach_view(self, breach: BreachCase, *, as_of: date) -> dict:
+        view = breach.model_dump(mode="json")
+        view["days_in_breach"] = (as_of - breach.test_date).days
+        view["days_to_cure_deadline"] = (
+            breach.cure_deadline - as_of
+        ).days
+        view["cure_overdue"] = (
+            breach.state
+            not in (BREACH_CURED, BREACH_WAIVED, BREACH_DEFAULTED)
+            and as_of > breach.cure_deadline
+        )
+        return view
+
+    def list_breach_cases(
+        self, *, as_of: date, credit_file_id: str | None = None
+    ) -> list[dict]:
+        """The breach list — one file's, or the portfolio's —
+        with ageing against each cure deadline. Open breaches
+        sort first, oldest failure first: the list is a work
+        queue, not an archive."""
+        if credit_file_id is not None:
+            self._load(credit_file_id)
+        breaches = self.store.list_breach_cases(credit_file_id)
+        views = [self._breach_view(b, as_of=as_of) for b in breaches]
+        views.sort(key=lambda v: (
+            v["state"] in (BREACH_CURED, BREACH_WAIVED, BREACH_DEFAULTED),
+            v["test_date"],
+            v["breach_id"],
+        ))
+        return views
+
+    def get_breach_case(
+        self, credit_file_id: str, breach_id: str, *, as_of: date
+    ) -> dict:
+        return self._breach_view(
+            self._load_breach(credit_file_id, breach_id), as_of=as_of
+        )
+
+    def _load_breach(
+        self, credit_file_id: str, breach_id: str
+    ) -> BreachCase:
+        self._load(credit_file_id)
+        breach = self.store.get_breach_case(breach_id)
+        if breach is None or breach.credit_file_id != credit_file_id:
+            raise NotFoundError(
+                f"breach case {breach_id} not found on credit "
+                f"file {credit_file_id}"
+            )
+        return breach
+
+    def _record_breach_act(
+        self,
+        breach: BreachCase,
+        *,
+        action: str,
+        target_state: str,
+        actor_id: str,
+        actor_role: str,
+        reason_code: str | None = None,
+        note: str = "",
+        test_result_id: str | None = None,
+        decision_id: str | None = None,
+    ) -> BreachCase:
+        validate_breach_transition(
+            state=breach.state, target=target_state, what=action
+        )
+        breach.events.append(BreachEvent(
+            action=action,
+            actor_id=actor_id,
+            actor_role=actor_role,
+            reason_code=reason_code,
+            note=note,
+            test_result_id=test_result_id,
+            decision_id=decision_id,
+        ))
+        breach.state = target_state
+        self.store.save_breach_case(breach)
+        self._audit(
+            breach.credit_file_id, f"breach_{action}",
+            f"breach {breach.breach_id} ({breach.covenant_name}, "
+            f"{breach.period_label}) moved to {target_state} by "
+            f"{actor_id} ({actor_role})"
+            + (f" under reason {reason_code}" if reason_code else "")
+            + (f": {note}" if note else ""),
+        )
+        return breach
+
+    def review_breach(
+        self,
+        credit_file_id: str,
+        breach_id: str,
+        *,
+        actor_id: str,
+        actor_role: str,
+        note: str = "",
+    ) -> BreachCase:
+        """A named officer takes the breach under review."""
+        require_breach_actor(actor_id, actor_role, what="breach review")
+        breach = self._load_breach(credit_file_id, breach_id)
+        return self._record_breach_act(
+            breach, action="under_review",
+            target_state=BREACH_UNDER_REVIEW,
+            actor_id=actor_id, actor_role=actor_role, note=note,
+        )
+
+    def escalate_breach(
+        self,
+        credit_file_id: str,
+        breach_id: str,
+        *,
+        actor_id: str,
+        actor_role: str,
+        reason_code: str,
+        note: str = "",
+    ) -> BreachCase:
+        """Escalate the breach to the watchlist queue — a coded
+        act by a named officer, never a quiet flag."""
+        require_breach_actor(
+            actor_id, actor_role, what="breach escalation"
+        )
+        if reason_code not in BREACH_ESCALATION_REASON_CODES:
+            raise ValidationError(
+                f"unknown breach escalation reason code "
+                f"{reason_code!r}: codes come from the versioned "
+                f"vocabulary (breach-resolution-reasons-v1): "
+                f"{sorted(BREACH_ESCALATION_REASON_CODES)}"
+            )
+        breach = self._load_breach(credit_file_id, breach_id)
+        return self._record_breach_act(
+            breach, action="escalated",
+            target_state=BREACH_ESCALATED,
+            actor_id=actor_id, actor_role=actor_role,
+            reason_code=reason_code, note=note,
+        )
+
+    def cure_breach(
+        self,
+        credit_file_id: str,
+        breach_id: str,
+        *,
+        actor_id: str,
+        actor_role: str,
+        cure_result_id: str,
+        note: str = "",
+    ) -> BreachCase:
+        """Cure the breach — on the evidence of a later passing
+        re-test of the same covenant, linked by result id. The
+        cure is validated mechanically: no passing re-test, no
+        cure."""
+        require_breach_actor(actor_id, actor_role, what="breach cure")
+        breach = self._load_breach(credit_file_id, breach_id)
+        cure_result = self.store.get_covenant_test_result(cure_result_id)
+        sets = self.store.list_covenant_sets(credit_file_id)
+        amendments = self.store.list_covenant_amendments(credit_file_id)
+        validate_cure(
+            cure_result=cure_result,
+            breach_covenant_id=breach.covenant_id,
+            breach_result_id=breach.test_result_id,
+            breach_test_date=breach.test_date,
+            sets=sets,
+            amendments=amendments,
+            credit_file_id=credit_file_id,
+        )
+        return self._record_breach_act(
+            breach, action="cured", target_state=BREACH_CURED,
+            actor_id=actor_id, actor_role=actor_role, note=note,
+            test_result_id=cure_result_id,
+        )
+
+    def waive_breach(
+        self,
+        credit_file_id: str,
+        breach_id: str,
+        *,
+        actor_id: str,
+        actor_role: str,
+        decision_id: str,
+        note: str = "",
+    ) -> BreachCase:
+        """Waive the breach — only on a committee decision's
+        authority. The decision must be a stored artefact of
+        this credit file with an approval outcome; a waiver that
+        names no decision is a free-text waiver and is refused."""
+        require_breach_actor(actor_id, actor_role, what="breach waiver")
+        breach = self._load_breach(credit_file_id, breach_id)
+        decision = (
+            self.store.get_committee_decision(decision_id)
+            if decision_id
+            else None
+        )
+        validate_waiver_decision(
+            decision=decision, credit_file_id=credit_file_id
+        )
+        return self._record_breach_act(
+            breach, action="waived", target_state=BREACH_WAIVED,
+            actor_id=actor_id, actor_role=actor_role, note=note,
+            decision_id=decision_id,
+        )
+
+    def default_breach(
+        self,
+        credit_file_id: str,
+        breach_id: str,
+        *,
+        actor_id: str,
+        actor_role: str,
+        reason_code: str,
+        note: str = "",
+    ) -> BreachCase:
+        """Move the breach onto the default path — the
+        enforcement outcome, reached from review or escalation
+        under a coded reason. The breach record stays; the
+        facility's handling changes, not its history."""
+        require_breach_actor(
+            actor_id, actor_role, what="breach default path"
+        )
+        if reason_code not in BREACH_DEFAULT_REASON_CODES:
+            raise ValidationError(
+                f"unknown breach default reason code "
+                f"{reason_code!r}: codes come from the versioned "
+                f"vocabulary (breach-resolution-reasons-v1): "
+                f"{sorted(BREACH_DEFAULT_REASON_CODES)}"
+            )
+        breach = self._load_breach(credit_file_id, breach_id)
+        return self._record_breach_act(
+            breach, action="defaulted",
+            target_state=BREACH_DEFAULTED,
+            actor_id=actor_id, actor_role=actor_role,
+            reason_code=reason_code, note=note,
+        )
 
     def amend_covenant(
         self,

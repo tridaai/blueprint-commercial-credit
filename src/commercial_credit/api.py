@@ -907,4 +907,235 @@ def tick_covenants(body: CovenantTickRequest) -> dict:
             }
             for crossing in result["crossings_recorded"]
         ],
+        "tests_recorded": [
+            {
+                "credit_file_id": entry["credit_file_id"],
+                "borrower": entry["borrower"],
+                "result": entry["result"].model_dump(mode="json"),
+            }
+            for entry in result["tests_recorded"]
+        ],
+        "breaches_opened": [
+            {
+                "credit_file_id": entry["credit_file_id"],
+                "borrower": entry["borrower"],
+                "breach": entry["breach"].model_dump(mode="json"),
+            }
+            for entry in result["breaches_opened"]
+        ],
     }
+
+
+# ------------------------------------------------------------------
+# Round 11: covenant test execution and breach cases. The tick
+# above also runs due tests; these endpoints run them per file,
+# read the recorded results with their restatement standing, and
+# work the breach queue — review, escalation, cure, waiver,
+# default path — each a coded act by a named officer.
+# ------------------------------------------------------------------
+
+
+class RunCovenantTestsRequest(BaseModel):
+    as_of: date
+
+
+@app.post("/applications/{credit_file_id}/covenant-tests/run")
+def run_covenant_tests(
+    credit_file_id: str, body: RunCovenantTestsRequest
+) -> dict:
+    _file_or_404(credit_file_id)
+    ran = pipeline.run_due_covenant_tests(
+        credit_file_id, as_of=body.as_of
+    )
+    return {
+        "credit_file_id": credit_file_id,
+        "as_of": body.as_of.isoformat(),
+        "results": [
+            entry["result"].model_dump(mode="json")
+            for entry in ran["results"]
+        ],
+        "breaches_opened": [
+            entry["breach"].model_dump(mode="json")
+            for entry in ran["breaches"]
+        ],
+    }
+
+
+class RunCovenantTestRequest(BaseModel):
+    as_of: date
+
+
+@app.post(
+    "/applications/{credit_file_id}/covenant-tests/{instance_id}/run"
+)
+def run_covenant_test(
+    credit_file_id: str, instance_id: str, body: RunCovenantTestRequest
+) -> dict:
+    _file_or_404(credit_file_id)
+    result = pipeline.run_covenant_test(
+        credit_file_id, instance_id, as_of=body.as_of
+    )
+    return result.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/covenant-test-results")
+def list_covenant_test_results(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return pipeline.covenant_test_results(credit_file_id)
+
+
+@app.get(
+    "/applications/{credit_file_id}/covenants/{covenant_id}/history"
+)
+def get_covenant_history(
+    credit_file_id: str, covenant_id: str, as_of: date
+) -> dict:
+    _file_or_404(credit_file_id)
+    return pipeline.covenant_history(
+        credit_file_id, covenant_id, as_of=as_of
+    )
+
+
+@app.get("/breach-cases")
+def list_breach_cases(
+    as_of: date, credit_file_id: str | None = None
+) -> list[dict]:
+    if credit_file_id is not None:
+        _file_or_404(credit_file_id)
+    return pipeline.list_breach_cases(
+        as_of=as_of, credit_file_id=credit_file_id
+    )
+
+
+@app.get("/applications/{credit_file_id}/breach-cases")
+def list_file_breach_cases(
+    credit_file_id: str, as_of: date
+) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return pipeline.list_breach_cases(
+        as_of=as_of, credit_file_id=credit_file_id
+    )
+
+
+@app.get("/applications/{credit_file_id}/breach-cases/{breach_id}")
+def get_breach_case(
+    credit_file_id: str, breach_id: str, as_of: date
+) -> dict:
+    _file_or_404(credit_file_id)
+    return pipeline.get_breach_case(
+        credit_file_id, breach_id, as_of=as_of
+    )
+
+
+class BreachReviewRequest(BaseModel):
+    actor_id: str
+    actor_role: str
+    note: str = ""
+
+
+@app.post(
+    "/applications/{credit_file_id}/breach-cases/{breach_id}/review",
+    status_code=201,
+)
+def review_breach(
+    credit_file_id: str, breach_id: str, body: BreachReviewRequest
+) -> dict:
+    _file_or_404(credit_file_id)
+    breach = pipeline.review_breach(
+        credit_file_id, breach_id,
+        actor_id=body.actor_id, actor_role=body.actor_role,
+        note=body.note,
+    )
+    return breach.model_dump(mode="json")
+
+
+class BreachEscalateRequest(BaseModel):
+    actor_id: str
+    actor_role: str
+    reason_code: str
+    note: str = ""
+
+
+@app.post(
+    "/applications/{credit_file_id}/breach-cases/{breach_id}/escalate",
+    status_code=201,
+)
+def escalate_breach(
+    credit_file_id: str, breach_id: str, body: BreachEscalateRequest
+) -> dict:
+    _file_or_404(credit_file_id)
+    breach = pipeline.escalate_breach(
+        credit_file_id, breach_id,
+        actor_id=body.actor_id, actor_role=body.actor_role,
+        reason_code=body.reason_code, note=body.note,
+    )
+    return breach.model_dump(mode="json")
+
+
+class BreachCureRequest(BaseModel):
+    actor_id: str
+    actor_role: str
+    cure_result_id: str
+    note: str = ""
+
+
+@app.post(
+    "/applications/{credit_file_id}/breach-cases/{breach_id}/cure",
+    status_code=201,
+)
+def cure_breach(
+    credit_file_id: str, breach_id: str, body: BreachCureRequest
+) -> dict:
+    _file_or_404(credit_file_id)
+    breach = pipeline.cure_breach(
+        credit_file_id, breach_id,
+        actor_id=body.actor_id, actor_role=body.actor_role,
+        cure_result_id=body.cure_result_id, note=body.note,
+    )
+    return breach.model_dump(mode="json")
+
+
+class BreachWaiveRequest(BaseModel):
+    actor_id: str
+    actor_role: str
+    decision_id: str
+    note: str = ""
+
+
+@app.post(
+    "/applications/{credit_file_id}/breach-cases/{breach_id}/waive",
+    status_code=201,
+)
+def waive_breach(
+    credit_file_id: str, breach_id: str, body: BreachWaiveRequest
+) -> dict:
+    _file_or_404(credit_file_id)
+    breach = pipeline.waive_breach(
+        credit_file_id, breach_id,
+        actor_id=body.actor_id, actor_role=body.actor_role,
+        decision_id=body.decision_id, note=body.note,
+    )
+    return breach.model_dump(mode="json")
+
+
+class BreachDefaultRequest(BaseModel):
+    actor_id: str
+    actor_role: str
+    reason_code: str
+    note: str = ""
+
+
+@app.post(
+    "/applications/{credit_file_id}/breach-cases/{breach_id}/default",
+    status_code=201,
+)
+def default_breach(
+    credit_file_id: str, breach_id: str, body: BreachDefaultRequest
+) -> dict:
+    _file_or_404(credit_file_id)
+    breach = pipeline.default_breach(
+        credit_file_id, breach_id,
+        actor_id=body.actor_id, actor_role=body.actor_role,
+        reason_code=body.reason_code, note=body.note,
+    )
+    return breach.model_dump(mode="json")
