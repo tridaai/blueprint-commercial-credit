@@ -67,8 +67,11 @@ FLAG_KINDS = frozenset({"committee_attention", "conflict_of_interest"})
 
 # Sections whose text the officer may not edit. The exceptions
 # section renders the pinned policy report; editing it could only
-# drop or soften an outcome the report recorded.
-LOCKED_SECTIONS = frozenset({"policy_exceptions"})
+# drop or soften an outcome the report recorded. The document
+# disagreements section (round 8) renders the pinned spread's
+# contested lines in their recorded terms; editing it could only
+# drop or soften a disagreement the spread recorded.
+LOCKED_SECTIONS = frozenset({"policy_exceptions", "document_disagreements"})
 
 # The coded return vocabulary, versioned: a return recorded under
 # this version names these codes, and a later vocabulary change
@@ -208,9 +211,9 @@ def apply_edits(
         if key in LOCKED_SECTIONS:
             raise ValidationError(
                 f"section {key!r} is not editable at the officer "
-                "gate: it renders the pinned policy report "
-                "verbatim, so an exception cannot be dropped or "
-                "softened by editing it — discuss the exception "
+                "gate: it states a pinned artefact's record in its "
+                "recorded terms, so what it records cannot be "
+                "dropped or softened by editing it — discuss it "
                 "in risks_mitigants instead"
             )
     sections: list[MemoSection] = []

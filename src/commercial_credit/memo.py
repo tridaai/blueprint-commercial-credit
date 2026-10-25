@@ -21,6 +21,16 @@ non-pass outcomes — every fail and every not_evaluable, by test
 id. A draft that omits a blocker fail, or softens a not_evaluable
 into silence, cannot be stored either.
 
+Document disagreements (round 8) carry it the same way again: when
+the pinned spread records disagreements between its source types,
+the memo must carry a disagreements section accounting for every
+MATERIAL one, by id, stated in the record's own terms — each
+source's figure and the distance between them. A draft that drops
+the section, omits a material disagreement, or rewords a material
+difference into smaller language cannot be stored. Figures
+computed over a materially disagreed line carry the disagreement's
+flag, and their traces say so.
+
 Drafting goes through a composer port with named profiles. The
 default profile, `offline`, is deterministic: it assembles the
 narrative from the structured artefacts and formats every figure
@@ -45,12 +55,14 @@ from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Protocol
 
+from .disagreements import SOURCE_TYPE_LABELS, get_disagreement_policy
 from .errors import MemoVerificationError, ValidationError
 from .models import (
     ComputedFigure,
     ComputationPack,
     CreditFile,
     CreditMemo,
+    Disagreement,
     FigureTrace,
     MemoSection,
     MemoTable,
@@ -188,11 +200,19 @@ def build_trace_universe(inputs: MemoInputs) -> dict[Decimal, str]:
                     if figure.fiscal_year is not None
                     else "combined"
                 )
-                add(
-                    figure.value,
+                source = (
                     f"{pack_label} {pack.pack_id}, figure {figure.key} "
-                    f"({figure.label}), {where}",
+                    f"({figure.label}), {where}"
                 )
+                if figure.disagreement_ids:
+                    # Round 8: a figure computed over a materially
+                    # disagreed line never traces as a clean figure —
+                    # its trace names the disagreement(s) it rests on.
+                    source += (
+                        "; computed over document disagreement(s) "
+                        + ", ".join(figure.disagreement_ids)
+                    )
+                add(figure.value, source)
         for result in pack.covenant_results:
             base = f"{pack_label} {pack.pack_id}, covenant {result.name!r}"
             add(result.value, f"{base} value, FY{result.fiscal_year}")
@@ -248,6 +268,64 @@ def build_trace_universe(inputs: MemoInputs) -> dict[Decimal, str]:
             f"spread {spread.spread_id}, adjustment "
             f"{adjustment.adjustment_id} amount",
         )
+
+    # Document disagreements (round 8): every source's figure, the
+    # distance from the figure the spread carries, the counts, and
+    # the materiality line the policy drew — the figures the
+    # disagreements section is allowed to state, each traced to
+    # the record it comes from.
+    if spread.disagreements:
+        material_count = sum(1 for d in spread.disagreements if d.material)
+        add(
+            Decimal(len(spread.disagreements)),
+            f"spread {spread.spread_id}, document disagreements recorded",
+        )
+        add(
+            Decimal(material_count),
+            f"spread {spread.spread_id}, material document disagreements",
+        )
+        add(
+            Decimal(len(spread.disagreements) - material_count),
+            f"spread {spread.spread_id}, immaterial document disagreements",
+        )
+        for record in spread.disagreements:
+            base = (
+                f"spread {spread.spread_id}, disagreement "
+                f"{record.disagreement_id} on line {record.line_key} "
+                f"({record.line_label}) FY{record.fiscal_year}"
+            )
+            for source in record.sources:
+                label = SOURCE_TYPE_LABELS.get(
+                    source.source_type, source.source_type
+                )
+                add(source.value, f"{base}, {label} figure")
+                add(
+                    source.delta_abs,
+                    f"{base}, {label} difference from the spread figure",
+                )
+                if source.delta_rel is not None:
+                    add(
+                        (source.delta_rel * 100).quantize(Decimal("0.01")),
+                        f"{base}, {label} difference from the spread "
+                        "figure, percent",
+                    )
+        try:
+            disagreement_policy = get_disagreement_policy(
+                spread.disagreement_policy_version or None
+            )
+        except ValueError:
+            disagreement_policy = None
+        if disagreement_policy is not None:
+            add(
+                disagreement_policy.materiality_absolute,
+                f"disagreement policy {disagreement_policy.version} "
+                "materiality threshold, dollars",
+            )
+            add(
+                disagreement_policy.materiality_relative * 100,
+                f"disagreement policy {disagreement_policy.version} "
+                "materiality threshold, percent of the spread figure",
+            )
 
     # Policy report: thresholds, the values the tests read, the pack.
     for outcome in report.outcomes:
@@ -402,6 +480,53 @@ def render_memo(memo: CreditMemo) -> str:
     return "\n\n".join(chunk for _, chunk in _render_chunks(memo))
 
 
+def render_disagreement_paragraph(record: Disagreement) -> str:
+    """A disagreement stated in its record's own terms: the line
+    and period, every source's figure exactly as reported, the
+    distance of each from the figure the spread carries, and the
+    policy's materiality verdict.
+
+    This rendering is canonical: the composer writes it, and the
+    verifier requires it verbatim. A memo may add prose around a
+    disagreement, but the disagreement itself may not be reworded —
+    rewording is how a material difference gets softened into a
+    smaller one, and the check exists to make that a refusal
+    rather than a judgement call.
+    """
+    parts: list[str] = []
+    for source in record.sources:
+        label = SOURCE_TYPE_LABELS.get(source.source_type, source.source_type)
+        piece = f"the {label} report {fmt_money(source.value)}"
+        if source.source_type == record.working_source_type:
+            piece += ", the figure the spread carries"
+        elif source.delta_rel is not None:
+            direction = (
+                "below" if source.value < record.working_value else "above"
+            )
+            percent = (source.delta_rel * 100).quantize(Decimal("0.01"))
+            piece += (
+                f", a difference of {fmt_money(source.delta_abs)} "
+                f"({percent}% {direction} the spread figure)"
+            )
+        else:
+            piece += (
+                f", a difference of {fmt_money(source.delta_abs)} "
+                "from the spread figure"
+            )
+        parts.append(piece)
+    verdict = (
+        "The disagreement policy judges the difference material."
+        if record.material
+        else "The disagreement policy judges the difference below "
+             "the materiality line."
+    )
+    listing = "; ".join(parts)
+    return (
+        f"{record.line_label} (fiscal {record.fiscal_year}): "
+        f"{listing}. {verdict}"
+    )
+
+
 # ---------------------------------------------------------------------
 # The verifier.
 # ---------------------------------------------------------------------
@@ -410,11 +535,15 @@ def render_memo(memo: CreditMemo) -> str:
 def verify_memo(memo: CreditMemo, inputs: MemoInputs) -> MemoVerification:
     """Verify a composed memo against the artefacts it pins.
 
-    Two checks, both over the artefact as rendered:
+    Three checks, all over the artefact as rendered:
       1. every figure in the rendered text traces into the universe
          built from the pinned inputs;
       2. the exceptions section accounts for exactly the pinned
-         report's non-pass outcomes, by test id.
+         report's non-pass outcomes, by test id;
+      3. when the pinned spread records document disagreements,
+         the disagreements section exists and accounts for exactly
+         the material ones, by id, each stated in its record's
+         canonical terms (round 8).
     Any failure raises MemoVerificationError naming the offenders —
     the caller stores nothing.
     """
@@ -444,6 +573,34 @@ def verify_memo(memo: CreditMemo, inputs: MemoInputs) -> MemoVerification:
     unexpected = [t for t in listed if t not in expected]
     duplicated = sorted({t for t in listed if listed.count(t) > 1})
 
+    # Round 8: disagreements integrity, the exceptions discipline
+    # applied to the spread's contested lines.
+    spread = inputs.spread
+    material_records = [d for d in spread.disagreements if d.material]
+    expected_disagreements = [d.disagreement_id for d in material_records]
+    disagreements_section = memo.section("document_disagreements")
+    listed_disagreements = (
+        list(disagreements_section.disagreement_ids)
+        if disagreements_section else []
+    )
+    missing_disagreements = [
+        d for d in expected_disagreements if d not in listed_disagreements
+    ]
+    unexpected_disagreements = [
+        d for d in listed_disagreements if d not in expected_disagreements
+    ]
+    duplicated_disagreements = sorted(
+        {d for d in listed_disagreements if listed_disagreements.count(d) > 1}
+    )
+    unstated: list[str] = []
+    if disagreements_section is not None:
+        paragraphs = set(disagreements_section.paragraphs)
+        unstated = [
+            d.disagreement_id
+            for d in material_records
+            if render_disagreement_paragraph(d) not in paragraphs
+        ]
+
     problems: list[str] = []
     if offenders:
         problems.append(
@@ -462,6 +619,33 @@ def verify_memo(memo: CreditMemo, inputs: MemoInputs) -> MemoVerification:
         problems.append(
             "exception(s) listed more than once: " + ", ".join(duplicated)
         )
+    if spread.disagreements and disagreements_section is None:
+        problems.append(
+            "document disagreements section missing: the pinned "
+            f"spread records {len(spread.disagreements)} disagreement(s) "
+            f"({len(material_records)} material) and the memo "
+            "carries none of them"
+        )
+    if missing_disagreements:
+        problems.append(
+            "material disagreement(s) omitted: "
+            + ", ".join(missing_disagreements)
+        )
+    if unexpected_disagreements:
+        problems.append(
+            "disagreement(s) listed that the pinned spread does not "
+            "record as material: " + ", ".join(unexpected_disagreements)
+        )
+    if duplicated_disagreements:
+        problems.append(
+            "disagreement(s) listed more than once: "
+            + ", ".join(duplicated_disagreements)
+        )
+    if unstated:
+        problems.append(
+            "material disagreement(s) not stated in their recorded "
+            "terms: " + ", ".join(unstated)
+        )
     if problems:
         raise MemoVerificationError(
             "memo refused by the figure verifier — " + "; ".join(problems),
@@ -474,6 +658,8 @@ def verify_memo(memo: CreditMemo, inputs: MemoInputs) -> MemoVerification:
         figures=traces,
         exceptions_expected=expected,
         exceptions_listed=listed,
+        disagreements_expected=expected_disagreements,
+        disagreements_listed=listed_disagreements,
         verified=True,
     )
 
@@ -543,16 +729,22 @@ class OfflineMemoComposer:
     name = "offline"
 
     def compose(self, inputs: MemoInputs) -> list[MemoSection]:
-        return [
+        sections = [
             self._request_summary(inputs),
             self._borrower_overview(inputs),
             self._financial_analysis(inputs),
+        ]
+        disagreements = self._document_disagreements(inputs)
+        if disagreements is not None:
+            sections.append(disagreements)
+        sections += [
             self._strengths(inputs),
             self._risks_and_mitigants(inputs),
             self._policy_exceptions(inputs),
             self._recommendation(inputs),
             self._conditions(inputs),
         ]
+        return sections
 
     # -- sections ----------------------------------------------------
 
@@ -723,6 +915,78 @@ class OfflineMemoComposer:
             caption="Computed measures",
             columns=["Measure"] + [f"FY{year}" for year in years],
             rows=rows,
+        )
+
+    def _document_disagreements(
+        self, inputs: MemoInputs
+    ) -> MemoSection | None:
+        """The disagreements section (round 8): present only when
+        the spread records disagreements — a memo on agreeing
+        documents has nothing to carry, and an empty section would
+        imply a check that found nothing to say either way.
+
+        Every material disagreement is stated in its record's
+        canonical terms (the verifier requires them verbatim);
+        immaterial ones are counted, not listed — their full
+        records ride on the spread and through the disagreements
+        view, so the count here is a pointer, not a summary that
+        could quietly absorb a material one (the verifier checks
+        the section's id list against the spread's material set,
+        never against the prose)."""
+        spread = inputs.spread
+        if not spread.disagreements:
+            return None
+        material = [d for d in spread.disagreements if d.material]
+        immaterial = [d for d in spread.disagreements if not d.material]
+        try:
+            policy = get_disagreement_policy(
+                spread.disagreement_policy_version or None
+            )
+        except ValueError:
+            policy = get_disagreement_policy()
+        paragraphs = [
+            "The documents behind this spread do not fully agree, "
+            "and the differences are carried on the record rather "
+            "than resolved quietly. The spread records "
+            f"{len(spread.disagreements)} document disagreement(s) "
+            f"under disagreement policy `{policy.policy_id}` "
+            f"version `{policy.version}`: {len(material)} "
+            "material and "
+            f"{len(immaterial)} below the materiality line. The "
+            "spread's working figures follow the policy's source "
+            "precedence — the audited statements first, then the "
+            "tax return, then the management statements — and no "
+            "figure was averaged and no source's figure dropped "
+            "to reach them.",
+        ]
+        paragraphs.extend(
+            render_disagreement_paragraph(d) for d in material
+        )
+        if material:
+            paragraphs.append(
+                "Figures computed over a materially disagreed "
+                "line carry the disagreement's flag in the "
+                "computation pack, so a ratio that rests on a "
+                "contested figure is marked as resting on one "
+                "wherever it is read."
+            )
+        if immaterial:
+            paragraphs.append(
+                f"The remaining {len(immaterial)} disagreement(s) "
+                "fall below the disagreement policy's materiality "
+                f"line — a difference reaching "
+                f"{fmt_money(policy.materiality_absolute)} or "
+                f"{fmt_percent(policy.materiality_relative * 100)} of "
+                "the spread figure — and are recorded in full on "
+                "the spread and through the disagreements view. "
+                "They are counted here so the file shows they were "
+                "seen; they flag no figure."
+            )
+        return MemoSection(
+            key="document_disagreements",
+            title="Document disagreements",
+            paragraphs=paragraphs,
+            disagreement_ids=[d.disagreement_id for d in material],
         )
 
     def _strengths(self, inputs: MemoInputs) -> MemoSection:
