@@ -10,8 +10,14 @@ credit file (with supplemental figures and covenant definitions the
 caller hands in), stored packs by id, and the global cash-flow view
 combining the borrower with guarantor spreads. Round 4 adds the
 policy pack: the shipped pack versions, an evaluation of a file
-against one pinned version, and the stored policy reports. Every
-request carries a request id into the structured logs.
+against one pinned version, and the stored policy reports. Round
+5 adds memo composition, the composed memo, its verification
+record and its rendered text. Round 6 adds the credit officer
+gate: submit a draft for review, approve it (as-is or with
+edits), return it for rework with coded reasons, flag items on
+it, recompose a returned memo, and read a memo's version history
+and its approval diff. Every request carries a request id into
+the structured logs.
 """
 
 from __future__ import annotations
@@ -415,3 +421,135 @@ def get_memo_text(credit_file_id: str, memo_id: str) -> dict:
     _file_or_404(credit_file_id)
     memo = pipeline.get_memo(credit_file_id, memo_id)
     return {"memo_id": memo.memo_id, "text": render_memo(memo)}
+
+
+# -- the credit officer gate (round 6) -------------------------------
+
+
+class SubmitMemoRequest(BaseModel):
+    actor: str
+    actor_role: str
+
+
+class ApproveMemoRequest(BaseModel):
+    officer_id: str
+    officer_role: str
+    edits: dict[str, list[str]] | None = None
+    note: str = ""
+
+
+class ReturnMemoRequest(BaseModel):
+    officer_id: str
+    officer_role: str
+    reason_codes: list[str] = []
+    note: str = ""
+
+
+class FlagMemoRequest(BaseModel):
+    officer_id: str
+    officer_role: str
+    kind: str
+    section_key: str | None = None
+    note: str = ""
+
+
+class RecomposeMemoRequest(BaseModel):
+    supersedes_memo_id: str
+    actor: str
+    actor_role: str
+
+
+@app.post("/applications/{credit_file_id}/memos/{memo_id}/submit")
+def submit_memo(credit_file_id: str, memo_id: str, body: SubmitMemoRequest) -> dict:
+    _file_or_404(credit_file_id)
+    memo = pipeline.submit_memo_for_review(
+        credit_file_id, memo_id, actor=body.actor, actor_role=body.actor_role
+    )
+    return memo.model_dump(mode="json")
+
+
+@app.post(
+    "/applications/{credit_file_id}/memos/{memo_id}/approve",
+    status_code=201,
+)
+def approve_memo(credit_file_id: str, memo_id: str, body: ApproveMemoRequest) -> dict:
+    _file_or_404(credit_file_id)
+    memo = pipeline.approve_memo(
+        credit_file_id,
+        memo_id,
+        officer_id=body.officer_id,
+        officer_role=body.officer_role,
+        edits=body.edits,
+        note=body.note,
+    )
+    return memo.model_dump(mode="json")
+
+
+@app.post("/applications/{credit_file_id}/memos/{memo_id}/return")
+def return_memo(credit_file_id: str, memo_id: str, body: ReturnMemoRequest) -> dict:
+    _file_or_404(credit_file_id)
+    memo = pipeline.return_memo(
+        credit_file_id,
+        memo_id,
+        officer_id=body.officer_id,
+        officer_role=body.officer_role,
+        reason_codes=body.reason_codes,
+        note=body.note,
+    )
+    return memo.model_dump(mode="json")
+
+
+@app.post(
+    "/applications/{credit_file_id}/memos/{memo_id}/flag", status_code=201
+)
+def flag_memo(credit_file_id: str, memo_id: str, body: FlagMemoRequest) -> dict:
+    _file_or_404(credit_file_id)
+    event = pipeline.flag_memo(
+        credit_file_id,
+        memo_id,
+        officer_id=body.officer_id,
+        officer_role=body.officer_role,
+        kind=body.kind,
+        section_key=body.section_key,
+        note=body.note,
+    )
+    return event.model_dump(mode="json")
+
+
+@app.post("/applications/{credit_file_id}/memos/recompose", status_code=201)
+def recompose_memo(credit_file_id: str, body: RecomposeMemoRequest) -> dict:
+    _file_or_404(credit_file_id)
+    memo = pipeline.recompose_memo(
+        credit_file_id,
+        supersedes_memo_id=body.supersedes_memo_id,
+        actor=body.actor,
+        actor_role=body.actor_role,
+    )
+    return memo.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/memos/{memo_id}/diff")
+def get_memo_diff(credit_file_id: str, memo_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    diff = pipeline.get_memo_diff(credit_file_id, memo_id)
+    return diff.model_dump(mode="json")
+
+
+@app.get("/applications/{credit_file_id}/memos/{memo_id}/history")
+def get_memo_history(credit_file_id: str, memo_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    history = pipeline.memo_history(credit_file_id, memo_id)
+    return {
+        "memo_id": history["memo_id"],
+        "status": history["status"],
+        "versions": [
+            {**v, "created_at": v["created_at"].isoformat()}
+            for v in history["versions"]
+        ],
+        "events": [e.model_dump(mode="json") for e in history["events"]],
+        "diff": (
+            history["diff"].model_dump(mode="json")
+            if history["diff"] is not None
+            else None
+        ),
+    }
