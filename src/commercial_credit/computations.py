@@ -66,6 +66,12 @@ Two honesty rules, applied uniformly:
     distributions, intangibles) that the statements do not report
     is recorded as "not reported" in the figure's notes and left
     out — the artefact always shows which components entered.
+  * A figure computed over a spread line whose source types
+    materially disagree (round 8) is flagged with the
+    disagreement's id: it still computes, from the spread's
+    working figure, but the flag rides on the figure record into
+    every consumer — a flagged figure can never present as a
+    clean one.
 
 Rounding, applied as each step is recorded so the trace replays
 exactly: money to the cent, ratios to 4 decimal places, both
@@ -79,6 +85,7 @@ import json
 from dataclasses import dataclass, field as dc_field
 from decimal import ROUND_HALF_UP, Decimal
 
+from .disagreements import precedence_rank
 from .errors import ValidationError
 from .models import (
     ComputationPack,
@@ -97,7 +104,7 @@ from .models import (
 )
 from .spreading import period_year_of
 
-ENGINE_VERSION = "aldergrove-compute-v1"
+ENGINE_VERSION = "aldergrove-compute-v2"
 
 CENT = Decimal("0.01")
 RATIO_PLACES = Decimal("0.0001")
@@ -133,17 +140,31 @@ def _provenance_index(
     spread: Spread, extractions: list[ExtractedValue]
 ) -> dict[tuple[str, int], ExtractedValue]:
     """(field, fiscal year) -> the extracted value the spread rests
-    on: the first occurrence, in the period's current document, in
-    page/line order — the same selection the spread builder makes."""
-    doc_by_year = {ps.fiscal_year: ps.document_id for ps in spread.period_sources}
+    on. Since round 8 the spread rests on one current document per
+    (period, source type), and the cell comes from the
+    highest-precedence source type that reports the line: an
+    extraction counts only when its document is its own type's
+    current version for the period, and among the types the
+    precedence race decides before page/line order does — the same
+    selection the spread builder makes. A value from a
+    lower-precedence type is a disagreement source, never the
+    cell; a value from a superseded version of its own type is
+    neither."""
+    current_doc: dict[tuple[int, str], str] = {
+        (ps.fiscal_year, ps.source_type): ps.document_id
+        for ps in spread.period_sources
+    }
     index: dict[tuple[str, int], ExtractedValue] = {}
+    ranks: dict[tuple[str, int], tuple[int, tuple[int, str, str]]] = {}
     for v in extractions:
         year = period_year_of(v)
-        if doc_by_year.get(year) != v.provenance.document_id:
+        source_type = v.source_type or "audited_statement"
+        if current_doc.get((year, source_type)) != v.provenance.document_id:
             continue
         key = (v.field, year)
-        current = index.get(key)
-        if current is None or _coord(v) < _coord(current):
+        rank = (precedence_rank(source_type), _coord(v))
+        if key not in ranks or rank < ranks[key]:
+            ranks[key] = rank
             index[key] = v
     return index
 
@@ -724,6 +745,112 @@ def _canonical_hash(descriptor: dict) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+# ---------------------------------------------------------------------
+# Disagreement flags (round 8): a figure computed over a materially
+# disagreed line carries the disagreement's id.
+# ---------------------------------------------------------------------
+
+
+def _material_disagreement_index(spread: Spread | None) -> dict[tuple[str, int], set[str]]:
+    """(spread line key, fiscal year) -> the ids of the MATERIAL
+    disagreements recorded on that cell. Immaterial disagreements
+    do not flag figures: the spread carries them, the memo counts
+    them, but a figure resting on a line two sources reported
+    within a hair of each other is not thereby contested."""
+    index: dict[tuple[str, int], set[str]] = {}
+    if spread is None:
+        return index
+    for record in spread.disagreements:
+        if record.material:
+            index.setdefault((record.line_key, record.fiscal_year), set()).add(
+                record.disagreement_id
+            )
+    return index
+
+
+def _apply_disagreement_flags(
+    figures: list[ComputedFigure],
+    spread: Spread | None,
+    *,
+    extra_packs: list[ComputationPack] | tuple[ComputationPack, ...] = (),
+) -> None:
+    """Walk every figure's derivation and stamp the material
+    disagreement ids it rests on.
+
+    A figure is flagged when any spread-line input in its
+    derivation — directly, through an intermediate step, or
+    through a figure it consumes — reads a cell the spread
+    records a material disagreement on. Figures consumed from
+    other packs (the global view reads entity packs) contribute
+    the flags their own pack recorded: those were computed
+    against their own spread, and re-deriving them here without
+    that spread would guess. The walk is memoised and
+    cycle-guarded; derivation graphs are acyclic by construction,
+    so the guard is a backstop, not a feature.
+    """
+    material = _material_disagreement_index(spread)
+    local = {(f.key, f.fiscal_year, f.entity): f for f in figures}
+    local_ids = {id(f) for f in figures}
+
+    def resolve(inp) -> ComputedFigure | None:
+        key = (inp.figure_key, inp.fiscal_year, inp.entity)
+        if inp.pack_id:
+            for pack in extra_packs:
+                if pack.pack_id == inp.pack_id:
+                    for candidate in pack.figures:
+                        if (candidate.key, candidate.fiscal_year, candidate.entity) == key:
+                            return candidate
+                    return None
+        if key in local:
+            return local[key]
+        for pack in extra_packs:
+            for candidate in pack.figures:
+                if (candidate.key, candidate.fiscal_year, candidate.entity) == key:
+                    return candidate
+        return None
+
+    memo: dict[int, set[str]] = {}
+
+    def flags_of(fig: ComputedFigure, seen: frozenset[int]) -> set[str]:
+        if id(fig) in memo:
+            return memo[id(fig)]
+        if id(fig) in seen:
+            return set()
+        seen = seen | {id(fig)}
+        steps = {s.step_key: s for s in fig.steps}
+
+        def walk_step(step, seen_steps: frozenset[str]) -> set[str]:
+            if step.step_key in seen_steps:
+                return set()
+            seen_steps = seen_steps | {step.step_key}
+            found: set[str] = set()
+            for inp in step.inputs:
+                if inp.kind == "spread_line":
+                    found |= material.get((inp.line_key, inp.fiscal_year), set())
+                elif inp.kind == "step" and inp.step_key in steps:
+                    found |= walk_step(steps[inp.step_key], seen_steps)
+                elif inp.kind == "figure":
+                    dep = resolve(inp)
+                    if dep is None:
+                        continue
+                    if id(dep) in local_ids:
+                        found |= flags_of(dep, seen)
+                    else:
+                        # Another pack's figure: its own flags,
+                        # computed against its own spread.
+                        found |= set(dep.disagreement_ids)
+            return found
+
+        flags: set[str] = set()
+        for step in fig.steps:
+            flags |= walk_step(step, frozenset())
+        memo[id(fig)] = flags
+        return flags
+
+    for fig in figures:
+        fig.disagreement_ids = sorted(flags_of(fig, frozenset()))
+
+
 def _sorted_supplemental(supplemental: list[ExtractedValue]) -> list[ExtractedValue]:
     return sorted(
         supplemental,
@@ -773,6 +900,7 @@ def compute_entity_pack(
     for idx, year in enumerate(periods):
         prior = periods[idx - 1] if idx > 0 else None
         figures.extend(_compute_year(ctx, year, prior))
+    _apply_disagreement_flags(figures, spread)
     definitions = sorted(
         covenant_definitions, key=lambda d: (d.name, d.fiscal_year)
     )
@@ -856,6 +984,13 @@ def compute_global_pack(
     })
     for year in years:
         figures.extend(_global_year(included, eliminations_sorted, year))
+    # Global figures consume entity figures, whose own packs
+    # already flagged them against their own spreads; the flags
+    # propagate through the figure inputs.
+    _apply_disagreement_flags(
+        figures, None,
+        extra_packs=[pack for _name, pack in included],
+    )
 
     all_supplemental: list[ExtractedValue] = []
     for _, pack in included:
