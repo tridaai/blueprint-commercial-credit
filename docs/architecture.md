@@ -252,6 +252,67 @@ whole gate: submit, approve, return, flag, recompose, plus a
 memo's version history (its supersession chain with derived
 statuses, its events, and its diff) and the diff record itself.
 
+## Committee gate (round 7)
+
+`committee.py` holds the second gate's discipline — the quorum
+rules, the adverse-action and deferral vocabularies, condition
+and reason validation, full-status derivation, and the notice
+renderer — and `CreditPipeline` runs the workflow:
+`convene_committee` brings the officer-final memo before the
+committee, `decide_committee` records the decision. Convening
+and deciding are events on the same review-event stream the
+officer gate writes, so `derive_full_status` reads one ordered
+record across both gates: a memo that has not reached officer
+approval has no committee state; past it, convened and decided
+events land in_committee and then the outcome's status
+(committee_approved, committee_approved_conditional, declined,
+deferred). The decidable artefact is checked before any state
+check: a memo superseded by a newer version, or one that is not
+the officer-final artefact, is refused by name.
+
+A decision is a stored, content-addressed `CommitteeDecision`
+(migration 0007): outcome, members, quorum, recorder, and the
+outcome's payload. The quorum discipline is mechanical —
+`validate_quorum` requires at least two distinct named members
+with committee roles, the recorder among them, whatever quorum
+the caller states (a stated quorum of 1 is itself refused).
+Outcome payloads are exclusive: conditions exist only on
+approve_with_conditions, adverse reasons only on a decline,
+deferral reasons and re-presentment requirements only on a
+deferral.
+
+Conditions are validated against the memo's own inputs. A
+financial covenant must name a figure key of the pinned
+computation pack, and its threshold must be a key of the same
+trace universe `verify_memo` builds (`build_trace_universe` over
+the memo's pinned artefacts); the found trace is stamped onto
+the stored condition. A decline's reasons are validated tie by
+tie (`_tie_problem`): the pinned report is consulted for the
+cited test's outcome — pass is an automatic refusal — the code
+must be the one that outcome speaks to (coverage failures,
+leverage, concentration, documentation, staleness each have
+their tests; a not_evaluable supports only the
+insufficiency-of-information and documentation codes), a figure
+tie must match an occurrence in the memo's verification record
+(text, value and source), and a file-fact tie must name a
+required checklist item the file actually lacks. The
+adverse-action notice is a pure rendering of the stored
+decision over the pinned report and credit file — no text is
+accepted at decision time, so nothing unproven can reach the
+borrower.
+
+A deferral is not terminal: the decision record stays, the
+memo's derived status reads `deferred`, and `convene_committee`
+accepts the memo again from that state (re-presentment). The
+next decision's id is derived over a descriptor that includes
+its sequence among the memo's decisions, so the deferral and
+its successor coexist as separate records and the history shows
+both. The API exposes convene, decide, the committee state
+(status + decisions + latest), a decision by id, and the
+adverse-action notice for a memo's latest decline; memo history
+gains the memo's committee decisions alongside its versions,
+events and diff.
+
 ## Storage
 
 PostgreSQL is the deployment store. `migrations/` holds numbered SQL

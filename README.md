@@ -279,8 +279,68 @@ evidence:
   bars that officer from approving the memo, by name of the
   flag, so a different officer must decide.
 
-The committee gate — the second human gate, with coded
-adverse-action reasons (design law 3) — is round 7.
+## What round 7 adds
+
+The committee gate — the second human gate, where the credit
+itself is decided, and where a decline must explain itself in
+codes tied to evidence (design law 3):
+
+- **A quorum of named members, or no decision** — a decision is
+  a stored record (migration 0007) naming the members who made
+  it, each with a role, the quorum they met, and the recorder —
+  who must be one of the members. The quorum is at least two,
+  mechanically: a quorum of one is refused whatever the caller
+  asks, so the officer who approved the memo can sit on the
+  committee but never be its only member, and no preparer-side
+  role sits at all. The committee acts only on the
+  officer-final memo, only once it stands convened, and a
+  decided memo cannot be decided again.
+- **Outcomes, all coded** — approve, approve with conditions,
+  decline, defer. Each outcome carries only its own payload: an
+  approval records no conditions and no reasons; anything else
+  is refused rather than quietly stored.
+- **Conditions are structured records** — a financial covenant
+  (metric, operator, threshold), a reporting requirement, a
+  documentation item, each with its due/review cadence as data.
+  A covenant's threshold must trace into the memo's pinned
+  artefacts through the same trace universe the figure verifier
+  uses, and the trace is recorded on the condition — an invented
+  threshold refuses the whole decision. Round 10 will schedule
+  these as covenants; this round records them.
+- **Declines carry coded reasons, tied or refused (law 3)** —
+  every adverse-action reason is a code from the versioned
+  vocabulary (`adverse-action-reasons-v1`) PLUS a mechanical
+  tie: a policy test of the memo's pinned report that failed or
+  could not be evaluated (by test id), a figure in the memo's
+  verification record (by its trace), or a required checklist
+  item missing from the file (by item id). A reason citing a
+  test that PASSED, a figure that was never traced, or a
+  document that is on file is refused, with the offender named;
+  a code wearing the wrong evidence — a coverage "failure" over
+  a test that merely could not be evaluated — is refused the
+  same way. There is no free-text reason field. The
+  borrower-facing adverse-action notice is then GENERATED from
+  the codes and their ties — statements from the vocabulary,
+  evidence clauses read off the pinned report, the verification
+  record and the checklist — so the notice can only say what
+  the record already proves (ECOA/Reg B: specific, accurate).
+- **Deferrals name the path back** — a deferral carries coded
+  reasons (`committee-deferral-reasons-v1`) and named
+  re-presentment requirements. The memo's derived status reads
+  `deferred`: it is back with the credit officer, it is not a
+  draft, and re-presentment convenes the committee again on the
+  same officer-final artefact — the new decision supersedes the
+  deferral on the record, which keeps both.
+- **Status is still derived, never stored** — the officer
+  gate's event stream extends with `committee_convened` and
+  `committee_decided`, so one ordered record derives the full
+  chain: draft → in_officer_review → officer_approved →
+  in_committee → committee_approved |
+  committee_approved_conditional | declined | deferred.
+
+Later rounds add disagreement handling, staleness blocks, and
+the covenant monitoring loop that schedules round 7's
+conditions.
 
 ## The laws (enforced in code, never in prompts)
 
