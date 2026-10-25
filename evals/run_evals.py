@@ -218,6 +218,35 @@ and a CRE file whose appraisal goes stale:
                             approval record carries the readiness
                             report id and blocker count.
 
+Round 10 counters — covenants (law 6), graded on the purpose-built
+committee-ready file taken through a conditional approval:
+
+  covenant_schedule_date_   every date in the graded table — pure
+    wrong                   schedule arithmetic (quarterly/annual
+                            cadences, leap years, fiscal-year
+                            offsets, the maturity cap, reporting
+                            lags) and the end-to-end set's DSCR
+                            test dates. REQUIRED: 0.
+  covenant_threshold_       the stored covenant set is
+    mutated_in_place        byte-identical after an amendment: a
+                            threshold changes only by a superseding
+                            version recorded beside the set.
+                            REQUIRED: 0 mutations.
+  covenant_due_missing_     a covenant test standing at
+    from_queue              awaiting_inputs, its required inputs
+                            named, must appear in the due-work
+                            queue. REQUIRED: 0 missing.
+  covenant_tick_duplication re-running the scheduler tick at the
+                            same as_of records no second crossing.
+                            REQUIRED: 0.
+  covenant_positive_paths   the set is created from the
+                            conditional approval (pinning decision
+                            + policy version), the schedule
+                            computes, the tick marks the due tests,
+                            the queue lists the awaiting test with
+                            inputs named, and the amendment lands
+                            as version 2 in the derived schedule.
+
 Later rounds add counters as their machinery lands.
 Exit code 0 = GATE: PASS.
 """
@@ -237,6 +266,12 @@ from commercial_credit.computations import (  # noqa: E402
     compute_entity_pack,
     compute_global_pack,
     verify_trace,
+)
+from commercial_credit.covenants import (  # noqa: E402
+    add_months,
+    covenant_test_dates,
+    deliverable_due_dates,
+    fiscal_year_end,
 )
 from commercial_credit.documents import (  # noqa: E402
     LocalDocumentStore,
@@ -2158,6 +2193,206 @@ def main() -> int:
           f"{'fresh convene, approval stamp, named tax block, stale-appraisal refresh all landed' if readiness_positive else 'FAILED'}")
     if not readiness_positive:
         failures.append("a readiness positive path did not land")
+
+    # ---------------------------------------------------------------
+    # Round 10: covenants (law 6). The graded date table runs the
+    # pure schedule arithmetic; the end-to-end path takes the
+    # committee-ready file through a conditional approval, a
+    # recorded closing, the schedule, the queue, the tick and an
+    # amendment. Zero tolerance on all four counters.
+    # ---------------------------------------------------------------
+    date_table = [
+        (add_months(date(2026, 1, 31), 1), date(2026, 2, 28)),
+        (add_months(date(2024, 1, 31), 1), date(2024, 2, 29)),
+        (add_months(date(2024, 2, 29), 12), date(2025, 2, 28)),
+        (fiscal_year_end(2024, month=2, day=29), date(2024, 2, 29)),
+        (fiscal_year_end(2025, month=2, day=29), date(2025, 2, 28)),
+        (
+            covenant_test_dates(
+                date(2026, 1, 15), frequency="annual",
+                basis="fiscal_period_end", term_months=36,
+            ),
+            [(date(2026, 12, 31), 2026), (date(2027, 12, 31), 2027),
+             (date(2028, 12, 31), 2028)],
+        ),
+        (
+            covenant_test_dates(
+                date(2026, 1, 15), frequency="quarterly",
+                basis="fiscal_period_end", term_months=12,
+            ),
+            [(date(2026, 3, 31), 2026), (date(2026, 6, 30), 2026),
+             (date(2026, 9, 30), 2026), (date(2026, 12, 31), 2026)],
+        ),
+        (
+            covenant_test_dates(
+                date(2026, 1, 15), frequency="annual",
+                basis="fiscal_period_end", term_months=36,
+                fiscal_month=6, fiscal_day=30,
+            ),
+            [(date(2026, 6, 30), 2026), (date(2027, 6, 30), 2027),
+             (date(2028, 6, 30), 2028)],
+        ),
+        (
+            covenant_test_dates(
+                date(2024, 2, 29), frequency="annual",
+                basis="point_in_time", term_months=12,
+            ),
+            [(date(2024, 12, 31), 2024), (date(2025, 2, 28), None)],
+        ),
+        (
+            covenant_test_dates(
+                date(2026, 7, 1), frequency="semiannual",
+                basis="fiscal_period_end", term_months=24,
+            ),
+            [(date(2026, 12, 31), 2026), (date(2027, 6, 30), 2027),
+             (date(2027, 12, 31), 2027), (date(2028, 6, 30), 2028)],
+        ),
+        (
+            deliverable_due_dates(
+                date(2026, 7, 1), frequency="annual", term_months=60,
+            ),
+            [(date(2027, 3, 31), 2026), (date(2028, 3, 30), 2027),
+             (date(2029, 3, 31), 2028), (date(2030, 3, 31), 2029),
+             (date(2031, 3, 31), 2030)],
+        ),
+    ]
+    schedule_date_wrong = sum(
+        1 for got, want in date_table if got != want
+    )
+
+    kp = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    k_file = kp.open_application(
+        _ready_borrower(), _ready_facility(),
+        documents=_ready_documents(),
+    )
+    kcf = k_file.credit_file_id
+    _, k_final = _officer_final_for(kp, kcf, as_of=date(2026, 6, 30))
+    kp.convene_committee(
+        kcf, k_final.memo_id, actor=C_OFFICER,
+        actor_role=C_OFFICER_ROLE, as_of=date(2026, 6, 30),
+    )
+    kp.record_closing(
+        kcf, closing_date=date(2026, 7, 1), actor=C_OFFICER,
+        actor_role=C_OFFICER_ROLE,
+    )
+    k_decision = kp.decide_committee(
+        kcf, k_final.memo_id,
+        recorder_id=C_CHAIR, recorder_role="committee_chair",
+        members=list(C_MEMBERS), outcome="approve_with_conditions",
+        conditions=[
+            CommitteeCondition(
+                condition_id="", type="financial_covenant",
+                metric_key="dscr", operator=">=",
+                threshold=Decimal("1.25"), due_cadence="annual",
+            ),
+            CommitteeCondition(
+                condition_id="", type="reporting_requirement",
+                report_what="Annual audited financial statements",
+                due_cadence="annual",
+            ),
+        ],
+    )
+    k_sets = kp.list_covenant_sets(kcf)
+    set_created_ok = (
+        len(k_sets) == 1
+        and k_sets[0].decision_id == k_decision.decision_id
+        and k_sets[0].policy_version == "v1"
+        and k_sets[0].state == "active"
+    )
+    k_set = k_sets[0]
+    k_instances = kp.covenant_schedule(
+        kcf, as_of=date(2026, 8, 1)
+    )["sets"][0]["instances"]
+    k_dscr_dates = [
+        i.test_date for i in k_instances if i.metric_key == "dscr"
+    ]
+    if k_dscr_dates != [date(y, 12, 31) for y in range(2026, 2031)]:
+        schedule_date_wrong += 1
+    print(f"covenant_schedule_date_wrong: {schedule_date_wrong} of "
+          f"{len(date_table) + 1} graded cases (required 0)")
+    if schedule_date_wrong:
+        failures.append("a covenant schedule date was wrong")
+
+    # The queue: the FY2026 DSCR test stands awaiting its inputs
+    # at 2026-12-15, and the queue must list it, inputs named.
+    k_dec_instances = kp.covenant_schedule(
+        kcf, as_of=date(2026, 12, 15)
+    )["sets"][0]["instances"]
+    k_dscr_2026 = next(
+        i for i in k_dec_instances
+        if i.metric_key == "dscr" and i.test_date == date(2026, 12, 31)
+    )
+    k_queue = kp.covenant_due_work(as_of=date(2026, 12, 15))
+    k_queue_entry = next(
+        (e for e in k_queue
+         if e["instance"].instance_id == k_dscr_2026.instance_id),
+        None,
+    )
+    due_missing = 0 if (
+        k_dscr_2026.state == "awaiting_inputs"
+        and k_queue_entry is not None
+        and k_queue_entry["borrower"]
+        == "Calloway Precision Manufacturing, Inc."
+        and any(
+            "FY2026" in name
+            for name in k_queue_entry["instance"].required_inputs
+        )
+    ) else 1
+    print(f"covenant_due_missing_from_queue: {due_missing} "
+          f"(required 0)")
+    if due_missing:
+        failures.append("a due covenant test was missing from the queue")
+
+    # The tick: crossings recorded once, however often it runs.
+    first_tick = kp.tick_covenants(as_of=date(2027, 1, 15))
+    second_tick = kp.tick_covenants(as_of=date(2027, 1, 15))
+    tick_duplication = len(second_tick["crossings_recorded"])
+    print(f"covenant_tick_duplication: {tick_duplication} "
+          f"(required 0); first tick recorded "
+          f"{len(first_tick['crossings_recorded'])} crossings")
+    if tick_duplication:
+        failures.append("the covenant tick duplicated a crossing")
+
+    # The amendment: the stored set never moves; the derived
+    # current covenant does — version 2 at the new threshold.
+    k_original = next(
+        c for c in k_set.covenants if c.metric_key == "dscr"
+    )
+    stored_before = kp.get_covenant_set(
+        kcf, k_set.set_id
+    ).model_dump_json()
+    kp.amend_covenant(
+        kcf, k_original.covenant_id,
+        author_id=C_CHAIR, author_role="committee_chair",
+        reason_code="committee_redecision",
+        decision_id=k_decision.decision_id,
+        threshold=Decimal("1.30"),
+    )
+    stored_after = kp.get_covenant_set(
+        kcf, k_set.set_id
+    ).model_dump_json()
+    threshold_mutated = 0 if stored_before == stored_after else 1
+    print(f"covenant_threshold_mutated_in_place: {threshold_mutated} "
+          f"(required 0)")
+    if threshold_mutated:
+        failures.append("a covenant threshold was mutated in place")
+    k_current = kp.covenant_schedule(
+        kcf, as_of=date(2026, 8, 1)
+    )["sets"][0]["current_covenants"]
+    amendment_landed = any(
+        c.metric_key == "dscr" and c.threshold == Decimal("1.30")
+        and c.version == 2 for c in k_current
+    )
+    covenant_positive = (
+        set_created_ok and due_missing == 0 and amendment_landed
+        and len(first_tick["crossings_recorded"]) == 2
+    )
+    print(f"covenant_positive_paths: "
+          f"{'set from conditional approval, schedule computed, tick marks due, queue lists with inputs named, amendment lands as v2' if covenant_positive else 'FAILED'}")
+    if not covenant_positive:
+        failures.append("a covenant positive path did not land")
 
     if failures:
         print("GATE: FAIL")
