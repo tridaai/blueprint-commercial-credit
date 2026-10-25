@@ -178,6 +178,15 @@ class ExtractedValue(BaseModel):
     period_label: str
     fiscal_year: int | None = None
     provenance: Provenance
+    # Which kind of source the value was read from (round 8): the
+    # audited statements, the tax return, or the management
+    # statements — disagreements.py's vocabulary. The extractor
+    # stamps it; the spreading engine falls back to the credit
+    # file's document record for values that arrive unstamped.
+    # It is provenance metadata: two values for the same line from
+    # different source kinds are a disagreement to carry, never
+    # two versions of one truth to merge.
+    source_type: str | None = None
     # The line label exactly as it appeared in the source document.
     # Mapped values name their canonical field in `field`; a line the
     # spreading taxonomy does not map keeps its label here and travels
@@ -358,12 +367,17 @@ def require_valid_adjustment(adjustment: SpreadAdjustment) -> None:
 
 
 class PeriodSource(BaseModel):
-    """Which document version one spread period rests on.
+    """Which document version one spread period rests on, per
+    source type (round 8).
 
     When a borrower files a corrected statement for a period, the
-    new version supersedes the earlier extraction for that period;
-    the spread records the version it used and names the superseded
-    documents, whose extracted values remain in the store.
+    new version supersedes the earlier extraction *of the same
+    source type* for that period; the spread records the version
+    it used and names the superseded documents, whose extracted
+    values remain in the store. A document of a different source
+    type — the tax return next to the audited statements — never
+    supersedes anything: it stands alongside, and where the two
+    disagree the spread records a Disagreement (below).
     """
 
     fiscal_year: int
@@ -372,6 +386,62 @@ class PeriodSource(BaseModel):
     document_sha256: str
     version: int = Field(ge=1)
     superseded_document_ids: list[str] = Field(default_factory=list)
+    source_type: str = "audited_statement"
+
+
+class DisagreementSource(BaseModel):
+    """One source's figure inside a disagreement (round 8).
+
+    The value exactly as that source reported it, where it was
+    read from, and its distance from the figure the spread
+    carries: `delta_abs` is |value − working value| and
+    `delta_rel` that distance over the working value (None when
+    the working value is zero, where a relative distance has no
+    meaning). The working source itself is listed too, with zero
+    deltas — the record shows every figure, not just the losers.
+    """
+
+    source_type: str
+    document_id: str
+    document_sha256: str
+    value: Decimal
+    provenance: Provenance
+    delta_abs: Decimal
+    delta_rel: Decimal | None = None
+
+
+class Disagreement(BaseModel):
+    """Two source types reporting different figures for one spread
+    line in one period (round 8; design law 5).
+
+    The disagreement is a first-class record on the spread, not a
+    footnote: it names the line and the period, carries EVERY
+    reporting source's value with its provenance (the figure the
+    spread works from and each figure it set aside), and records
+    the materiality verdict the disagreement policy reached. The
+    values are never averaged and the working value is never
+    silently picked: the precedence that chose it is the policy's,
+    stated in disagreements.py, and this record is how any
+    consumer of the spread — the computation engine, the memo,
+    an examiner — sees that the line is contested.
+    """
+
+    disagreement_id: str
+    credit_file_id: str
+    line_key: str
+    line_label: str
+    fiscal_year: int
+    working_source_type: str
+    working_value: Decimal
+    sources: list[DisagreementSource] = Field(default_factory=list)
+    material: bool
+    policy_version: str
+
+    def source(self, source_type: str) -> DisagreementSource | None:
+        for source in self.sources:
+            if source.source_type == source_type:
+                return source
+        return None
 
 
 class SpreadLine(BaseModel):
@@ -422,6 +492,14 @@ class Spread(BaseModel):
     lines: list[SpreadLine]
     unmapped: list[UnmappedEntry] = Field(default_factory=list)
     adjustments: list[SpreadAdjustment] = Field(default_factory=list)
+    # Round 8: the disagreements between source types the spread
+    # carries, and the version of the disagreement policy that
+    # judged them. Part of the spread's content, so the spread id
+    # covers them: a rebuild that sees different sources is a
+    # different spread, and a consumer can never be handed the
+    # lines without the contests recorded on them.
+    disagreements: list[Disagreement] = Field(default_factory=list)
+    disagreement_policy_version: str = ""
 
 
 # ---------------------------------------------------------------------
@@ -502,6 +580,14 @@ class ComputedFigure(BaseModel):
     missing_inputs: list[str] = Field(default_factory=list)
     steps: list[ComputationStep] = Field(default_factory=list)
     notes: str = ""
+    # Round 8: the ids of the MATERIAL document disagreements this
+    # figure rests on, when any input in its derivation — directly,
+    # or through a figure it consumes — reads a spread line a
+    # disagreement contests. The figure still computes, from the
+    # spread's working value; the flag means it can never present
+    # as a clean figure: the memo verifier names the disagreement
+    # in the figure's trace.
+    disagreement_ids: list[str] = Field(default_factory=list)
 
 
 class CovenantDefinition(BaseModel):
@@ -808,6 +894,9 @@ class MemoSection(BaseModel):
     section: the structured list of policy test ids the section
     accounts for, so the verifier can check exceptions integrity
     structurally instead of trusting the prose.
+    `disagreement_ids` is the round-8 parallel, used only by the
+    document_disagreements section: the material disagreement ids
+    the section accounts for, checked the same way.
     """
 
     key: str
@@ -815,6 +904,7 @@ class MemoSection(BaseModel):
     paragraphs: list[str] = Field(default_factory=list)
     tables: list[MemoTable] = Field(default_factory=list)
     exception_test_ids: list[str] = Field(default_factory=list)
+    disagreement_ids: list[str] = Field(default_factory=list)
 
 
 class FigureTrace(BaseModel):
@@ -848,6 +938,12 @@ class MemoVerification(BaseModel):
     figures: list[FigureTrace] = Field(default_factory=list)
     exceptions_expected: list[str] = Field(default_factory=list)
     exceptions_listed: list[str] = Field(default_factory=list)
+    # Round 8: the material disagreements the pinned spread records
+    # (expected) and the ones the memo's disagreements section
+    # accounts for (listed) — the same structural discipline the
+    # exceptions above have carried since round 5.
+    disagreements_expected: list[str] = Field(default_factory=list)
+    disagreements_listed: list[str] = Field(default_factory=list)
     verified: bool = True
 
 
