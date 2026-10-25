@@ -14,11 +14,18 @@ random-based into the result: the same inputs rebuild the same
 spread, byte for byte, with the same content-derived spread id.
 Monetary values are Decimal end to end.
 
-What the builder deliberately does not do: compute ratios, run
-policy tests, or judge disagreements between documents (rounds 3, 4
-and 8). Inside one period, the latest statement version wins whole —
-a restated statement supersedes the earlier extraction for that
-period, and the spread says which version it rests on.
+What the builder deliberately does not do: compute ratios or run
+policy tests (rounds 3 and 4). Disagreements between documents are
+round 8, and the builder's rule for them is the one design law 5
+states: within one source type and one period, the latest version
+wins whole — a restated audited statement supersedes the earlier
+audited statement, and the spread says which version it rests on.
+Across source types nothing supersedes: the spread works from the
+highest-precedence source that reports each line (audited, then
+tax, then management — disagreements.py), and where the sources
+differ beyond the disagreement policy's tolerance the difference
+is recorded on the spread as a Disagreement, every source's value
+carried with its provenance. Nothing is averaged, ever.
 """
 
 from __future__ import annotations
@@ -28,9 +35,17 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 
+from .disagreements import (
+    DISAGREEMENT_POLICY,
+    SOURCE_AUDITED,
+    detect_disagreement,
+    precedence_rank,
+    source_type_for_document,
+)
 from .errors import ValidationError
 from .models import (
     CreditFile,
+    Disagreement,
     ExtractedValue,
     PeriodSource,
     Spread,
@@ -175,39 +190,93 @@ def build_spread(
 
     periods = sorted({period_year_of(v) for v in ordered})
 
-    # -- which document version each period rests on ------------------
-    period_sources: list[PeriodSource] = []
-    current_doc_by_period: dict[int, str] = {}
-    for year in periods:
-        doc_ids: list[str] = []
-        for v in ordered:
-            if period_year_of(v) == year and v.provenance.document_id not in doc_ids:
-                doc_ids.append(v.provenance.document_id)
-        doc_ids.sort(key=order_of)
-        current_id = doc_ids[-1]
-        current_doc_by_period[year] = current_id
-        source_doc = credit_file.document(current_id)
-        label = next(
-            v.period_label
-            for v in ordered
-            if period_year_of(v) == year and v.provenance.document_id == current_id
-        )
-        period_sources.append(
-            PeriodSource(
-                fiscal_year=year,
-                period_label=label,
-                document_id=current_id,
-                document_sha256=source_doc.sha256 if source_doc else "",
-                version=len(doc_ids),
-                superseded_document_ids=doc_ids[:-1],
-            )
-        )
+    # -- source types ---------------------------------------------------
+    # Every value belongs to a source type: the extractor stamps it,
+    # and a value that arrives unstamped takes its type from the
+    # document record on the credit file (an unknown document is
+    # treated as a statement — the pipeline's producers all stamp).
+    def source_type_of(v: ExtractedValue) -> str:
+        if v.source_type:
+            return v.source_type
+        doc = credit_file.document(v.provenance.document_id)
+        if doc is not None:
+            return source_type_for_document(doc.kind.value)
+        return SOURCE_AUDITED
 
-    # Only the current version's values enter the spread. Superseded
-    # extractions stay in the store, retrievable, but present nothing.
-    current = [
-        v for v in ordered if v.provenance.document_id == current_doc_by_period[period_year_of(v)]
-    ]
+    # -- which document version each (period, source type) rests on -----
+    # Supersession is per source type: the latest version OF THAT
+    # TYPE filed for the period is its current version. A tax return
+    # filed after the audited statements supersedes nothing — the
+    # two stand side by side, and their differences are judged
+    # below as disagreements.
+    docs_by_period_type: dict[tuple[int, str], list[str]] = {}
+    for v in ordered:
+        key = (period_year_of(v), source_type_of(v))
+        doc_ids = docs_by_period_type.setdefault(key, [])
+        if v.provenance.document_id not in doc_ids:
+            doc_ids.append(v.provenance.document_id)
+    current_doc: dict[tuple[int, str], str] = {
+        key: doc_ids[-1] for key, doc_ids in docs_by_period_type.items()
+    }
+
+    period_sources: list[PeriodSource] = []
+    for year in periods:
+        types_present = sorted(
+            (t for (y, t) in docs_by_period_type if y == year),
+            key=lambda t: (precedence_rank(t), t),
+        )
+        for source_type in types_present:
+            doc_ids = docs_by_period_type[(year, source_type)]
+            current_id = doc_ids[-1]
+            source_doc = credit_file.document(current_id)
+            label = next(
+                v.period_label
+                for v in ordered
+                if period_year_of(v) == year
+                and source_type_of(v) == source_type
+                and v.provenance.document_id == current_id
+            )
+            period_sources.append(
+                PeriodSource(
+                    fiscal_year=year,
+                    period_label=label,
+                    document_id=current_id,
+                    document_sha256=source_doc.sha256 if source_doc else "",
+                    version=len(doc_ids),
+                    superseded_document_ids=doc_ids[:-1],
+                    source_type=source_type,
+                )
+            )
+
+    # -- the reported figure per (field, period, source type) -----------
+    # Only each type's CURRENT version reports. Within it, the
+    # first occurrence of a line stands (ordered runs page/line
+    # within the document) — a repeated line with a different value
+    # inside one document is that document contradicting itself,
+    # not a disagreement between sources, and is not averaged.
+    reported: dict[tuple[str, int, str], ExtractedValue] = {}
+    for v in ordered:
+        year = period_year_of(v)
+        source_type = source_type_of(v)
+        if v.provenance.document_id != current_doc[(year, source_type)]:
+            continue  # a superseded version of its own type
+        reported.setdefault((v.field, year, source_type), v)
+
+    source_types_present = sorted(
+        {t for (_, _, t) in reported},
+        key=lambda t: (precedence_rank(t), t),
+    )
+
+    def working_value(field: str, year: int) -> ExtractedValue | None:
+        """The figure the spread works from for one line and
+        period: the highest-precedence source type that reports
+        it. The other reporters are not discarded — they are the
+        disagreement record below."""
+        for source_type in source_types_present:
+            value = reported.get((field, year, source_type))
+            if value is not None:
+                return value
+        return None
 
     adjustments_by_cell: dict[tuple[str, int], Decimal] = {}
     for adjustment in adjustments:
@@ -218,14 +287,10 @@ def build_spread(
     lines: list[SpreadLine] = []
     for template in TEMPLATE_LINES:
         raw: dict[int, Decimal | None] = {year: None for year in periods}
-        for v in current:
-            if v.field == template.field:
-                # Sorted by page/line within the document: the first
-                # occurrence of a line in its statement stands. (A
-                # repeated line with a different value is a document
-                # disagreement — round 8's subject, not averaged here.)
-                if raw[period_year_of(v)] is None:
-                    raw[period_year_of(v)] = v.value
+        for year in periods:
+            winner = working_value(template.field, year)
+            if winner is not None:
+                raw[year] = winner.value
         adjusted: dict[int, Decimal | None] = {}
         changes: dict[int, Decimal | None] = {}
         for idx, year in enumerate(periods):
@@ -256,20 +321,21 @@ def build_spread(
         )
 
     # -- unmapped entries ----------------------------------------------
+    # The same working-value rule as the template lines: per field
+    # and period, the highest-precedence reporter's figure, with
+    # its provenance. Other reporters live in the disagreements.
     unmapped_values: dict[str, dict[int, Decimal]] = {}
     unmapped_sources: dict[str, dict[int, ExtractedValue]] = {}
     unmapped_names: dict[str, str] = {}
-    for v in current:
-        if v.field in TEMPLATE_BY_FIELD:
+    for (field, year, _type), v in reported.items():
+        if field in TEMPLATE_BY_FIELD:
             continue  # a template line, spread above
-        year = period_year_of(v)
-        unmapped_values.setdefault(v.field, {})
-        unmapped_sources.setdefault(v.field, {})
-        if year not in unmapped_values[v.field]:
-            unmapped_values[v.field][year] = v.value
-            unmapped_sources[v.field][year] = v
+        if working_value(field, year) is not v:
+            continue
+        unmapped_values.setdefault(field, {})[year] = v.value
+        unmapped_sources.setdefault(field, {})[year] = v
         unmapped_names.setdefault(
-            v.field, v.source_label or v.field.removeprefix(UNMAPPED_FIELD_PREFIX)
+            field, v.source_label or field.removeprefix(UNMAPPED_FIELD_PREFIX)
         )
     unmapped = [
         UnmappedEntry(
@@ -289,6 +355,53 @@ def build_spread(
         adjustments, key=lambda a: (a.line_key, a.fiscal_year, a.adjustment_id)
     )
 
+    # -- disagreements between source types ------------------------------
+    # Every (line, period) that more than one source type reports is
+    # judged under the disagreement policy. A record is created
+    # only where a source differs from the working figure beyond
+    # tolerance — and the record carries every source's figure, so
+    # the spread can never be read as if the working value were the
+    # only value anyone reported.
+    disagreements: list[Disagreement] = []
+    for year in periods:
+        fields = sorted({f for (f, y, _t) in reported if y == year})
+        for field in fields:
+            reporters = [
+                (t, reported[(field, year, t)]) for t in source_types_present
+                if (field, year, t) in reported
+            ]
+            if len(reporters) < 2:
+                continue
+            template = TEMPLATE_BY_FIELD.get(field)
+            if template is not None:
+                label = template.label
+            else:
+                label = unmapped_names.get(
+                    field, field.removeprefix(UNMAPPED_FIELD_PREFIX)
+                )
+            record = detect_disagreement(
+                credit_file_id=credit_file.credit_file_id,
+                field=field,
+                line_label=label,
+                fiscal_year=year,
+                reported=[
+                    (
+                        source_type,
+                        value,
+                        (
+                            credit_file.document(value.provenance.document_id).sha256
+                            if credit_file.document(value.provenance.document_id)
+                            else ""
+                        ),
+                    )
+                    for source_type, value in reporters
+                ],
+                policy=DISAGREEMENT_POLICY,
+            )
+            if record is not None:
+                disagreements.append(record)
+    disagreements.sort(key=lambda d: (d.fiscal_year, d.line_key))
+
     spread = Spread(
         spread_id="",
         credit_file_id=credit_file.credit_file_id,
@@ -298,6 +411,8 @@ def build_spread(
         lines=lines,
         unmapped=unmapped,
         adjustments=canonical_adjustments,
+        disagreements=disagreements,
+        disagreement_policy_version=DISAGREEMENT_POLICY.version,
     )
     digest = hashlib.sha256(
         spread.model_dump_json(exclude={"spread_id"}).encode("utf-8")
