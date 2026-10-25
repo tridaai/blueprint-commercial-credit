@@ -851,16 +851,43 @@ class MemoVerification(BaseModel):
     verified: bool = True
 
 
+class MemoCommitteeFlag(BaseModel):
+    """An item an officer marks on a memo under review (round 6).
+
+    Two kinds: `committee_attention` — carried onto the
+    officer-final memo so the committee sees it — and
+    `conflict_of_interest`, by which an officer declares they
+    cannot decide this memo; that officer's approval is then
+    refused and the memo must be decided by a different officer.
+    """
+
+    flag_id: str
+    kind: str  # committee_attention | conflict_of_interest
+    section_key: str | None = None
+    note: str = ""
+    officer_id: str
+    officer_role: str
+    at: datetime = Field(default_factory=utcnow)
+
+
 class CreditMemo(BaseModel):
-    """The draft credit memo: a stored, content-addressed artefact.
+    """The credit memo: a stored, content-addressed artefact.
 
     The header pins everything the memo was composed from — the
     spread, the computation pack, the policy pack and version and
     the report, all by id — so a reader can walk from any figure in
-    the memo to the exact artefacts that produced it. The memo ends
-    this round in DRAFT: it states facts and policy outcomes, its
-    recommendation and conditions sections are placeholders, and the
-    credit officer's gate is a later round.
+    the memo to the exact artefacts that produced it. A composed
+    memo is born a DRAFT: it states facts and policy outcomes, and
+    its recommendation and conditions sections are placeholders.
+
+    At the credit officer gate (round 6) a draft is reviewed by a
+    named officer. Approval mints a NEW artefact — the
+    officer-final memo, status `officer_approved`, naming the
+    draft it supersedes and the officer who approved it, carrying
+    any committee flags — and a MemoDiff records what the officer
+    changed. A draft is never edited in place; its live review
+    status (draft / in review / returned / approved) is derived
+    from the memo review events, not stored on the artefact.
 
     Content-addressed like the artefacts it pins: the memo id is
     derived from the pinned ids, the composer profile, the section
@@ -884,9 +911,106 @@ class CreditMemo(BaseModel):
     sections: list[MemoSection] = Field(default_factory=list)
     verification: MemoVerification
     created_at: datetime = Field(default_factory=utcnow)
+    # Round 6 (officer gate) lineage. A composed draft supersedes
+    # nothing; a recomposition after a return names the returned
+    # draft it replaces, and an officer-final memo names the draft
+    # it was approved from, the approving officer, and the flags
+    # the committee must see.
+    supersedes_memo_id: str | None = None
+    reviewed_by: str | None = None
+    committee_flags: list[MemoCommitteeFlag] = Field(default_factory=list)
 
     def section(self, key: str) -> MemoSection | None:
         for section in self.sections:
             if section.key == key:
                 return section
         return None
+
+
+# ---------------------------------------------------------------------
+# Round 6: the credit officer gate. A draft memo is reviewed by a
+# named credit officer, who approves it (as-is, or with edits that
+# pass the figure verifier again), returns it for rework with
+# coded reasons, or flags items on it. Every action is a stored,
+# append-only review event naming the actor; approval mints a new
+# memo artefact plus a diff — the record of what the machine
+# proposed and what the human changed (design law 8).
+# ---------------------------------------------------------------------
+
+
+class MemoReviewEvent(BaseModel):
+    """One recorded action at the officer gate.
+
+    Actions: submitted_for_review, approved_as_is,
+    approved_with_edits, returned_for_rework, flagged, recomposed.
+    The stream of these events for a memo is the authority for its
+    review status — the artefact itself is never mutated. Returns
+    carry coded reasons from the versioned vocabulary
+    (officer_gate.RETURN_REASON_CODES); `flag` carries the full
+    MemoCommitteeFlag when the action is `flagged`.
+    """
+
+    event_id: str = Field(default_factory=lambda: new_id("rev"))
+    credit_file_id: str
+    memo_id: str
+    action: str
+    actor_id: str
+    actor_role: str
+    resulting_memo_id: str | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+    reason_vocabulary: str | None = None
+    flag: MemoCommitteeFlag | None = None
+    note: str = ""
+    at: datetime = Field(default_factory=utcnow)
+
+
+class SectionChange(BaseModel):
+    """One section whose text differs between draft and final."""
+
+    section_key: str
+    paragraphs_before: list[str] = Field(default_factory=list)
+    paragraphs_after: list[str] = Field(default_factory=list)
+    tables_changed: bool = False
+
+
+class FigureChange(BaseModel):
+    """One figure occurrence that differs between draft and final.
+
+    `old_trace` / `new_trace` name the artefact + field the
+    figure traced to on that side — the figure's trace status.
+    An added figure has no old side; a removed figure has no new
+    side; an altered figure carries both.
+    """
+
+    section_key: str
+    kind: str  # added | removed | altered
+    old_text: str | None = None
+    old_value: str | None = None
+    old_trace: str | None = None
+    new_text: str | None = None
+    new_value: str | None = None
+    new_trace: str | None = None
+
+
+class MemoDiff(BaseModel):
+    """The draft-vs-final record of an officer approval (law 8).
+
+    Content-addressed like the memos it connects: the diff id
+    derives from the two memo ids, the approving officer, the
+    action and the changes themselves. An approval as-is produces
+    a diff with no section or figure changes — the record exists
+    either way, so 'the officer changed nothing' is itself
+    recorded, not merely the absence of a record.
+    """
+
+    diff_id: str
+    credit_file_id: str
+    from_memo_id: str
+    to_memo_id: str
+    officer_id: str
+    officer_role: str
+    action: str  # approved_as_is | approved_with_edits
+    section_changes: list[SectionChange] = Field(default_factory=list)
+    figure_changes: list[FigureChange] = Field(default_factory=list)
+    note: str = ""
+    created_at: datetime = Field(default_factory=utcnow)
