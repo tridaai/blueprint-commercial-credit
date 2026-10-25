@@ -159,6 +159,37 @@ Round 7 counters — the committee gate:
                             defer → re-present → approve on the
                             same artefact, two decisions on record.
 
+Round 8 counters — document disagreements (law 5), graded on the
+seed borrower with its FY2024 tax return and management accounts
+registered beside the audited statements (exactly seven
+disagreements: five material, two immaterial):
+
+  disagreement_detection_   the records the spread carries, by
+    exactness               line and materiality, against the
+                            hand-graded fixture.
+  disagreement_material_    a memo with the disagreements section
+    omitted_accepted        dropped, with one material
+                            disagreement's statement removed, or
+                            with a material disagreement reworded
+                            into smaller language, must each be
+                            REFUSED by the verifier. REQUIRED: 0.
+  disagreement_averaged_    the spread's working figure on a
+    or_dropped              contested line must be the audited
+                            figure itself — never the mean of the
+                            sources — and every source's figure
+                            must ride in the record. REQUIRED: 0.
+  disagreement_cross_type_  the tax return, registered after the
+    restatement_accepted    audited statements, must not
+                            supersede them: the audited period
+                            source stands, the tax source stands
+                            beside it. REQUIRED: 0.
+  disagreement_flagged_     figures computed over a materially
+    figure_clean            disagreed line must carry the flag,
+                            figures over immaterial-only lines
+                            must not, and a flagged figure's memo
+                            trace must name the disagreement.
+                            REQUIRED: 0 clean presentations.
+
 Later rounds add counters (stale-input committee-ready) as
 their machinery lands. Exit code 0 = GATE: PASS.
 """
@@ -195,6 +226,7 @@ from commercial_credit.memo import (  # noqa: E402
     build_trace_universe,
     compose_memo,
     extract_figures,
+    render_disagreement_paragraph,
     render_memo,
     verify_memo,
 )
@@ -224,6 +256,7 @@ from commercial_credit.policy import evaluate_policy, get_policy_pack  # noqa: E
 from commercial_credit.seed import (  # noqa: E402
     ReferenceLosFeed,
     ground_truth,
+    hartline_disagreement_documents,
     statement_document,
 )
 from commercial_credit.spreading import TEMPLATE_LINES  # noqa: E402
@@ -1542,6 +1575,184 @@ def main() -> int:
           f"{'approve/conditional/decline/defer-represent landed' if committee_positive else 'FAILED'}")
     if not committee_positive:
         failures.append("a committee positive path did not land")
+
+    # ---------------------------------------------------------------
+    # Round 8: document disagreements. The seed borrower again, now
+    # with its FY2024 tax return and management accounts registered
+    # beside the audited statements — the witnesses disagree, and
+    # the round is graded on the disagreement surviving every
+    # layer: detection, the spread's working figures, the
+    # computation flags, and the memo.
+    # ---------------------------------------------------------------
+    r8 = CreditPipeline(store=InMemoryCreditStore(), documents=LocalDocumentStore())
+    r8_file = r8.open_application(
+        borrower, facility,
+        documents=docs + hartline_disagreement_documents(),
+    )
+    r8_spread = r8.get_spread(r8_file.credit_file_id)
+    r8_records = list(r8_spread.disagreements)
+    r8_material = [d for d in r8_records if d.material]
+    detection_exact = (
+        len(r8_records) == 7
+        and {d.line_key for d in r8_material}
+        == {"revenue", "cost_of_goods_sold", "gross_profit", "ebit",
+            "net_income"}
+        and {d.line_key for d in r8_records if not d.material}
+        == {"inventory", "total_current_assets"}
+        and all(d.fiscal_year == 2024 for d in r8_records)
+    )
+    print(f"disagreement_detection_exactness: {len(r8_records)} records "
+          f"({len(r8_material)} material, "
+          f"{len(r8_records) - len(r8_material)} immaterial) on the "
+          f"seed borrower FY2024 "
+          f"{'— exact' if detection_exact else '— MISMATCH'}")
+    if not detection_exact:
+        failures.append("disagreement detection diverges from the fixture")
+
+    # Averaged or dropped: the working figure is the audited figure
+    # itself, and every source's figure rides in the record.
+    averaged_or_dropped = 0
+    revenue_line = next(l for l in r8_spread.lines if l.key == "revenue")
+    if revenue_line.values.get(2024) != Decimal("12374000"):
+        averaged_or_dropped += 1
+    revenue_record = next(d for d in r8_records if d.line_key == "revenue")
+    reported_values = {s.value for s in revenue_record.sources}
+    if reported_values != {
+        Decimal("12374000"), Decimal("11905000"), Decimal("12410000")
+    }:
+        averaged_or_dropped += 1
+    if revenue_line.values.get(2024) in reported_values and len(
+        reported_values
+    ) > 1 and revenue_line.values[2024] == sum(reported_values) / 3:
+        averaged_or_dropped += 1
+    print(f"disagreement_averaged_or_dropped: {averaged_or_dropped} "
+          f"(required 0)")
+    if averaged_or_dropped:
+        failures.append("a disagreement was averaged or a source dropped")
+
+    # Cross-type restatement: the tax return was registered AFTER
+    # the audited FY2024 statements; it superseded nothing.
+    cross_type_restatement = 0
+    fy24_sources = {
+        ps.source_type: ps for ps in r8_spread.period_sources
+        if ps.fiscal_year == 2024
+    }
+    tax_doc_id = next(
+        d.document_id for d in r8_file.documents
+        if d.kind == DocumentKind.TAX_RETURN
+    )
+    audited_source = fy24_sources.get("audited_statement")
+    if audited_source is None or audited_source.document_id == tax_doc_id:
+        cross_type_restatement += 1
+    if "tax_return" not in fy24_sources:
+        cross_type_restatement += 1
+    if audited_source is not None and (
+        tax_doc_id in audited_source.superseded_document_ids
+    ):
+        cross_type_restatement += 1
+    print(f"disagreement_cross_type_restatement_accepted: "
+          f"{cross_type_restatement} (required 0)")
+    if cross_type_restatement:
+        failures.append("a cross-type difference was treated as a restatement")
+
+    # Flagged figures: exactly the figures over materially disagreed
+    # lines carry flags, and their memo traces name the disagreement.
+    r8_pack = r8.compute_metrics(r8_file.credit_file_id)
+    flagged_keys = {
+        f.key for f in r8_pack.figures
+        if f.fiscal_year == 2024 and f.status == "computed"
+        and f.disagreement_ids
+    }
+    flagged_clean = 0
+    if flagged_keys != {
+        "gross_margin", "operating_margin",
+        "return_on_assets", "return_on_equity",
+    }:
+        flagged_clean += 1
+    r8_report = r8.evaluate_policy(
+        r8_file.credit_file_id, pack_version="v1", as_of=date(2025, 6, 30)
+    )
+    r8_memo = r8.compose_memo(
+        r8_file.credit_file_id, report_id=r8_report.report_id
+    )
+    r8_inputs = MemoInputs(
+        credit_file=r8.store.get_credit_file(r8_file.credit_file_id),
+        spread=r8_spread,
+        pack=r8_pack,
+        policy_report=r8_report,
+    )
+    for f in r8_pack.figures:
+        if not (f.disagreement_ids and f.status == "computed"
+                and f.value is not None):
+            continue
+        traces = [
+            t for t in r8_memo.verification.figures
+            if t.value == format(f.value, "f")
+        ]
+        if traces and not any(
+            "document disagreement" in t.source for t in traces
+        ):
+            flagged_clean += 1
+    print(f"disagreement_flagged_figure_clean: {flagged_clean} "
+          f"(required 0)")
+    if flagged_clean:
+        failures.append("a flagged figure presented as clean")
+
+    # Material omission: three tampered memos, each refused.
+    omitted_accepted = 0
+    section_dropped = r8_memo.model_copy(deep=True)
+    section_dropped.sections = [
+        s for s in section_dropped.sections
+        if s.key != "document_disagreements"
+    ]
+    one_removed = r8_memo.model_copy(deep=True)
+    removed_section = one_removed.section("document_disagreements")
+    ebit_record = next(
+        d for d in r8_material if d.line_key == "ebit"
+    )
+    removed_section.paragraphs = [
+        p for p in removed_section.paragraphs
+        if p != render_disagreement_paragraph(ebit_record)
+    ]
+    removed_section.disagreement_ids = [
+        i for i in removed_section.disagreement_ids
+        if i != ebit_record.disagreement_id
+    ]
+    reworded = r8_memo.model_copy(deep=True)
+    reworded_section = reworded.section("document_disagreements")
+    revenue_paragraph = render_disagreement_paragraph(revenue_record)
+    reworded_section.paragraphs = [
+        (
+            "Revenue (fiscal 2024): the audited statements report "
+            "$12,374,000.00, which the spread carries; the tax "
+            "return reports a broadly similar figure and the "
+            "difference is not significant."
+        ) if p == revenue_paragraph else p
+        for p in reworded_section.paragraphs
+    ]
+    for tampered in (section_dropped, one_removed, reworded):
+        try:
+            verify_memo(tampered, r8_inputs)
+            omitted_accepted += 1
+        except MemoVerificationError:
+            pass
+    print(f"disagreement_material_omitted_accepted: {omitted_accepted} "
+          f"of 3 tamper cases accepted (required 0)")
+    if omitted_accepted:
+        failures.append("the verifier accepted a memo missing a "
+                        "material disagreement")
+
+    # The positive path, on the record: the memo's verification
+    # lists exactly the material ids the spread records.
+    memo_disagreement_ok = (
+        sorted(r8_memo.verification.disagreements_expected)
+        == sorted(r8_memo.verification.disagreements_listed)
+        == sorted(d.disagreement_id for d in r8_material)
+    )
+    print(f"disagreement_memo_positive_path: "
+          f"{'memo carries all 5 material disagreements' if memo_disagreement_ok else 'FAILED'}")
+    if not memo_disagreement_ok:
+        failures.append("the memo did not carry the material disagreements")
 
     if failures:
         print("GATE: FAIL")
