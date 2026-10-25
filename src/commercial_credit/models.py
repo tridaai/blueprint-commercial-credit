@@ -18,7 +18,7 @@ from enum import Enum
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .errors import ProvenanceError
+from .errors import ProvenanceError, ValidationError
 
 
 def new_id(prefix: str) -> str:
@@ -178,6 +178,11 @@ class ExtractedValue(BaseModel):
     period_label: str
     fiscal_year: int | None = None
     provenance: Provenance
+    # The line label exactly as it appeared in the source document.
+    # Mapped values name their canonical field in `field`; a line the
+    # spreading taxonomy does not map keeps its label here and travels
+    # with field "unmapped:<slug>" so it is carried, never dropped.
+    source_label: str | None = None
 
     @field_validator("provenance", mode="before")
     @classmethod
@@ -249,3 +254,153 @@ class FiscalPeriod(BaseModel):
     fiscal_year: int
     period_end: date
     interim: bool = False
+
+
+# ---------------------------------------------------------------------
+# Round 2: spreading. The spread is a deterministic function of the
+# extractions and the adjustments — it carries no timestamps and no
+# random ids, so the same inputs rebuild it byte-identically.
+# ---------------------------------------------------------------------
+
+
+class AdjustmentReasonCode(str, Enum):
+    """Why a spread line was adjusted. Coded, never free-form alone:
+    the free-text reason rides alongside, and both are required."""
+
+    NON_RECURRING_EXPENSE = "non_recurring_expense"
+    NON_RECURRING_GAIN = "non_recurring_gain"
+    EXCESS_OWNER_COMPENSATION = "excess_owner_compensation"
+    ONE_TIME_ITEM = "one_time_item"
+    PRO_FORMA_ADJUSTMENT = "pro_forma_adjustment"
+    RECLASSIFICATION = "reclassification"
+    OTHER = "other"
+
+
+class SpreadAdjustment(BaseModel):
+    """An adjustment / add-back to one spread line for one period.
+
+    First-class record, not an edit to the extracted figure: the
+    unadjusted value stays in the spread untouched and the adjusted
+    view is derived. An adjustment must justify itself — the spread
+    line it touches, a coded reason AND a free-text reason, the
+    document provenance that supports it, and who or what proposed
+    it. `require_valid_adjustment` enforces that on receipt, the way
+    `require_complete_provenance` guards extractions.
+    """
+
+    adjustment_id: str = Field(default_factory=lambda: new_id("adj"))
+    credit_file_id: str
+    line_key: str = Field(min_length=1)
+    fiscal_year: int
+    amount: Decimal
+    reason_code: AdjustmentReasonCode
+    reason: str
+    source: Provenance
+    proposed_by: str = Field(min_length=1)
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_must_say_something(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValidationError("an adjustment requires a free-text reason")
+        return v
+
+
+def require_valid_adjustment(adjustment: SpreadAdjustment) -> None:
+    """Receiving-side check for adjustments, defence in depth behind
+    the model validators (which a model_construct call can bypass).
+    Raises ValidationError on the first defect found."""
+    if adjustment.source is None:
+        raise ValidationError(
+            f"adjustment {adjustment.adjustment_id} has no source provenance"
+        )
+    p = adjustment.source
+    if not p.document_id or p.page < 1 or not (
+        (p.line and p.line.strip()) or (p.cell and p.cell.strip())
+    ):
+        raise ValidationError(
+            f"adjustment {adjustment.adjustment_id} source provenance is incomplete"
+        )
+    if not adjustment.reason or not adjustment.reason.strip():
+        raise ValidationError(
+            f"adjustment {adjustment.adjustment_id} has no free-text reason"
+        )
+    if adjustment.reason_code is None:
+        raise ValidationError(
+            f"adjustment {adjustment.adjustment_id} has no reason code"
+        )
+    if not adjustment.proposed_by or not adjustment.proposed_by.strip():
+        raise ValidationError(
+            f"adjustment {adjustment.adjustment_id} does not name who proposed it"
+        )
+    if not adjustment.line_key or not adjustment.line_key.strip():
+        raise ValidationError(
+            f"adjustment {adjustment.adjustment_id} names no spread line"
+        )
+
+
+class PeriodSource(BaseModel):
+    """Which document version one spread period rests on.
+
+    When a borrower files a corrected statement for a period, the
+    new version supersedes the earlier extraction for that period;
+    the spread records the version it used and names the superseded
+    documents, whose extracted values remain in the store.
+    """
+
+    fiscal_year: int
+    period_label: str
+    document_id: str
+    document_sha256: str
+    version: int = Field(ge=1)
+    superseded_document_ids: list[str] = Field(default_factory=list)
+
+
+class SpreadLine(BaseModel):
+    """One template line across all spread periods.
+
+    `values` is the unadjusted view (exactly what extraction read);
+    `adjusted_values` is `values` plus the period's adjustments.
+    Both are always present so either view is derivable from the
+    spread alone. `changes` is period-over-period presentation data
+    on the unadjusted view (None where either side is unreported).
+    """
+
+    key: str
+    label: str
+    section: str
+    values: dict[int, Decimal | None]
+    adjusted_values: dict[int, Decimal | None]
+    changes: dict[int, Decimal | None]
+
+
+class UnmappedEntry(BaseModel):
+    """A statement line the taxonomy does not map, carried as itself.
+
+    Never dropped, never silently folded into a mapped line: the
+    entry keeps the label as it appeared in the document, its values
+    per period, and where each value was read from.
+    """
+
+    field: str
+    name: str
+    values: dict[int, Decimal | None]
+    sources: dict[int, Provenance]
+
+
+class Spread(BaseModel):
+    """A multi-period spread of one credit file.
+
+    `spread_id` is derived from the spread's canonical content, so
+    rebuilding from the same extractions and adjustments reproduces
+    the same id and the same bytes.
+    """
+
+    spread_id: str
+    credit_file_id: str
+    template_version: str
+    periods: list[int]
+    period_sources: list[PeriodSource]
+    lines: list[SpreadLine]
+    unmapped: list[UnmappedEntry] = Field(default_factory=list)
+    adjustments: list[SpreadAdjustment] = Field(default_factory=list)

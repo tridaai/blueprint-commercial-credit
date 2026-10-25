@@ -49,13 +49,39 @@ STATEMENT_FIELDS: dict[str, str] = {
     "EBIT": "ebit",
     "Interest expense": "interest_expense",
     "Net income": "net_income",
+    "Depreciation and amortization": "depreciation_and_amortization",
+    "Change in accounts receivable": "change_in_receivables",
+    "Change in inventory": "change_in_inventory",
+    "Change in accounts payable": "change_in_payables",
+    "Net cash provided by operating activities": "net_cash_from_operations",
+    "Capital expenditures": "capital_expenditures",
+    "Net cash used in investing activities": "net_cash_from_investing",
+    "Proceeds from borrowings": "debt_proceeds",
+    "Repayments of borrowings": "debt_repayments",
+    "Net cash from financing activities": "net_cash_from_financing",
+    "Net change in cash": "net_change_in_cash",
 }
+
+# Prefix on the field name of a statement line the taxonomy does not
+# map. The line is still extracted — with its label and provenance —
+# so the spreading engine can carry it as a named unmapped entry.
+UNMAPPED_FIELD_PREFIX = "unmapped:"
+
+
+def unmapped_field_for(label: str) -> str:
+    """Canonical field name for an unmapped statement line label."""
+    slug = "".join(ch if ch.isalnum() else "_" for ch in label.strip().lower())
+    slug = "_".join(part for part in slug.split("_") if part)
+    return f"{UNMAPPED_FIELD_PREFIX}{slug}"
 
 class OfflineReferenceExtractor:
     """Reference extractor over the generated structured documents.
 
     Deterministic, no model: it parses the stored document and returns
-    every recognised statement line with the page and line it sits on.
+    every statement line with the page and line it sits on. Lines the
+    taxonomy maps get their canonical field name; a line it does not
+    map is returned too, marked `unmapped:` and carrying its label —
+    extraction never silently drops a figure the borrower reported.
     It exists so the pipeline, the provenance contract and the evals
     run end to end offline; it makes no claim about scanned PDFs.
     """
@@ -74,9 +100,9 @@ class OfflineReferenceExtractor:
             page_no = int(page["page"])
             for line in page.get("lines", []):
                 label = line.get("label")
-                field = STATEMENT_FIELDS.get(label or "")
-                if field is None:
+                if not label:
                     continue
+                field = STATEMENT_FIELDS.get(label) or unmapped_field_for(label)
                 try:
                     amount = Decimal(str(line["value"]))
                 except (InvalidOperation, KeyError, TypeError):
@@ -92,6 +118,7 @@ class OfflineReferenceExtractor:
                             page=page_no,
                             line=f"L{int(line['line'])}",
                         ),
+                        source_label=label,
                     )
                 )
         require_complete_provenance(values)
