@@ -2064,10 +2064,14 @@ def main() -> int:
         e.input_key for e in first.blockers
     } or not second.blockers:
         cleared_without_refresh += 1
-    if any(
-        "waiv" in name or "override" in name
-        for name in dir(CreditPipeline)
-    ):
+    # (Round 11 note: waive_breach is the one waiv-named method —
+    # it resolves a covenant breach on a committee decision's
+    # authority and cannot touch a readiness blocker; the scan
+    # below therefore names it as the only allowed match.)
+    if [
+        name for name in dir(CreditPipeline)
+        if "waiv" in name or "override" in name
+    ] != ["waive_breach"]:
         cleared_without_refresh += 1
     try:
         rp.convene_committee(
@@ -2393,6 +2397,349 @@ def main() -> int:
           f"{'set from conditional approval, schedule computed, tick marks due, queue lists with inputs named, amendment lands as v2' if covenant_positive else 'FAILED'}")
     if not covenant_positive:
         failures.append("a covenant positive path did not land")
+
+    # ---------------------------------------------------------------
+    # Round 11: covenant test execution + breach cases (law 6,
+    # the math half). A fresh approved Calloway file — its DSCR
+    # covenant stands at the un-amended 1.25 — receives hand-built
+    # FY2026 statements that fail (DSCR 0.9143, leverage 4.4348,
+    # current ratio 1.7310 passes), then FY2027 statements that
+    # cure (DSCR 1.5000). A second file's period is restated. A
+    # third file's statements arrive without the cash-flow page.
+    # Zero tolerance on every counter.
+    # ---------------------------------------------------------------
+    _T_FY2026 = dict(zip(_BS, (
+        260000, 950000, 1300000, 2510000, 3740000, 6250000,
+        850000, 260000, 1450000, 3650000, 5100000, 1150000,
+    )), **dict(zip(_IS, (
+        8600000, 6020000, 2580000, 2380000, 200000, 110000, 60000,
+    ))), **dict(zip(_CF, (
+        120000, -50000, -100000, 50000, 80000, 260000, -260000,
+        270000, -200000, 70000, -110000,
+    ))))
+    _T_FY2027 = dict(zip(_BS, (
+        300000, 1000000, 1400000, 2700000, 3900000, 6600000,
+        900000, 280000, 1500000, 3600000, 5100000, 1500000,
+    )), **dict(zip(_IS, (
+        9800000, 6860000, 2940000, 2540000, 400000, 100000, 210000,
+    ))), **dict(zip(_CF, (
+        140000, -50000, -100000, 50000, 450000, 300000, -300000,
+        100000, -210000, -110000, 40000,
+    ))))
+    _T_FY2026_RESTATED = dict(
+        _T_FY2026, ebit=320000, operating_expenses=2260000,
+        net_income=180000,
+    )
+
+    def _t_stmt_doc(year, figures, with_cf=True):
+        def page(number, title, fields):
+            return {
+                "page": number, "title": title,
+                "lines": [
+                    {"line": i, "label": _LABELS[f], "value": figures[f]}
+                    for i, f in enumerate(fields, start=1)
+                ],
+            }
+
+        pages = [
+            page(1, "Balance Sheet", _BS),
+            page(2, "Income Statement", _IS),
+        ]
+        if with_cf:
+            pages.append(page(3, "Cash Flow Statement", _CF))
+        return json.dumps({
+            "document_type": "financial_statement",
+            "borrower": "Calloway Precision Manufacturing, Inc.",
+            "fiscal_year": year, "period_label": f"FY{year}",
+            "basis": "audited", "pages": pages,
+        }).encode()
+
+    def _t_deliver(pipe, cf, year, figures, with_cf=True):
+        stored = pipe.store.get_credit_file(cf)
+        register_document(
+            pipe.store, pipe.documents, stored,
+            kind=DocumentKind.FINANCIAL_STATEMENT,
+            filename=f"calloway-fy{year}-statements.json",
+            data=_t_stmt_doc(year, figures, with_cf),
+            period_label=f"FY{year}",
+        )
+        pipe.run_extraction(cf)
+
+    def _t_approved(pipe):
+        t_file = pipe.open_application(
+            _ready_borrower(), _ready_facility(),
+            documents=_ready_documents(),
+        )
+        tcf = t_file.credit_file_id
+        _, t_final = _officer_final_for(pipe, tcf, as_of=date(2026, 6, 30))
+        pipe.convene_committee(
+            tcf, t_final.memo_id, actor=C_OFFICER,
+            actor_role=C_OFFICER_ROLE, as_of=date(2026, 6, 30),
+        )
+        pipe.record_closing(
+            tcf, closing_date=date(2026, 7, 1), actor=C_OFFICER,
+            actor_role=C_OFFICER_ROLE,
+        )
+        t_decision = pipe.decide_committee(
+            tcf, t_final.memo_id,
+            recorder_id=C_CHAIR, recorder_role="committee_chair",
+            members=list(C_MEMBERS), outcome="approve_with_conditions",
+            conditions=[
+                CommitteeCondition(
+                    condition_id="", type="financial_covenant",
+                    metric_key="dscr", operator=">=",
+                    threshold=Decimal("1.25"), due_cadence="annual",
+                ),
+                CommitteeCondition(
+                    condition_id="", type="reporting_requirement",
+                    report_what="Annual audited financial statements",
+                    due_cadence="annual",
+                ),
+            ],
+        )
+        return tcf, t_decision
+
+    def _t_results(pipe, cf, metric_key):
+        return [
+            v for v in pipe.covenant_test_results(cf)
+            if v["metric_key"] == metric_key
+        ]
+
+    # The graded figures: every recorded covenant figure on the
+    # fail year must equal the hand computation exactly.
+    vp = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    vcf, v_decision = _t_approved(vp)
+    _t_deliver(vp, vcf, 2026, _T_FY2026)
+    vp.run_due_covenant_tests(vcf, as_of=date(2027, 8, 1))
+    _expected_figures = {
+        ("dscr", 2026): Decimal("0.9143"),
+        ("debt_to_tangible_net_worth", 2026): Decimal("4.4348"),
+        ("current_ratio", 2026): Decimal("1.7310"),
+        ("current_ratio", 2025): Decimal("1.7143"),
+    }
+    math_wrong = 0
+    for (metric, year), want in _expected_figures.items():
+        got = [
+            v for v in _t_results(vp, vcf, metric)
+            if v["fiscal_year"] == year and v["figure_value"] is not None
+        ]
+        if not got or any(
+            Decimal(str(v["figure_value"])) != want for v in got
+        ):
+            math_wrong += 1
+    print(f"covenant_math_wrong: {math_wrong} of "
+          f"{len(_expected_figures)} graded figures (required 0)")
+    if math_wrong:
+        failures.append("a covenant test figure was wrong")
+
+    # Every fail has its breach; every breach traces to a fail.
+    v_results = vp.covenant_test_results(vcf)
+    v_breaches = vp.list_breach_cases(
+        as_of=date(2027, 8, 1), credit_file_id=vcf
+    )
+    fail_ids = {
+        v["result_id"] for v in v_results if v["outcome"] == "fail"
+    }
+    breach_result_ids = {b["test_result_id"] for b in v_breaches}
+    fail_without_breach = len(fail_ids - breach_result_ids)
+    print(f"covenant_fail_without_breach: {fail_without_breach} "
+          f"(required 0); {len(fail_ids)} fails, "
+          f"{len(breach_result_ids)} breaches")
+    if fail_without_breach:
+        failures.append("a covenant failure opened no breach case")
+
+    # A not_evaluable result never reads as a pass: the third
+    # file's FY2026 statements arrive without the cash-flow page.
+    np_ = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    ncf, _nd = _t_approved(np_)
+    _t_deliver(np_, ncf, 2026, _T_FY2026, with_cf=False)
+    np_.run_due_covenant_tests(ncf, as_of=date(2027, 8, 1))
+    ne_results = [
+        v for v in _t_results(np_, ncf, "dscr")
+        if v["fiscal_year"] == 2026
+    ]
+    not_eval_as_pass = 0
+    if (
+        len(ne_results) != 1
+        or ne_results[0]["outcome"] != "not_evaluable"
+        or ne_results[0]["figure_value"] is not None
+        or not any(
+            "depreciation_and_amortization" in name
+            for name in ne_results[0]["missing_inputs"]
+        )
+    ):
+        not_eval_as_pass += 1
+    if any(
+        b["test_result_id"]
+        in {v["result_id"] for v in ne_results}
+        for b in np_.list_breach_cases(
+            as_of=date(2027, 8, 1), credit_file_id=ncf
+        )
+    ):
+        not_eval_as_pass += 1
+    print(f"covenant_not_evaluable_read_as_pass: {not_eval_as_pass} "
+          f"(required 0)")
+    if not_eval_as_pass:
+        failures.append("a not_evaluable test read as a pass")
+
+    # Waivers without a committee reference are refused — an
+    # invented id, a decline's id, and (via the state machine)
+    # any act on a terminal breach.
+    dscr_breach = next(
+        b for b in v_breaches if b["metric_key"] == "dscr"
+    )
+    # (_refused returns 1 when a probe was ACCEPTED.)
+    waiver_accepted = 0
+    waiver_accepted += _refused(lambda: vp.waive_breach(
+        vcf, dscr_breach["breach_id"], actor_id=C_OFFICER,
+        actor_role=C_OFFICER_ROLE, decision_id="",
+    ))
+    waiver_accepted += _refused(lambda: vp.waive_breach(
+        vcf, dscr_breach["breach_id"], actor_id=C_OFFICER,
+        actor_role=C_OFFICER_ROLE,
+        decision_id="decision-that-does-not-exist",
+    ))
+    dp = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    d_file = dp.open_application(
+        _ready_borrower(), _ready_facility(),
+        documents=_ready_documents(),
+    )
+    dcf2 = d_file.credit_file_id
+    _, d_final = _officer_final_for(dp, dcf2, as_of=date(2026, 6, 30))
+    dp.convene_committee(
+        dcf2, d_final.memo_id, actor=C_OFFICER,
+        actor_role=C_OFFICER_ROLE, as_of=date(2026, 6, 30),
+    )
+    d_decline = dp.decide_committee(
+        dcf2, d_final.memo_id,
+        recorder_id=C_CHAIR, recorder_role="committee_chair",
+        members=list(C_MEMBERS), outcome="decline",
+        adverse_reasons=[
+            AdverseActionReason(
+                code="leverage_above_policy_limit",
+                tie_kind="policy_test",
+                test_id="max_leverage_by_segment",
+            ),
+            AdverseActionReason(
+                code="financial_information_insufficient",
+                tie_kind="policy_test",
+                test_id="min_global_dscr",
+            ),
+        ],
+    )
+    waiver_accepted += _refused(lambda: vp.waive_breach(
+        vcf, dscr_breach["breach_id"], actor_id=C_OFFICER,
+        actor_role=C_OFFICER_ROLE, decision_id=d_decline.decision_id,
+    ))
+    print(f"covenant_waiver_without_reference_accepted: "
+          f"{waiver_accepted} of 3 probes (required 0)")
+    if waiver_accepted:
+        failures.append("a breach waiver without authority was accepted")
+
+    # No silent close: an open breach refuses the default path
+    # directly, refuses a cure by its own failing result, and a
+    # terminal breach refuses every further act.
+    silently_closed = 0
+    silently_closed += _refused(lambda: vp.default_breach(
+        vcf, dscr_breach["breach_id"], actor_id=C_OFFICER,
+        actor_role=C_OFFICER_ROLE,
+        reason_code="cure_period_expired_uncured",
+    ))
+    silently_closed += _refused(lambda: vp.cure_breach(
+        vcf, dscr_breach["breach_id"], actor_id=C_OFFICER,
+        actor_role=C_OFFICER_ROLE,
+        cure_result_id=dscr_breach["test_result_id"],
+    ))
+    print(f"covenant_breach_silently_closed: "
+          f"{silently_closed} of 2 probes accepted (required 0)")
+    if silently_closed:
+        failures.append("a breach was silently closed")
+
+    # Positive paths: the current-ratio pass stands clean; the
+    # DSCR breach is cured by the FY2027 pass; a leverage breach
+    # is waived on the committee's decision; the restated file
+    # flags its original result and the re-test passes.
+    cr_pass = next(
+        v for v in _t_results(vp, vcf, "current_ratio")
+        if v["outcome"] == "pass"
+    )
+    _t_deliver(vp, vcf, 2027, _T_FY2027)
+    vp.run_due_covenant_tests(vcf, as_of=date(2028, 8, 1))
+    cure = next(
+        v for v in _t_results(vp, vcf, "dscr")
+        if v["fiscal_year"] == 2027 and v["outcome"] == "pass"
+    )
+    cured_ok = False
+    try:
+        cured = vp.cure_breach(
+            vcf, dscr_breach["breach_id"], actor_id=C_OFFICER,
+            actor_role=C_OFFICER_ROLE,
+            cure_result_id=cure["result_id"],
+        )
+        cured_ok = cured.state == "cured"
+    except ValidationError:
+        cured_ok = False
+    terminal_refused = 1 - _refused(lambda: vp.escalate_breach(
+        vcf, dscr_breach["breach_id"], actor_id=C_OFFICER,
+        actor_role=C_OFFICER_ROLE, reason_code="repeat_breach",
+    ))
+    lev_breach = next(
+        b for b in vp.list_breach_cases(
+            as_of=date(2027, 8, 1), credit_file_id=vcf
+        )
+        if b["metric_key"] == "debt_to_tangible_net_worth"
+        and b["state"] == "open"
+    )
+    waived_ok = False
+    try:
+        waived = vp.waive_breach(
+            vcf, lev_breach["breach_id"], actor_id=C_CHAIR,
+            actor_role="committee_chair",
+            decision_id=v_decision.decision_id,
+        )
+        waived_ok = waived.state == "waived"
+    except ValidationError:
+        waived_ok = False
+
+    rp2 = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    rcf2, _rd2 = _t_approved(rp2)
+    _t_deliver(rp2, rcf2, 2026, _T_FY2026)
+    rp2.run_due_covenant_tests(rcf2, as_of=date(2027, 8, 1))
+    original = next(
+        v for v in _t_results(rp2, rcf2, "dscr")
+        if v["outcome"] == "fail"
+    )
+    _t_deliver(rp2, rcf2, 2026, _T_FY2026_RESTATED)
+    flagged = next(
+        v for v in _t_results(rp2, rcf2, "dscr")
+        if v["result_id"] == original["result_id"]
+    )
+    rp2.run_due_covenant_tests(rcf2, as_of=date(2027, 8, 3))
+    retest = next(
+        v for v in _t_results(rp2, rcf2, "dscr")
+        if v["supersedes_result_id"] == original["result_id"]
+    )
+    restatement_ok = (
+        flagged["standing"] == "superseded_by_restatement"
+        and retest["outcome"] == "pass"
+        and Decimal(str(retest["figure_value"])) == Decimal("1.2571")
+    )
+    testing_positive = (
+        cr_pass is not None and cured_ok and terminal_refused == 1
+        and waived_ok and restatement_ok
+    )
+    print(f"covenant_testing_positive_paths: "
+          f"{'pass recorded clean, fail → breach → cured by FY2027 pass, breach waived on the committee decision, restatement flags + re-test passes' if testing_positive else 'FAILED'}")
+    if not testing_positive:
+        failures.append("a covenant testing positive path did not land")
 
     if failures:
         print("GATE: FAIL")
