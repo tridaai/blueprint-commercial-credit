@@ -1525,3 +1525,156 @@ class CovenantTestInstance(BaseModel):
     state: str
     days_until_due: int
     required_inputs: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------
+# Round 11: covenant test results and breach cases. Round 10 derived
+# the schedule; this round executes the tests on it. A test re-spreads
+# the period through the existing spreading engine and recomputes the
+# covenant's metric through the existing computation engine — the
+# figure comes out of a stored computation pack, pinned by id — and
+# the comparison against the covenant's threshold is recorded as an
+# artefact. A failure opens a breach case: the bank's workflow object
+# for the breach, with a cure clock and coded resolutions. Detection
+# is the system's job; waiver and enforcement are the bank's, and
+# they happen here only as recorded acts with named authority.
+# ---------------------------------------------------------------------
+
+# The honest outcomes of one covenant test. There is no fifth state:
+# a test whose figure cannot be computed is not_evaluable and names
+# what is missing; a test whose statements have not arrived stands
+# at awaiting_inputs — blocked on the borrower, never silently
+# passed over, and never read as a pass.
+TEST_PASS = "pass"
+TEST_FAIL = "fail"
+TEST_NOT_EVALUABLE = "not_evaluable"
+TEST_AWAITING_INPUTS = "awaiting_inputs"
+
+# The derived standing of a recorded result against the file's
+# CURRENT spread: current, or superseded by a restatement of the
+# period it tested — the original record stands either way.
+RESULT_CURRENT = "current"
+RESULT_SUPERSEDED_BY_RESTATEMENT = "superseded_by_restatement"
+
+
+class TestedPeriodSource(BaseModel):
+    """One source document version a test result rests on: the
+    period source the spread recorded for the tested fiscal year
+    (per source type), pinned into the result so a later
+    restatement of that period is detectable by comparison — the
+    result names the exact document version it was computed from.
+    """
+
+    fiscal_year: int
+    source_type: str
+    document_id: str
+    document_sha256: str
+    version: int
+
+
+class CovenantTestResult(BaseModel):
+    """The recorded outcome of one covenant test instance.
+
+    Content-addressed like the packs it derives from: the result
+    id covers the instance, the covenant version tested, the
+    spread and computation pack the figure came out of, and the
+    outcome — so re-running the same test over the same inputs
+    reproduces the same artefact and stores nothing twice. The
+    figure is the engine's figure (from the pinned pack's own
+    covenant result), never recomputed here: this record compares
+    and reports, it does not calculate.
+
+    A re-test — after a restatement, or after an awaiting_inputs
+    result's statements arrive — is a new result naming the one
+    it supersedes; the superseded result stays on record forever.
+    """
+
+    result_id: str
+    credit_file_id: str
+    set_id: str
+    instance_id: str
+    covenant_id: str
+    covenant_version: int
+    covenant_name: str
+    metric_key: str
+    operator: str
+    threshold: Decimal
+    test_date: date
+    period_label: str
+    fiscal_year: int | None = None
+    spread_id: str | None = None
+    computation_pack_id: str | None = None
+    figure_value: Decimal | None = None
+    headroom: Decimal | None = None
+    outcome: str  # pass | fail | not_evaluable | awaiting_inputs
+    missing_inputs: list[str] = Field(default_factory=list)
+    period_sources: list[TestedPeriodSource] = Field(default_factory=list)
+    supersedes_result_id: str | None = None
+    is_retest: bool = False
+    as_of: date
+
+
+# Breach case states. A breach opens on a failing test and moves
+# only by recorded acts: review, escalation, and the three
+# resolutions — cured (a later passing re-test of the same
+# covenant), waived (only on a committee decision's authority),
+# or the default path. Cured, waived and defaulted are terminal.
+BREACH_OPEN = "open"
+BREACH_UNDER_REVIEW = "under_review"
+BREACH_ESCALATED = "escalated"
+BREACH_CURED = "cured"
+BREACH_WAIVED = "waived"
+BREACH_DEFAULTED = "defaulted_path"
+BREACH_TERMINAL_STATES = frozenset({
+    BREACH_CURED, BREACH_WAIVED, BREACH_DEFAULTED,
+})
+
+
+class BreachEvent(BaseModel):
+    """One recorded act on a breach case: who did what, under
+    which coded reason, naming the artefact that authorised it
+    where one did (the passing re-test for a cure, the committee
+    decision for a waiver). The case's history is its events;
+    nothing about a breach is ever edited away."""
+
+    action: str  # opened | under_review | escalated | cured | waived | defaulted
+    actor_id: str
+    actor_role: str = ""
+    reason_code: str | None = None
+    note: str = ""
+    test_result_id: str | None = None
+    decision_id: str | None = None
+    at: datetime = Field(default_factory=utcnow)
+
+
+class BreachCase(BaseModel):
+    """A covenant breach, as a case: the bank's workflow object
+    for one failing test.
+
+    Opened automatically by the failing test result that raised
+    it — one breach per failing result, the id derived from the
+    result — and closed only by a coded resolution act (cure,
+    waiver, default path). `cure_deadline` is the test date plus
+    the covenant's cure (grace) period from the set: the clock
+    the resolutions run against. Ageing is derived at read time,
+    never stored."""
+
+    breach_id: str
+    credit_file_id: str
+    borrower_name: str
+    set_id: str
+    covenant_id: str
+    covenant_version: int
+    covenant_name: str
+    metric_key: str
+    operator: str
+    threshold: Decimal
+    figure_value: Decimal | None = None
+    test_result_id: str
+    instance_id: str
+    test_date: date
+    period_label: str
+    cure_deadline: date
+    state: str = BREACH_OPEN
+    events: list[BreachEvent] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utcnow)
