@@ -38,6 +38,25 @@ Round 2 counters — the spreading engine:
                             the spread rests on the new version and
                             the prior version stays retrievable.
 
+Round 3 counters — the computation engine:
+
+  computation_correctness   engine figures for a hand-built fixture
+                            borrower equal values computed by hand in
+                            this file (exact, to the cent / 4dp);
+                            spot checks on the seed borrower's pack
+                            likewise.
+  derivation_trace_         every computed figure's derivation
+    completeness            chain resolves to provenanced spread
+                            lines / supplemental figures, and every
+                            step re-performs. REQUIRED: 100%.
+  computation_determinism   recomputing the same inputs returns the
+                            identical artefact — same pack id, same
+                            bytes.
+  elimination_rejection     a global-view elimination without a
+                            stated reason is refused, in code.
+  global_dscr_vs_hand       borrower + guarantor with eliminations,
+                            against a hand-computed global DSCR.
+
 Later rounds add counters (untraceable memo figure, stale-input
 committee-ready, decline without coded reasons) as their machinery
 lands. Exit code 0 = GATE: PASS.
@@ -53,6 +72,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from commercial_credit.checklist import generate_checklist  # noqa: E402
+from commercial_credit.computations import (  # noqa: E402
+    compute_entity_pack,
+    compute_global_pack,
+    verify_trace,
+)
 from commercial_credit.documents import (  # noqa: E402
     LocalDocumentStore,
     read_document_verified,
@@ -63,11 +87,15 @@ from commercial_credit.extraction import receive_extraction  # noqa: E402
 from commercial_credit.models import (  # noqa: E402
     AdjustmentReasonCode,
     DocumentKind,
+    Elimination,
     ExtractedValue,
     FacilityRequest,
     FacilityType,
+    PeriodSource,
     Provenance,
+    Spread,
     SpreadAdjustment,
+    SpreadLine,
 )
 from commercial_credit.pipeline import CreditPipeline  # noqa: E402
 from commercial_credit.seed import (  # noqa: E402
@@ -75,6 +103,7 @@ from commercial_credit.seed import (  # noqa: E402
     ground_truth,
     statement_document,
 )
+from commercial_credit.spreading import TEMPLATE_LINES  # noqa: E402
 from commercial_credit.store import InMemoryCreditStore  # noqa: E402
 
 EXPECTED_SPECIFICS: dict[FacilityType, set[DocumentKind]] = {
@@ -123,6 +152,75 @@ def _register_and_extract(pipeline, credit_file_id: str, data: bytes,
     extracted = receive_extraction(pipeline.extractor.extract(doc, content))
     pipeline.store.save_extractions(credit_file_id, extracted)
     return doc
+
+
+_SECTION_PAGE = {
+    "balance_sheet": 1,
+    "income_statement": 2,
+    "cash_flow_statement": 3,
+}
+
+
+def _fixture_spread(credit_file_id: str, doc_prefix: str,
+                    figures: dict[int, dict[str, str]], *, adjustments=()):
+    """A spread + extractions built by hand from raw figures, for
+    grading the computation engine against hand computation (the
+    pytest suite carries the full fixture set)."""
+    periods = sorted(figures)
+    lines: list[SpreadLine] = []
+    extractions: list[ExtractedValue] = []
+    counters: dict[str, int] = {}
+    for template in TEMPLATE_LINES:
+        counters[template.section] = counters.get(template.section, 0) + 1
+        raw: dict[int, Decimal | None] = {}
+        adjusted: dict[int, Decimal | None] = {}
+        for year in periods:
+            value = figures[year].get(template.field)
+            raw[year] = Decimal(value) if value is not None else None
+            delta = sum(
+                (a.amount for a in adjustments
+                 if a.line_key == template.key and a.fiscal_year == year),
+                Decimal("0"),
+            )
+            adjusted[year] = (
+                (raw[year] if raw[year] is not None else Decimal("0")) + delta
+                if raw[year] is not None or delta != 0
+                else None
+            )
+            if value is not None:
+                extractions.append(ExtractedValue(
+                    field=template.field,
+                    value=Decimal(value),
+                    period_label=f"FY{year}",
+                    fiscal_year=year,
+                    provenance=Provenance(
+                        document_id=f"{doc_prefix}-{year}",
+                        page=_SECTION_PAGE[template.section],
+                        line=f"L{counters[template.section]}",
+                    ),
+                ))
+        lines.append(SpreadLine(
+            key=template.key, label=template.label, section=template.section,
+            values=raw, adjusted_values=adjusted,
+            changes={year: None for year in periods},
+        ))
+    spread = Spread(
+        spread_id=f"spread-eval-{doc_prefix}",
+        credit_file_id=credit_file_id,
+        template_version="aldergrove-spread-v1",
+        periods=periods,
+        period_sources=[
+            PeriodSource(
+                fiscal_year=year, period_label=f"FY{year}",
+                document_id=f"{doc_prefix}-{year}",
+                document_sha256="cd" * 32, version=1,
+            )
+            for year in periods
+        ],
+        lines=lines,
+        adjustments=list(adjustments),
+    )
+    return spread, extractions
 
 
 def main() -> int:
@@ -310,6 +408,176 @@ def main() -> int:
           f"{'retained' if prior_kept else 'LOST'}")
     if not restated_ok:
         failures.append("restatement did not supersede cleanly")
+
+    # -- round 3: computation engine vs hand computation ---------------
+    # Fresh pipeline: the seed borrower's pack, spot-checked by hand.
+    #   current ratio FY2024 = 3,951,000 / 1,749,000 = 2.2590
+    #   working capital      = 3,951,000 − 1,749,000 = 2,202,000
+    #   funded debt          = 360,000 + 2,760,000   = 3,120,000
+    #   gross margin         = 3,712,200 / 12,374,000 = 0.3000
+    r3 = CreditPipeline(store=InMemoryCreditStore(), documents=LocalDocumentStore())
+    r3_file = r3.open_application(borrower, facility, documents=docs)
+    hartline_pack = r3.compute_metrics(r3_file.credit_file_id)
+
+    def _fig(pack, key, year):
+        return next(
+            f for f in pack.figures
+            if f.key == key and f.fiscal_year == year
+        )
+
+    spot = {
+        "current_ratio": Decimal("2.2590"),
+        "working_capital": Decimal("2202000.00"),
+        "total_debt": Decimal("3120000.00"),
+        "gross_margin": Decimal("0.3000"),
+    }
+    spot_ok = all(
+        _fig(hartline_pack, key, 2024).value == expected
+        for key, expected in spot.items()
+    )
+    ebitda_fig = _fig(hartline_pack, "ebitda", 2024)
+    honest_nc = (
+        ebitda_fig.status == "not_computable"
+        and any("depreciation_and_amortization" in m
+                for m in ebitda_fig.missing_inputs)
+    )
+    print(f"computation_spot_checks (seed borrower): "
+          f"{'ok' if spot_ok else 'WRONG'}; EBITDA not computable "
+          f"without a cash-flow statement: "
+          f"{'named' if honest_nc else 'NOT NAMED'}")
+    if not spot_ok:
+        failures.append("seed borrower computation spot checks diverge")
+    if not honest_nc:
+        failures.append("missing D&A was not named as a missing input")
+
+    # A hand-built fixture borrower, full statements, hand-computed:
+    #   EBITDA = (500,000 + 50,000 add-back) + 120,000 = 670,000
+    #   debt service = 200,000 + 90,000 + 10,000 leases = 300,000
+    #   DSCR = 670,000 / 300,000 = 2.2333
+    #   debt/EBITDA = 1,000,000 / 670,000 = 1.4925
+    fixture_figs = {
+        2023: {"current_portion_ltd": "200000"},
+        2024: {
+            "ebit": "500000", "depreciation_and_amortization": "120000",
+            "interest_expense": "90000", "current_portion_ltd": "220000",
+            "long_term_debt": "780000", "total_current_assets": "900000",
+            "total_current_liabilities": "600000",
+            "capital_expenditures": "200000",
+            "net_cash_from_operations": "560000",
+        },
+    }
+    fx_spread, fx_extractions = _fixture_spread(
+        r3_file.credit_file_id, "fxdoc", fixture_figs,
+        adjustments=[SpreadAdjustment(
+            credit_file_id=r3_file.credit_file_id,
+            line_key="ebit", fiscal_year=2024, amount=Decimal("50000"),
+            reason_code=AdjustmentReasonCode.NON_RECURRING_EXPENSE,
+            reason="One-time relocation cost",
+            source=Provenance(document_id="fxdoc-2024", page=2, line="L5"),
+            proposed_by="credit-officer:eval",
+        )],
+    )
+    fx_pack = compute_entity_pack(
+        credit_file_id=r3_file.credit_file_id, entity="Eval Fixture",
+        spread=fx_spread, extractions=fx_extractions,
+        supplemental=[ExtractedValue(
+            field="capital_lease_payments", value=Decimal("10000"),
+            period_label="FY2024", fiscal_year=2024,
+            provenance=Provenance(document_id="fxdoc-debt", page=1, line="L3"),
+        )],
+    )
+    hand = {
+        "ebitda": Decimal("670000.00"),
+        "debt_service": Decimal("300000.00"),
+        "dscr": Decimal("2.2333"),
+        "debt_to_ebitda": Decimal("1.4925"),
+        "fixed_charge_coverage": Decimal("1.5667"),
+        "free_cash_flow": Decimal("360000.00"),
+    }
+    matched = sum(
+        1 for key, expected in hand.items()
+        if _fig(fx_pack, key, 2024).value == expected
+    )
+    print(f"computation_correctness: {matched}/{len(hand)} vs hand computation")
+    if matched != len(hand):
+        failures.append("engine figures diverge from hand computation")
+
+    trace = verify_trace(fx_pack, spread=fx_spread)
+    hartline_trace = verify_trace(
+        hartline_pack, spread=r3.get_spread(r3_file.credit_file_id)
+    )
+    trace_total = trace.figures_checked + hartline_trace.figures_checked
+    trace_complete = trace.figures_complete + hartline_trace.figures_complete
+    completeness = (trace_complete / trace_total) if trace_total else 0.0
+    print(f"derivation_trace_completeness: {trace_complete}/{trace_total} "
+          f"= {completeness:.3f} (required 1.000)")
+    if completeness != 1.0:
+        failures.append(f"derivation traces incomplete: {trace.gaps + hartline_trace.gaps}")
+
+    recomputed = compute_entity_pack(
+        credit_file_id=r3_file.credit_file_id, entity="Eval Fixture",
+        spread=fx_spread, extractions=fx_extractions,
+        supplemental=fx_pack.supplemental,
+    )
+    deterministic = (
+        recomputed.pack_id == fx_pack.pack_id
+        and recomputed.model_dump_json() == fx_pack.model_dump_json()
+        and hartline_pack.pack_id
+        == r3.compute_metrics(r3_file.credit_file_id).pack_id
+    )
+    print(f"computation_determinism: "
+          f"{'identical artefact on recompute' if deterministic else 'MISMATCH'}")
+    if not deterministic:
+        failures.append("recomputation did not return the identical artefact")
+
+    # Global view: guarantor EBITDA 170,000 (150,000 + 20,000), debt
+    # service 70,000 (40,000 + 30,000). Global cash flow =
+    # 670,000 + 170,000 − 50,000 rent elimination = 790,000; global
+    # debt service = 300,000 + 70,000 = 370,000; global DSCR =
+    # 790,000 / 370,000 = 2.1351.
+    g_spread, g_extractions = _fixture_spread(
+        r3_file.credit_file_id, "fxguar",
+        {
+            2023: {"current_portion_ltd": "40000"},
+            2024: {
+                "ebit": "150000", "depreciation_and_amortization": "20000",
+                "interest_expense": "30000", "current_portion_ltd": "55000",
+            },
+        },
+    )
+    g_pack = compute_entity_pack(
+        credit_file_id=r3_file.credit_file_id, entity="Eval Guarantor",
+        spread=g_spread, extractions=g_extractions,
+    )
+    global_pack = compute_global_pack(
+        credit_file_id=r3_file.credit_file_id,
+        borrower_pack=fx_pack,
+        entity_packs={"Eval Guarantor": g_pack},
+        eliminations=[Elimination(
+            name="intercompany_rent", fiscal_year=2024,
+            amount=Decimal("50000"), target="cash_flow",
+            reason="Rent counted in both entities' figures",
+        )],
+        expected_guarantors=["Eval Guarantor"],
+    )
+    global_dscr = _fig(global_pack, "global_dscr", 2024).value
+    print(f"global_dscr_vs_hand: {global_dscr} (hand-computed 2.1351)")
+    if global_dscr != Decimal("2.1351"):
+        failures.append("global DSCR diverges from hand computation")
+
+    try:
+        compute_global_pack(
+            credit_file_id=r3_file.credit_file_id,
+            borrower_pack=fx_pack,
+            eliminations=[Elimination.model_construct(
+                name="quiet_removal", fiscal_year=2024,
+                amount=Decimal("1000"), target="cash_flow", reason="  ",
+            )],
+        )
+        print("elimination_rejection: FAIL (accepted)")
+        failures.append("an unexplained elimination was accepted")
+    except CreditError:
+        print("elimination_rejection: rejected as required")
 
     if failures:
         print("GATE: FAIL")
