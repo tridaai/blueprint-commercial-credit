@@ -1024,6 +1024,78 @@ class CreditMemo(BaseModel):
 
 
 # ---------------------------------------------------------------------
+# Round 9: committee readiness (design law 7). A credit file is
+# committee-ready only when every required input is on file and
+# fresh: the policy-cited checklist, the policy pack's statement-age
+# and appraisal limits, and the computation pack's not-computable
+# figures, consolidated into ONE content-addressed report. A
+# readiness entry is a BLOCKER when its input is missing, stale past
+# the limit its rule names, or not evaluable for want of a source
+# input. Blockers clear only when the input itself refreshes —
+# there is deliberately no waiver field anywhere in this section.
+# ---------------------------------------------------------------------
+
+
+class ReadinessEntry(BaseModel):
+    """One required input and its state at the evaluation date."""
+
+    input_key: str  # checklist item id, figure:<key>, or policy:<test id>
+    label: str
+    source: str  # checklist | computation_pack | policy_report
+    # present_fresh | present_stale | missing | not_evaluable_input
+    state: str
+    blocker: bool
+    detail: str
+    # Freshness evidence, when an age rule applies.
+    age_months: int | None = None
+    limit_months: int | None = None
+    rule_source: str | None = None
+    # For not_evaluable_input: the source inputs the figure or test
+    # is waiting on, named — never paraphrased downstream.
+    missing_inputs: list[str] = Field(default_factory=list)
+    related_test_ids: list[str] = Field(default_factory=list)
+    document_id: str | None = None
+
+
+class ReadinessReport(BaseModel):
+    """The consolidated committee-readiness report for one file.
+
+    Content-addressed like the other artefacts: the id derives from
+    the file, the evaluation date, the pinned artefact ids, the
+    policy + readiness-policy versions, and the entries themselves,
+    so the same artefacts at the same date always produce the same
+    report — and a report minted earlier can never bless a file
+    whose inputs have since gone stale, because readiness is
+    recomputed at the date of the action it gates.
+    """
+
+    report_id: str
+    credit_file_id: str
+    as_of: date
+    policy_pack_id: str
+    policy_version: str
+    readiness_policy_id: str
+    readiness_policy_version: str
+    policy_report_id: str | None = None
+    computation_pack_id: str | None = None
+    global_pack_id: str | None = None
+    entries: list[ReadinessEntry] = Field(default_factory=list)
+    summary: dict[str, int] = Field(default_factory=dict)
+
+    @property
+    def blockers(self) -> list[ReadinessEntry]:
+        return [e for e in self.entries if e.blocker]
+
+    @property
+    def blocker_count(self) -> int:
+        return len(self.blockers)
+
+    @property
+    def ready(self) -> bool:
+        return not self.blockers
+
+
+# ---------------------------------------------------------------------
 # Round 6: the credit officer gate. A draft memo is reviewed by a
 # named credit officer, who approves it (as-is, or with edits that
 # pass the figure verifier again), returns it for rework with
@@ -1063,6 +1135,12 @@ class MemoReviewEvent(BaseModel):
     reason_vocabulary: str | None = None
     flag: MemoCommitteeFlag | None = None
     committee_outcome: str | None = None
+    # Round 9: an approval event also carries the readiness report
+    # computed over the memo's pinned artefacts at approval time, so
+    # the committee block is visible on the record, never a surprise
+    # discovered at convene.
+    readiness_report_id: str | None = None
+    readiness_blocker_count: int | None = None
     note: str = ""
     at: datetime = Field(default_factory=utcnow)
 
@@ -1115,6 +1193,10 @@ class MemoDiff(BaseModel):
     action: str  # approved_as_is | approved_with_edits
     section_changes: list[SectionChange] = Field(default_factory=list)
     figure_changes: list[FigureChange] = Field(default_factory=list)
+    # Round 9: the readiness report pinned to this approval, with its
+    # blocker count — the same stamp the approval event carries.
+    readiness_report_id: str | None = None
+    readiness_blocker_count: int | None = None
     note: str = ""
     created_at: datetime = Field(default_factory=utcnow)
 
