@@ -855,6 +855,63 @@ pipeline built without a gateway keeps the old registry).
   profile, with the budget position), and `/model-costs/daily`
   for the portfolio.
 
+## What round 16 adds
+
+The **Postgres production profile, verified**: the deployment
+store stops being a claim and becomes a graded profile. Nothing
+about the domain changes — what changes is that the whole suite,
+the migration runner, and a booted production-shaped stack are
+now exercised against real Postgres 16, in the open.
+
+- **Full-suite parity** — `tests/pg_parity.py` (activated by
+  `tests/conftest.py` when `CREDIT_TEST_DATABASE_URL` is set)
+  swaps every test double for the real `PostgresCreditStore`:
+  the in-memory store becomes a subclass whose instances each
+  get a fresh, fully migrated schema, and the SQLite file store
+  becomes the same adapter keyed by resolved path, so the
+  reopen/persistence tests verify the same property against
+  Postgres that they verify against a file. The wiring's own
+  SQLite choice is swapped too, so a stack built with no
+  `DATABASE_URL` also lands on Postgres. The mode is
+  all-or-nothing and loud: a named-but-unreachable server fails
+  the run rather than quietly testing the doubles. Verified:
+  the entire suite passes on Postgres with the same outcomes
+  as the default profile.
+- **Migrations graded on Postgres** —
+  `tests/test_postgres_profile.py` applies all thirteen
+  migrations to a fresh database (UTF8, template0), asserts the
+  second run applies none, and reads a credit file back through
+  a second store instance — a restarted process meeting the
+  same database. The tests skip (visibly) when no URL is set.
+- **Production smoke** — `scripts/prod_smoke.py` (or
+  `make prod-smoke`) boots the real API with `DATABASE_URL`
+  pointed at a fresh database and walks one credit file through
+  the whole lifecycle over HTTP: open → documents → extraction
+  → spread → computation → policy → memo draft + verification →
+  officer gate → committee approval (with conditions) → closing
+  → the covenant set and its schedule → FY2026 statements → a
+  covenant test run that records an honest failure and opens a
+  real breach case. Every step asserts the state it produced;
+  any mismatch exits non-zero. Verified: 21/21 steps.
+- **The eval gate grades it** — with `CREDIT_EVAL_DATABASE_URL`
+  (else `DATABASE_URL`) set, the gate adds the round-16
+  counters: migration failures, production-smoke step failures,
+  and the suite parity gap (both profiles run in subprocesses
+  and their per-test outcomes compared; the profile-conditional
+  tests are excluded from the comparison and graded by their
+  own leg). Without a URL the checks are skipped and the skip
+  is counted — never silent.
+- **Deployment artefacts, stated plainly** — the compose stack
+  is unchanged in topology and already matches the production
+  shape (Postgres 16 + pgvector, SeaweedFS as the S3 document
+  store, the API wired to both). What was verified is the
+  profile above, against a scratch Postgres 16 cluster. What
+  was **not** verified: the Docker image build and the compose
+  stack itself — this build environment has no Docker daemon,
+  so the compose file is verified by inspection only, and the
+  README says so rather than claiming a run that never
+  happened.
+
 ## The laws (enforced in code, never in prompts)
 
 1. **No model-computed numbers.** Extraction returns values +
@@ -892,12 +949,19 @@ pipeline built without a gateway keeps the old registry).
 | `CREDIT_EXTRACTION_PROFILE` | When set, names the live profile the model-assisted extractor reads documents under (`hosted-frontier` or `in-boundary`). Unset ⇒ the offline reference extractor. |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | The `hosted-frontier` profile's key / endpoint override (endpoint defaults to `https://api.anthropic.com`). Variable names only — values live in the deployment's environment, never in the repo. |
 | `IN_BOUNDARY_MODEL_URL` / `IN_BOUNDARY_MODEL_API_KEY` | The `in-boundary` profile's OpenAI-compatible endpoint inside the bank's boundary, and its key where the endpoint requires one. |
+| `CREDIT_TEST_DATABASE_URL` | Test-only (round 16): when set, the whole pytest suite runs against this Postgres instead of the doubles (see `tests/pg_parity.py`). Never a deployment setting. |
+| `CREDIT_EVAL_DATABASE_URL` | Gate-only (round 16): the Postgres the eval gate grades migrations, the production smoke, and suite parity against. Falls back to `DATABASE_URL`. |
 
 ## Honest status
 
-- Live verification of the Postgres profile and of the S3 document
-  store runs in the production-profile round; round 1's gates run
-  against the SQLite and in-memory doubles behind the same ports.
+- The Postgres profile is live-verified as of round 16: the
+  full suite runs against Postgres with outcome parity, the
+  migrations are graded on a real empty database, and the
+  production smoke walks the lifecycle over HTTP (see "What
+  round 16 adds"). The S3 document store remains verified only
+  to its port — the compose stack's SeaweedFS has not been run
+  end-to-end, and this build environment has no Docker daemon,
+  so the Docker image build is likewise unverified.
 - Document extraction is the offline reference extractor over the
   generated borrower documents by default; a deployment can put
   the round 15 model-assisted extractor behind the same port

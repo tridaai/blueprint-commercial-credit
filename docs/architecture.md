@@ -843,6 +843,21 @@ type, status) broken out. SQLite and in-memory stores implement the
 same port for local runs and tests and make no deployment claims;
 `/readiness` names the live profile.
 
+Round 16 makes the Postgres profile a graded one. The suite's
+parity harness (`tests/pg_parity.py`, keyed by
+`CREDIT_TEST_DATABASE_URL`) replaces the doubles with the real
+adapter — a fresh migrated schema per in-memory-store instance,
+one schema per resolved path for the file store — so every
+store-backed test executes against Postgres unchanged, and the
+eval gate compares per-test outcomes across the two profiles.
+The migration runner is itself tested on an empty database
+(apply-all, then apply-none), and `scripts/prod_smoke.py` boots
+the wired stack on a fresh database and walks the full credit
+lifecycle over HTTP. The compose stack (Postgres 16 + pgvector,
+SeaweedFS for documents) is the deployment shape these checks
+mirror; the Docker build itself is not part of the verified
+claim — no daemon is available in the build environment.
+
 ## Round map
 
 R1 core: credit file model, intake, document port, provenance-carrying
