@@ -30,6 +30,8 @@ from .models import (
     ExtractedValue,
     MemoDiff,
     MemoReviewEvent,
+    ModelBudgetEvent,
+    ModelCallEntry,
     PolicyReport,
     RatingAssignment,
     RatingOverride,
@@ -77,6 +79,8 @@ class InMemoryCreditStore:
         self._rating_assignment_order: dict[str, list[str]] = {}
         self._rating_overrides: dict[str, RatingOverride] = {}
         self._rating_override_order: dict[str, list[str]] = {}
+        self._ledger_entries: list[ModelCallEntry] = []
+        self._budget_events: list[ModelBudgetEvent] = []
 
     def save_credit_file(self, credit_file: CreditFile) -> None:
         self._files[credit_file.credit_file_id] = credit_file.model_copy(deep=True)
@@ -509,6 +513,33 @@ class InMemoryCreditStore:
             )
         ]
 
+    # -- Model cost ledger (round 15): append-only ----------------
+
+    def add_call_entry(self, entry: ModelCallEntry) -> None:
+        self._ledger_entries.append(entry.model_copy(deep=True))
+
+    def list_call_entries(
+        self, credit_file_id: str | None
+    ) -> list[ModelCallEntry]:
+        return [
+            entry.model_copy(deep=True)
+            for entry in self._ledger_entries
+            if credit_file_id is None
+            or entry.credit_file_id == credit_file_id
+        ]
+
+    def add_budget_event(self, event: ModelBudgetEvent) -> None:
+        self._budget_events.append(event.model_copy(deep=True))
+
+    def list_budget_events(
+        self, credit_file_id: str
+    ) -> list[ModelBudgetEvent]:
+        return [
+            event.model_copy(deep=True)
+            for event in self._budget_events
+            if event.credit_file_id == credit_file_id
+        ]
+
     def ping(self) -> bool:
         return True
 
@@ -598,6 +629,17 @@ class SqliteCreditStore:
                 override_id TEXT PRIMARY KEY,
                 credit_file_id TEXT NOT NULL,
                 assignment_id TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS model_call_ledger (
+                entry_id TEXT PRIMARY KEY,
+                credit_file_id TEXT, purpose TEXT NOT NULL,
+                profile_id TEXT NOT NULL, model TEXT NOT NULL,
+                price_table_version TEXT NOT NULL,
+                called_at TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS model_budget_events (
+                event_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                recorded_at TEXT NOT NULL, payload TEXT NOT NULL);
             """
         )
         self._conn.commit()
@@ -1184,6 +1226,64 @@ class SqliteCreditStore:
         ).fetchall()
         return [
             RatingOverride.model_validate_json(r[0]) for r in rows
+        ]
+
+    # -- Model cost ledger (round 15): append-only ----------------
+
+    def add_call_entry(self, entry: ModelCallEntry) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO model_call_ledger (entry_id, "
+                "credit_file_id, purpose, profile_id, model, "
+                "price_table_version, called_at, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    entry.entry_id, entry.credit_file_id,
+                    entry.purpose, entry.profile_id, entry.model,
+                    entry.price_table_version,
+                    entry.called_at.isoformat(),
+                    entry.model_dump_json(),
+                ),
+            )
+
+    def list_call_entries(
+        self, credit_file_id: str | None
+    ) -> list[ModelCallEntry]:
+        if credit_file_id is not None:
+            rows = self._conn.execute(
+                "SELECT payload FROM model_call_ledger "
+                "WHERE credit_file_id = ? ORDER BY rowid",
+                (credit_file_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT payload FROM model_call_ledger ORDER BY rowid"
+            ).fetchall()
+        return [ModelCallEntry.model_validate_json(r[0]) for r in rows]
+
+    def add_budget_event(self, event: ModelBudgetEvent) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO model_budget_events (event_id, "
+                "credit_file_id, profile_id, recorded_at, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    event.event_id, event.credit_file_id,
+                    event.profile_id, event.recorded_at.isoformat(),
+                    event.model_dump_json(),
+                ),
+            )
+
+    def list_budget_events(
+        self, credit_file_id: str
+    ) -> list[ModelBudgetEvent]:
+        rows = self._conn.execute(
+            "SELECT payload FROM model_budget_events "
+            "WHERE credit_file_id = ? ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [
+            ModelBudgetEvent.model_validate_json(r[0]) for r in rows
         ]
 
     def get_breach_case(self, breach_id: str) -> BreachCase | None:
@@ -2095,6 +2195,63 @@ class PostgresCreditStore:
                 (credit_file_id,),
             ).fetchall()
         return [self._validate(RatingOverride, row) for row in rows]
+
+    # -- Model cost ledger (round 15): append-only ----------------
+
+    def add_call_entry(self, entry: ModelCallEntry) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO model_call_ledger (entry_id, "
+                "credit_file_id, purpose, profile_id, model, "
+                "price_table_version, called_at, payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+                (
+                    entry.entry_id, entry.credit_file_id,
+                    entry.purpose, entry.profile_id, entry.model,
+                    entry.price_table_version, entry.called_at,
+                    entry.model_dump_json(),
+                ),
+            )
+
+    def list_call_entries(
+        self, credit_file_id: str | None
+    ) -> list[ModelCallEntry]:
+        with self._connect() as conn:
+            if credit_file_id is not None:
+                rows = conn.execute(
+                    "SELECT payload FROM model_call_ledger "
+                    "WHERE credit_file_id = %s ORDER BY id",
+                    (credit_file_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT payload FROM model_call_ledger ORDER BY id"
+                ).fetchall()
+        return [self._validate(ModelCallEntry, row) for row in rows]
+
+    def add_budget_event(self, event: ModelBudgetEvent) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO model_budget_events (event_id, "
+                "credit_file_id, profile_id, recorded_at, payload) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                (
+                    event.event_id, event.credit_file_id,
+                    event.profile_id, event.recorded_at,
+                    event.model_dump_json(),
+                ),
+            )
+
+    def list_budget_events(
+        self, credit_file_id: str
+    ) -> list[ModelBudgetEvent]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM model_budget_events "
+                "WHERE credit_file_id = %s ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        return [self._validate(ModelBudgetEvent, row) for row in rows]
 
     def ping(self) -> bool:
         try:

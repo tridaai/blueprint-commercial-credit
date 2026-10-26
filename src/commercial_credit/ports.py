@@ -30,6 +30,8 @@ from .models import (
     FacilityRequest,
     MemoDiff,
     MemoReviewEvent,
+    ModelBudgetEvent,
+    ModelCallEntry,
     PolicyReport,
     RatingAssignment,
     RatingOverride,
@@ -277,4 +279,48 @@ class CreditFileStore(Protocol):
         self, credit_file_id: str | None = None
     ) -> list[BreachCase]: ...
 
+    # -- Model cost ledger (round 15) ------------------------------
+    # The gateway's append-only record of model calls and budget
+    # refusals. Entries are never updated or deleted: a later
+    # price-table version prices future calls, it never reprices
+    # recorded ones. `list_call_entries(None)` reads every entry
+    # (the portfolio rollup); a file id reads that file's entries.
+
+    def add_call_entry(self, entry: ModelCallEntry) -> None: ...
+
+    def list_call_entries(
+        self, credit_file_id: str | None
+    ) -> list[ModelCallEntry]: ...
+
+    def add_budget_event(self, event: ModelBudgetEvent) -> None: ...
+
+    def list_budget_events(
+        self, credit_file_id: str
+    ) -> list[ModelBudgetEvent]: ...
+
     def ping(self) -> bool: ...
+
+
+@runtime_checkable
+class ModelLedgerStore(Protocol):
+    """The gateway's ledger: where priced model calls and budget
+    refusals are recorded.
+
+    A separate, narrower port than the credit file store — the
+    gateway depends on this and nothing wider. In the shipped
+    wiring the credit file store implements both; the gateway
+    would make unrecorded calls without it, so it is required at
+    construction, never optional.
+    """
+
+    def add_call_entry(self, entry: ModelCallEntry) -> None: ...
+
+    def list_call_entries(
+        self, credit_file_id: str | None
+    ) -> list[ModelCallEntry]: ...
+
+    def add_budget_event(self, event: ModelBudgetEvent) -> None: ...
+
+    def list_budget_events(
+        self, credit_file_id: str
+    ) -> list[ModelBudgetEvent]: ...
