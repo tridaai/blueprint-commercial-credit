@@ -717,6 +717,122 @@ or routes around a refusal.
 `GET /console/queue?as_of=`, `GET /console/workspace/{id}?as_of=`,
 `GET /console/vocabularies`. Nothing else.
 
+## Model gateway (round 15)
+
+Rounds 5 and 12 put drafting behind composer ports — a
+deterministic `offline` composer and a `live` profile defined
+but not configured, refusing loudly. Round 15 builds the
+gateway those ports implied (`gateway.py`), and it is the one
+configured path for model calls: the production wiring
+(`wiring.build_pipeline`) constructs it from the shipped
+profile/price files and hands it to the pipeline, which routes
+every memo composition, recomposition and review-summary
+composition through it. A bare pipeline (tests, the demo)
+keeps the composer registries exactly as before — offline
+composer, `live` stub refusing — and the gateway holds no
+`live` profile at all: through it, the live path is the named
+profiles below.
+
+**Profiles are governed data.** `data/model_profiles.json`
+carries the profile definitions (id, provider kind, model,
+the *names* of the environment variables holding endpoint and
+key, a timeout) and the per-file budget cap;
+`data/model_prices.json` carries the versioned price table
+(version `2026.10.1`, as of 2026-10-01, per-model input/output
+prices per million tokens, each with its basis). The files are
+pinned to the gateway module's canonical constants by a drift
+test. Three profiles ship: `offline` (the deterministic
+composer's model name, priced at zero), `hosted-frontier`
+(provider kind `anthropic`, the Messages API), and
+`in-boundary` (provider kind `openai-compatible`, an
+open-weight model served inside the bank's boundary). The
+loader (`load_gateway_config`) is fail-closed: duplicate
+profile id, duplicate or negative price, unversioned profile
+set, malformed or negative budget cap, a live profile naming
+no endpoint, a key-required profile naming no key variable,
+or a profile whose model has no price entry each refuse the
+whole configuration. Resolution is fail-closed the same way:
+an unknown profile raises `UnknownModelProfileError`, a live
+profile whose endpoint/key the deployment has not set raises
+`ModelProfileNotConfiguredError`, and the wiring validates the
+deployment's own profile (`CREDIT_MODEL_PROFILE`) at
+construction — a misconfigured deployment does not start. No
+code path substitutes one profile for another.
+
+**One call path.** `ModelGateway.generate` resolves the
+profile, enforces the budget (below), dispatches to the
+profile's adapter behind the `ModelTransport` port (production:
+httpx; tests: stubs returning provider-shaped responses),
+prices the call from the table, appends the ledger entry, and
+returns the text. The composer factories bind a profile to a
+credit file: the deterministic composer renders the candidate,
+the adapter returns polished paragraphs (offline: the
+candidate verbatim, at zero tokens), and the pipeline's
+verifiers judge the result — the round 5 figure verifier for
+memos, the round 12 checks for review summaries. A reply that
+does not parse back into the artefact's paragraph shape is
+refused whole (`ModelResponseError`). Tables and structured
+sections never pass through a model. Token counts are the
+provider's when reported; otherwise the adapter's estimate
+(`chars/4`) is recorded *labelled as an estimate* on the
+entry's `token_basis`.
+
+**The ledger.** Every call appends a `ModelCallEntry`
+(migration `0013_model_ledger.sql`; all three stores implement
+the `ModelLedgerStore` port): file id or system scope,
+purpose (`memo_draft`, `review_summary`,
+`extraction_assist`), profile, model, tokens + basis, the
+price-table version and unit prices applied, exact Decimal
+cost (recomputable from the entry's own fields), latency, and
+the injected clock's timestamp. The entry is appended when
+the call returns, *before* shape checks and verifiers run —
+a refused draft remains in the ledger at its exact price.
+Rollups are pure reads over the ledger: per file (totals, by
+purpose, by profile, budget position) and portfolio daily
+(by UTC day and profile). Timestamps order the report and
+nothing else; no verdict derives from them.
+
+**Budgets before transport.** When a file's priced spend
+reaches the configured cap, `_enforce_budget` refuses further
+live-profile calls for that file *before the adapter is
+constructed*: a `ModelBudgetEvent` lands in the ledger store,
+an audit event (actor `model-gateway`, action
+`model_budget_refused`) lands on the file, and
+`ModelBudgetExceededError` propagates (the API maps it to
+429; the eval gate proves refusal-before-transport by the
+stub's call count). The offline profile is never budget-checked
+— zero priced spend — and system-scope calls are ledgered but
+not budgeted, by design: the cap governs per-file drafting
+spend.
+
+**Extraction assist.** `ModelAssistedExtractor` puts a live
+profile behind the round 1 `Extractor` port: the model reads
+the document text and returns labelled figures with page and
+line; this class stamps source type and period exactly as the
+reference extractor does and builds values through the same
+`ExtractedValue` construction, so `receive_extraction` and the
+provenance validators judge model output by the same law as
+every extractor. A value without a page or line raises
+`ProvenanceError` (batch refused whole); a reply that is not
+the contracted JSON raises `ModelResponseError`; the call
+ledgers under `extraction_assist` before either check. The
+pipeline binds the extractor per file (`for_file`) so its
+calls ledger and budget against the file they serve. The
+profile must be live and configured — checked at construction;
+the offline profile cannot read documents.
+
+**Surfaces.** `GET /model/profiles` (variable names +
+configured flags only — a test asserts a configured key value
+appears nowhere in summaries, ledger dumps or rollups),
+`GET /applications/{id}/model-ledger`,
+`GET /applications/{id}/model-costs`,
+`GET /model-costs/daily`. Configuration:
+`CREDIT_MODEL_PROFILE` (the deployment's own profile,
+default `offline`), `CREDIT_EXTRACTION_PROFILE` (unset keeps
+the reference extractor), and the profiles' own variables
+(`ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`,
+`IN_BOUNDARY_MODEL_URL`, `IN_BOUNDARY_MODEL_API_KEY`).
+
 ## Storage
 
 PostgreSQL is the deployment store. `migrations/` holds numbered SQL

@@ -789,6 +789,72 @@ every declared route must exist in the app, no action may
 live under `/console`, and the page must contain exactly one
 `fetch` call site.
 
+## What round 15 adds
+
+The **model gateway**: the one configured path every model
+call goes through, with named profiles, real adapters, and a
+cost ledger. Rounds 5 and 12 put drafting behind composer
+ports with an `offline` profile and a `live` stub that
+refused loudly; the gateway replaces the stub with the real
+thing, and the stub remains only as the bare-stack posture (a
+pipeline built without a gateway keeps the old registry).
+
+- **Profiles are data, loaded fail-closed** — `offline` (the
+  deterministic composer, zero cost), `hosted-frontier` (a
+  hosted frontier model over the Anthropic Messages API), and
+  `in-boundary` (an open-weight model on an OpenAI-compatible
+  endpoint inside the bank's boundary,
+  `data/model_profiles.json`). A profile names its model and
+  the *variables* holding its endpoint and key — never a key
+  value. A duplicate id, a live profile with no endpoint, a
+  key-required profile naming no key variable, or a profile
+  whose model has no price entry refuses the whole
+  configuration at load; the deployment's own profile
+  (`CREDIT_MODEL_PROFILE`) must resolve and be configured at
+  startup or the stack does not start. There is no fallback
+  anywhere: an unknown or unconfigured profile refuses, and
+  no other profile is ever substituted.
+- **The model writes narrative only — the verifiers still
+  decide** — a live adapter receives the deterministic
+  composer's candidate paragraphs and polishes the wording
+  under a binding instruction (introduce, alter or drop no
+  figure). Tables and every structured part of an artefact
+  never pass through the model. A reply that does not parse
+  back into the artefact's shape is refused whole, and what
+  survives faces exactly the verifier the offline draft faces:
+  the memo's figure verifier (round 5), the review summary's
+  checks (round 12). The model-assisted extractor behind the
+  extraction port keeps law 1 untouched — a figure the model
+  cannot point at (document, page, line) is the round-1
+  provenance refusal, batch whole.
+- **Every call is priced and ledgered** — each call appends
+  one entry to an append-only ledger (migration 0013, all
+  three stores): credit file (or system scope), purpose
+  (`memo_draft` / `review_summary` / `extraction_assist`),
+  profile and model, tokens in/out with their basis (provider
+  `reported`, or the adapter's stated `estimated:chars/4`),
+  the price-table version and the unit prices applied
+  (`data/model_prices.json`, versioned, as of 2026-10-01 —
+  the shipped files are pinned to the code's canonical data
+  by a drift test), the exact Decimal cost, latency, and the
+  injected clock's timestamp. The entry is written before any
+  shape check or verifier runs: a refused draft is still
+  ledgered at its exact price, because it cost what it cost.
+  Offline calls ledger at $0 — the ledger is the complete
+  record of drafting cost, not just the paid part.
+- **Budgets are enforced before transport** — a per-file cap
+  (configuration, $5.00 in the shipped profiles). At the cap,
+  further live calls for that file are refused *before any
+  transport is touched*, recorded as a budget event in the
+  ledger and an audit event on the file; the API surfaces the
+  refusal as 429. The offline profile is never capped, and
+  continuing offline is the caller naming it — the gateway
+  never switches profiles by itself. Reads: `/model/profiles`
+  (variable names and configured flags only), a file's
+  `/model-ledger` and `/model-costs` (rollup by purpose and
+  profile, with the budget position), and `/model-costs/daily`
+  for the portfolio.
+
 ## The laws (enforced in code, never in prompts)
 
 1. **No model-computed numbers.** Extraction returns values +
@@ -822,6 +888,10 @@ live under `/console`, and the page must contain exactly one
 | `S3_ENDPOINT_URL` | S3-compatible endpoint (the compose stack's SeaweedFS at `http://minio:8333`). |
 | `S3_BUCKET` | Document bucket. Unset ⇒ in-process local document store. |
 | `S3_REGION` | Default `us-east-1`. |
+| `CREDIT_MODEL_PROFILE` | The deployment's own drafting profile (default `offline`). Validated against the gateway at startup — an unknown or unconfigured profile stops the stack. |
+| `CREDIT_EXTRACTION_PROFILE` | When set, names the live profile the model-assisted extractor reads documents under (`hosted-frontier` or `in-boundary`). Unset ⇒ the offline reference extractor. |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | The `hosted-frontier` profile's key / endpoint override (endpoint defaults to `https://api.anthropic.com`). Variable names only — values live in the deployment's environment, never in the repo. |
+| `IN_BOUNDARY_MODEL_URL` / `IN_BOUNDARY_MODEL_API_KEY` | The `in-boundary` profile's OpenAI-compatible endpoint inside the bank's boundary, and its key where the endpoint requires one. |
 
 ## Honest status
 
@@ -829,9 +899,19 @@ live under `/console`, and the page must contain exactly one
   store runs in the production-profile round; round 1's gates run
   against the SQLite and in-memory doubles behind the same ports.
 - Document extraction is the offline reference extractor over the
-  generated borrower documents; a document-AI adapter slots behind
-  the same port in a deployment and inherits the same provenance
-  contract. No claim is made about scanned PDFs today.
+  generated borrower documents by default; a deployment can put
+  the round 15 model-assisted extractor behind the same port
+  (`CREDIT_EXTRACTION_PROFILE`), and it inherits the same
+  provenance contract — a value without a page and line is
+  refused whole. No claim is made about scanned PDFs today.
+- The model gateway's live profiles (round 15) are real HTTP
+  adapters — the Anthropic Messages shape for `hosted-frontier`,
+  an OpenAI-compatible shape for `in-boundary` — exercised in
+  tests and evals against stub transports returning
+  provider-shaped responses, with hand-computed prices. No live
+  provider key has been used yet; drafting defaults to the
+  offline profile, and the price table is governed reference
+  data for the shipped models, maintained by the deployment.
 - The risk-rating scorecard (round 13) is a coded stand-in for
   the bank's own rating model: the versioning, traceability and
   override discipline are real; the factor bands are illustrative,

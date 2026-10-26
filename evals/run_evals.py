@@ -347,6 +347,49 @@ API it renders:
                             round-trip through the workspace as
                             inert data. REQUIRED: 0.
 
+Round 15 counters — the model gateway, graded on stub
+transports returning provider-shaped responses (the adapters
+are exercised against the same shapes a live endpoint
+returns):
+
+  gateway_unpriced_calls    every call through the gateway must
+                            land in the ledger exactly once,
+                            priced from the entry's own recorded
+                            unit prices and table version: a live
+                            transport call with no entry, or an
+                            entry whose cost does not recompute
+                            from its tokens x unit prices, counts.
+                            REQUIRED: 0.
+  gateway_silent_fallback_  unknown profile, unconfigured live
+    accepted                profile, duplicate profile id and
+                            negative price probes must all refuse
+                            — a probe that is accepted (a
+                            substitution made, a transport
+                            touched) counts. REQUIRED: 0.
+  gateway_budget_breach_    at the per-file cap, a live call
+    executed                must refuse BEFORE transport: the
+                            stub's call count after the refused
+                            call is the proof. REQUIRED: 0.
+  gateway_ledger_cost_wrong hand-computed token x price fixtures
+                            must match the ledger to the digit:
+                            1200 in / 300 out at $3.00/$15.00 per
+                            MTok = $0.0081; 2000/500 at $0.90 =
+                            $0.00225; the offline profile = $0.
+                            REQUIRED: 0.
+  gateway_refused_output_   a verifier-refused live draft and a
+    unledgered              provenance-refused extraction batch
+                            must still stand in the ledger at
+                            their exact prices — they cost what
+                            they cost. REQUIRED: 0.
+  gateway_positive_paths    the offline draft fully ledgered at
+                            $0; the stubbed live memo and review
+                            summary priced exactly and passing
+                            the same verifiers; the per-file and
+                            portfolio rollups matching the ledger;
+                            the budget refusal recorded on the
+                            ledger and the audit trail, with the
+                            offline continuation working.
+
 Later rounds add counters as their machinery lands.
 Exit code 0 = GATE: PASS.
 """
@@ -3504,6 +3547,451 @@ def main() -> int:
     print(f"console_unescaped_render: {unescaped} (required 0)")
     if unescaped:
         failures.append("stored content could render unescaped")
+
+    # ---------------------------------------------------------------
+    # Round 15: the model gateway. Profiles as governed data
+    # behind the composer ports; every call priced into the
+    # append-only ledger; budgets enforced before transport.
+    # Graded on stub transports returning provider-shaped
+    # responses — the same shapes the real adapters parse.
+    # ---------------------------------------------------------------
+    import copy as _copy
+    import hashlib as _hashlib
+    from datetime import datetime as _datetime
+    from datetime import timezone as _timezone
+
+    from commercial_credit.errors import (
+        ModelBudgetExceededError as _BudgetError,
+    )
+    from commercial_credit.errors import (
+        ModelProfileConfigError as _ConfigError,
+    )
+    from commercial_credit.errors import (
+        ModelProfileNotConfiguredError as _NotConfigured,
+    )
+    from commercial_credit.errors import (
+        UnknownModelProfileError as _UnknownProfile,
+    )
+    from commercial_credit.gateway import (
+        DEFAULT_PRICES_DATA as _GW_PRICES,
+    )
+    from commercial_credit.gateway import (
+        DEFAULT_PROFILES_DATA as _GW_PROFILES,
+    )
+    from commercial_credit.gateway import ModelAssistedExtractor as _Extractor
+    from commercial_credit.gateway import ModelGateway as _Gateway
+    from commercial_credit.gateway import (
+        default_gateway_config as _gw_config,
+    )
+    from commercial_credit.gateway import load_gateway_config as _gw_load
+    from commercial_credit.models import SourceDocument as _SourceDocument
+
+    _GW_NOW = _datetime(2026, 10, 26, 9, 30, tzinfo=_timezone.utc)
+
+    class _GwStub:
+        """A call-counted transport answering through a
+        responder — the count is the budget proof."""
+
+        def __init__(self, responder):
+            self.calls = []
+            self._responder = responder
+
+        def post_json(self, url, *, headers, payload, timeout):
+            self.calls.append({"url": url, "payload": payload})
+            return self._responder(url, payload)
+
+    def _gw_candidate(prompt):
+        return prompt.split("<<<CANDIDATE>>>", 1)[1].split(
+            "<<<END>>>", 1
+        )[0].strip()
+
+    def _gw_anthropic(url, payload):
+        prompt = payload["messages"][0]["content"]
+        # The review polish prompt names its artefact; price the
+        # two drafting surfaces at their own graded usages.
+        if "annual credit review" in prompt:
+            usage = {"input_tokens": 800, "output_tokens": 200}
+        else:
+            usage = {"input_tokens": 1200, "output_tokens": 300}
+        return {
+            "content": [
+                {"type": "text", "text": _gw_candidate(prompt)}
+            ],
+            "usage": usage,
+        }
+
+    def _gw_open_hartline(pipe):
+        borrower, facility = ReferenceLosFeed().fetch_application(
+            "LOS-2026-0117"
+        )
+        docs = [
+            {
+                "kind": DocumentKind.FINANCIAL_STATEMENT.value,
+                "filename": f"hartline-fy{year}-statements.json",
+                "data_hex": statement_document(year).hex(),
+                "period_label": f"FY{year}",
+            }
+            for year in (2022, 2023, 2024)
+        ]
+        return pipe.open_application(borrower, facility, documents=docs)
+
+    # -- the main gateway: offline ledgered, live priced exact ----
+    _g_stub = _GwStub(_gw_anthropic)
+    _g_store = InMemoryCreditStore()
+    _g_gw = _Gateway(
+        _gw_config(), _g_store,
+        environ={"ANTHROPIC_API_KEY": "eval-key"},
+        transport=_g_stub,
+        clock=lambda: _GW_NOW,
+        audit_store=_g_store,
+    )
+    _gp = CreditPipeline(
+        store=_g_store, documents=LocalDocumentStore(), gateway=_g_gw
+    )
+    _g_file = _gw_open_hartline(_gp)
+    _gcf = _g_file.credit_file_id
+    _g_live_memo = _gp.compose_memo(_gcf, profile="hosted-frontier")
+
+    # the review surface rides the same gateway (Calloway chain)
+    _g_ccf, _g_decision = _t_approved(_gp)
+    _t_deliver(_gp, _g_ccf, 2026, _T_FY2026)
+    _gp.run_due_covenant_tests(_g_ccf, as_of=date(2027, 3, 1))
+    _g_pack = _gp.assemble_review_pack(
+        _g_ccf, review_number=1, as_of=date(2027, 3, 1)
+    )
+    _g_pack_live = _gp.assemble_review_pack(
+        _g_ccf, review_number=1, as_of=date(2027, 3, 1),
+        profile="hosted-frontier",
+    )
+    # one system-scope live call, for the cost fixture below
+    _g_gw.generate(
+        "hosted-frontier", credit_file_id=None, purpose="memo_draft",
+        prompt="pre <<<CANDIDATE>>>\n[\"x\"]\n<<<END>>> post",
+    )
+
+    gateway_positive = True
+    if _g_live_memo.composer_profile != "hosted-frontier":
+        gateway_positive = False
+    if _g_live_memo.verification.verified is not True:
+        gateway_positive = False
+    if _g_pack.summary.composer_profile != "offline":
+        gateway_positive = False
+    if _g_pack_live.summary.composer_profile != "hosted-frontier":
+        gateway_positive = False
+    if _g_pack_live.summary.verification.verified is not True:
+        gateway_positive = False
+    _g_offline_entries = [
+        e for e in _g_gw.list_call_entries(_gcf)
+        if e.profile_id == "offline"
+    ]
+    if not _g_offline_entries or any(
+        e.cost_usd != Decimal("0") for e in _g_offline_entries
+    ):
+        gateway_positive = False
+
+    # -- unpriced calls: every transport call ledgered once, and
+    #    every entry's cost recomputes from its own fields --------
+    unpriced = 0
+    _g_entries = _g_gw.list_call_entries(None)
+    _g_live_entries = [e for e in _g_entries if e.profile_id != "offline"]
+    if len(_g_live_entries) != len(_g_stub.calls):
+        unpriced += 1
+    for _e in _g_entries:
+        _expect = (
+            Decimal(_e.tokens_in) * _e.input_per_mtok_usd
+            + Decimal(_e.tokens_out) * _e.output_per_mtok_usd
+        ) / Decimal(1_000_000)
+        if _e.cost_usd != _expect:
+            unpriced += 1
+        if _e.price_table_version != "2026.10.1":
+            unpriced += 1
+    print(f"gateway_unpriced_calls: {unpriced} (required 0)")
+    if unpriced:
+        failures.append("a gateway call went unpriced or unledgered")
+
+    # -- ledger cost fixtures, to the digit ------------------------
+    cost_wrong = 0
+    _g_memo_entries = [
+        e for e in _g_gw.list_call_entries(_gcf)
+        if e.profile_id == "hosted-frontier"
+    ]
+    if len(_g_memo_entries) != 1 or (
+        _g_memo_entries[0].cost_usd != Decimal("0.0081")
+    ):
+        cost_wrong += 1  # 1200x3.00 + 300x15.00 over 1M
+    _g_review_entries = [
+        e for e in _g_gw.list_call_entries(_g_ccf)
+        if e.purpose == "review_summary"
+        and e.profile_id == "hosted-frontier"
+    ]
+    if len(_g_review_entries) != 1 or (
+        _g_review_entries[0].cost_usd != Decimal("0.0054")
+    ):
+        cost_wrong += 1  # 800x3.00 + 200x15.00 over 1M
+    # (the counter prints after the extraction fixture below,
+    # which carries the third hand-computed price)
+
+    # -- rollups match the ledger ----------------------------------
+    _g_rollup = _g_gw.file_rollup(_gcf)
+    _g_file_total = sum(
+        (e.cost_usd for e in _g_gw.list_call_entries(_gcf)),
+        Decimal("0"),
+    )
+    if Decimal(_g_rollup["cost_usd"]) != _g_file_total:
+        gateway_positive = False
+    _g_daily_total = sum(
+        (Decimal(r["cost_usd"]) for r in _g_gw.portfolio_rollup()),
+        Decimal("0"),
+    )
+    _g_all_total = sum(
+        (e.cost_usd for e in _g_entries), Decimal("0")
+    )
+    if _g_daily_total != _g_all_total:
+        gateway_positive = False
+
+    # -- silent fallback probes: all refuse, transport untouched ---
+    fallback_accepted = 0
+    _calls_before = len(_g_stub.calls)
+    try:
+        _g_gw.generate(
+            "no-such-profile", credit_file_id=None,
+            purpose="memo_draft", prompt="x",
+        )
+        fallback_accepted += 1
+    except _UnknownProfile:
+        pass
+    try:
+        _g_gw.generate(
+            "in-boundary", credit_file_id=None,
+            purpose="memo_draft", prompt="x",
+        )
+        fallback_accepted += 1
+    except _NotConfigured:
+        pass
+    _dup = _copy.deepcopy(_GW_PROFILES)
+    _dup["profiles"].append(dict(_dup["profiles"][0]))
+    try:
+        _gw_load(_dup, _copy.deepcopy(_GW_PRICES))
+        fallback_accepted += 1
+    except _ConfigError:
+        pass
+    _neg = _copy.deepcopy(_GW_PRICES)
+    _neg["entries"][1]["input_per_mtok_usd"] = "-3.00"
+    try:
+        _gw_load(_copy.deepcopy(_GW_PROFILES), _neg)
+        fallback_accepted += 1
+    except _ConfigError:
+        pass
+    if len(_g_stub.calls) != _calls_before:
+        fallback_accepted += 1
+    print(
+        f"gateway_silent_fallback_accepted: {fallback_accepted} "
+        "(required 0)"
+    )
+    if fallback_accepted:
+        failures.append("a gateway probe was silently substituted")
+
+    # -- a refused live draft is still ledgered --------------------
+    def _gw_rogue(url, payload):
+        prompt = payload["messages"][0]["content"]
+        paragraphs = json.loads(_gw_candidate(prompt))
+        paragraphs[0] += (
+            " The facility also carries a reserve of $4,242,424.24."
+        )
+        return {
+            "content": [
+                {"type": "text", "text": json.dumps(paragraphs)}
+            ],
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+        }
+
+    _r_stub = _GwStub(_gw_rogue)
+    _r_store = InMemoryCreditStore()
+    _r_gw = _Gateway(
+        _gw_config(), _r_store,
+        environ={"ANTHROPIC_API_KEY": "eval-key"},
+        transport=_r_stub,
+        clock=lambda: _GW_NOW,
+        audit_store=_r_store,
+    )
+    _rp = CreditPipeline(
+        store=_r_store, documents=LocalDocumentStore(), gateway=_r_gw
+    )
+    _r_file = _gw_open_hartline(_rp)
+    _rcf = _r_file.credit_file_id
+    refused_unledgered = 0
+    try:
+        _rp.compose_memo(_rcf, profile="hosted-frontier")
+        refused_unledgered += 1  # the rogue draft was accepted
+    except MemoVerificationError:
+        pass
+    _r_entries = [
+        e for e in _r_gw.list_call_entries(_rcf)
+        if e.profile_id == "hosted-frontier"
+    ]
+    if len(_r_entries) != 1 or (
+        _r_entries[0].cost_usd != Decimal("0.00105")
+    ):
+        refused_unledgered += 1  # 100x3.00 + 50x15.00 over 1M
+
+    # -- the budget: refused before transport, recorded ------------
+    def _gw_budget_config():
+        profiles = _copy.deepcopy(_GW_PROFILES)
+        profiles["file_budget_usd"] = "0.01"
+        return _gw_load(profiles, _copy.deepcopy(_GW_PRICES))
+
+    _b_stub = _GwStub(_gw_anthropic)
+    _b_store = InMemoryCreditStore()
+    _b_gw = _Gateway(
+        _gw_budget_config(), _b_store,
+        environ={"ANTHROPIC_API_KEY": "eval-key"},
+        transport=_b_stub,
+        clock=lambda: _GW_NOW,
+        audit_store=_b_store,
+    )
+    _bp = CreditPipeline(
+        store=_b_store, documents=LocalDocumentStore(), gateway=_b_gw
+    )
+    _b_file = _gw_open_hartline(_bp)
+    _bcf = _b_file.credit_file_id
+    _bp.compose_memo(_bcf, profile="hosted-frontier")  # $0.0081
+    _bp.compose_memo(_bcf, profile="hosted-frontier")  # $0.0162 total
+    budget_breach = 0
+    try:
+        _bp.compose_memo(_bcf, profile="hosted-frontier")
+        budget_breach += 1  # a third live call executed at the cap
+    except _BudgetError:
+        pass
+    if len(_b_stub.calls) != 2:
+        budget_breach += 1  # the refused call reached transport
+    print(f"gateway_budget_breach_executed: {budget_breach} (required 0)")
+    if budget_breach:
+        failures.append("a live call executed past the file budget")
+    _b_events = _b_gw.list_budget_events(_bcf)
+    if len(_b_events) != 1 or _b_events[0].spent_usd != Decimal("0.0162"):
+        gateway_positive = False
+    if not any(
+        e.action == "model_budget_refused"
+        for e in _b_store.list_audit(_bcf)
+    ):
+        gateway_positive = False
+    try:
+        _bp.compose_memo(_bcf, profile="offline")
+    except CreditError:
+        gateway_positive = False
+
+    # -- extraction assist: priced, provenanced, refusals ledgered -
+    def _gw_reader(url, payload):
+        prompt = payload["messages"][0]["content"]
+        raw = prompt.split("<<<DOCUMENT>>>", 1)[1].split("<<<END>>>", 1)[0]
+        document = json.loads(raw)
+        entries = []
+        for page in document.get("pages", []):
+            for line in page.get("lines", []):
+                if line.get("label") and line.get("value") is not None:
+                    entries.append({
+                        "label": line["label"],
+                        "value": line["value"],
+                        "page": page["page"],
+                        "line": line["line"],
+                    })
+        return {
+            "choices": [{"message": {"content": json.dumps(entries)}}],
+            "usage": {"prompt_tokens": 5000, "completion_tokens": 900},
+        }
+
+    _x_stub = _GwStub(_gw_reader)
+    _x_store = InMemoryCreditStore()
+    _x_gw = _Gateway(
+        _gw_config(), _x_store,
+        environ={
+            "IN_BOUNDARY_MODEL_URL": "http://models.bank.internal:8000/v1"
+        },
+        transport=_x_stub,
+        clock=lambda: _GW_NOW,
+        audit_store=_x_store,
+    )
+    _x_extractor = _Extractor(
+        _x_gw, "in-boundary", credit_file_id="cf-eval-extract"
+    )
+    _x_content = statement_document(2024)
+    _x_document = _SourceDocument(
+        document_id="doc-eval-2024",
+        credit_file_id="cf-eval-extract",
+        kind=DocumentKind.FINANCIAL_STATEMENT,
+        filename="hartline-fy2024-statements.json",
+        sha256=_hashlib.sha256(_x_content).hexdigest(),
+        byte_size=len(_x_content),
+        storage_key="doc-eval-2024",
+        period_label="FY2024",
+    )
+    _x_values = _x_extractor.extract(_x_document, _x_content)
+    if not _x_values or any(
+        not v.provenance.document_id or v.provenance.page < 1
+        or not (v.provenance.line or "").strip()
+        for v in _x_values
+    ):
+        gateway_positive = False
+    _x_entries = [
+        e for e in _x_gw.list_call_entries("cf-eval-extract")
+        if e.purpose == "extraction_assist"
+    ]
+    if len(_x_entries) != 1 or (
+        _x_entries[0].cost_usd != Decimal("0.00531")
+    ):
+        cost_wrong += 1  # 5000x0.90 + 900x0.90 over 1M
+
+    def _gw_reader_no_line(url, payload):
+        prompt = payload["messages"][0]["content"]
+        raw = prompt.split("<<<DOCUMENT>>>", 1)[1].split("<<<END>>>", 1)[0]
+        document = json.loads(raw)
+        page = document["pages"][0]
+        line = page["lines"][0]
+        entries = [{
+            "label": line["label"],
+            "value": line["value"],
+            "page": page["page"],
+        }]
+        return {
+            "choices": [{"message": {"content": json.dumps(entries)}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10},
+        }
+
+    _x_stub2 = _GwStub(_gw_reader_no_line)
+    _x_gw2 = _Gateway(
+        _gw_config(), _x_store,
+        environ={
+            "IN_BOUNDARY_MODEL_URL": "http://models.bank.internal:8000/v1"
+        },
+        transport=_x_stub2,
+        clock=lambda: _GW_NOW,
+        audit_store=_x_store,
+    )
+    _x_extractor2 = _Extractor(
+        _x_gw2, "in-boundary", credit_file_id="cf-eval-extract"
+    )
+    try:
+        _x_extractor2.extract(_x_document, _x_content)
+        refused_unledgered += 1  # a provenance-less batch was accepted
+    except ProvenanceError:
+        pass
+    if len(_x_gw2.list_call_entries("cf-eval-extract")) != 2:
+        refused_unledgered += 1
+    print(
+        f"gateway_refused_output_unledgered: {refused_unledgered} "
+        "(required 0)"
+    )
+    if refused_unledgered:
+        failures.append("a refused model call went unledgered")
+    print(f"gateway_ledger_cost_wrong: {cost_wrong} (required 0)")
+    if cost_wrong:
+        failures.append("a ledger cost diverged from tokens x price")
+    print(
+        "gateway_positive_paths: "
+        + ("ok" if gateway_positive else "FAILED")
+    )
+    if not gateway_positive:
+        failures.append("a gateway positive path did not land")
 
     if failures:
         print("GATE: FAIL")
