@@ -129,6 +129,7 @@ from .models import (
     new_id,
     utcnow,
 )
+from .gateway import ModelAssistedExtractor, ModelGateway
 from .memo import MemoInputs, RatingFacts, _canonical_hash, verify_memo
 from .memo import compose_memo as draft_memo
 from .memo import get_composer
@@ -197,12 +198,74 @@ class CreditPipeline:
         documents: DocumentStore,
         extractor: Extractor | None = None,
         actor: str = "intake-pipeline",
+        gateway: ModelGateway | None = None,
     ) -> None:
         self.store = store
         self.documents = documents
         self.extractor = extractor or OfflineReferenceExtractor()
         self.actor = actor
+        # Round 15: when a gateway is wired, every drafting call
+        # resolves through it (profiles as data, every call
+        # priced into the ledger, budget enforced). A bare stack
+        # keeps the round-5/12 composer registries — the offline
+        # composer, and the 'live' stub that refuses loudly —
+        # exactly as before.
+        self.gateway = gateway
         self._graph = self._build()
+
+    # -- model gateway (round 15) ------------------------------------
+
+    def _memo_composer(self, profile: str, credit_file_id: str):  # noqa: ANN202
+        """The memo composer for a profile: the gateway's bound
+        composer when wired (the call ledgers against the file),
+        the round-5 registry otherwise."""
+        if self.gateway is not None:
+            return self.gateway.memo_composer(
+                profile, credit_file_id=credit_file_id
+            )
+        return get_composer(profile)
+
+    def _review_composer(self, profile: str, credit_file_id: str):  # noqa: ANN202
+        """The review-summary composer for a profile — the
+        round-12 parallel of `_memo_composer`."""
+        if self.gateway is not None:
+            return self.gateway.review_composer(
+                profile, credit_file_id=credit_file_id
+            )
+        return get_review_composer(profile)
+
+    def _require_gateway(self) -> ModelGateway:
+        if self.gateway is None:
+            raise ValidationError(
+                "no model gateway is wired in this stack; the "
+                "cost ledger exists only where the gateway does "
+                "(wiring.build_pipeline wires one)"
+            )
+        return self.gateway
+
+    def model_profiles(self) -> list[dict]:
+        """Every gateway profile: model, price, configured flag.
+        Key values never appear — variable names only."""
+        return self._require_gateway().profile_summaries()
+
+    def file_model_ledger(self, credit_file_id: str) -> list[dict]:
+        """The file's priced model calls, in ledger order."""
+        self._load(credit_file_id)
+        gateway = self._require_gateway()
+        return [
+            entry.model_dump(mode="json")
+            for entry in gateway.list_call_entries(credit_file_id)
+        ]
+
+    def file_model_costs(self, credit_file_id: str) -> dict:
+        """The file's model cost rollup: totals by purpose and
+        profile, with its budget position."""
+        self._load(credit_file_id)
+        return self._require_gateway().file_rollup(credit_file_id)
+
+    def portfolio_model_costs(self) -> list[dict]:
+        """Model spend across the portfolio, by day and profile."""
+        return self._require_gateway().portfolio_rollup()
 
     # -- graph nodes -------------------------------------------------
     def _node_intake(self, state: PipelineState) -> PipelineState:
@@ -262,7 +325,15 @@ class CreditPipeline:
             ):
                 continue
             content = read_document_verified(self.documents, doc)
-            values = receive_extraction(self.extractor.extract(doc, content))
+            # Round 15: a model-assisted extractor is bound per
+            # file, so the extraction calls it makes ledger against
+            # this file and the per-file budget applies. Any other
+            # extractor (the offline reference extractor) is used
+            # exactly as constructed.
+            extractor = self.extractor
+            if isinstance(extractor, ModelAssistedExtractor):
+                extractor = extractor.for_file(credit_file.credit_file_id)
+            values = receive_extraction(extractor.extract(doc, content))
             if values:
                 self.store.save_extractions(credit_file.credit_file_id, values)
                 total += len(values)
@@ -610,7 +681,7 @@ class CreditPipeline:
             pack,
             report,
             global_pack=global_artefact,
-            composer=get_composer(profile),
+            composer=self._memo_composer(profile, credit_file_id),
             rating=self._current_rating_facts(credit_file_id),
         )
         if self.store.get_memo(memo.memo_id) is not None:
@@ -1181,7 +1252,9 @@ class CreditPipeline:
             pack,
             report,
             global_pack=global_pack,
-            composer=get_composer(old.composer_profile),
+            composer=self._memo_composer(
+                old.composer_profile, credit_file_id
+            ),
             rating=self._current_rating_facts(credit_file_id),
         )
         sequence = 1 + sum(
@@ -3035,7 +3108,7 @@ class CreditPipeline:
             credit_file, covenant_set, instance, anchor, basis,
             as_of=as_of,
         )
-        composer = get_review_composer(profile)
+        composer = self._review_composer(profile, credit_file_id)
         paragraphs = composer.compose(inputs)
         locked = locked_fact_paragraphs(inputs)
         verification = verify_review_summary(

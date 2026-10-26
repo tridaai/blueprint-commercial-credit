@@ -42,8 +42,14 @@ officer console: the static page at /console and the two read
 aggregates it renders (the pipeline queue and the per-file
 workspace) plus the coded vocabularies its forms offer. The
 console adds no write semantics — every action it offers posts
-to an existing gated route above. Every request carries a
-request id into the structured logs.
+to an existing gated route above. Round 15 adds the model
+gateway reads: the governed profile list (variable names and
+configured flags only — key values never appear), a file's
+priced call ledger and cost rollup with its budget position,
+and the portfolio's daily spend by profile. A budget refusal
+surfaces as 429, distinct from the 422 domain refusals: the
+request was well-formed, the file's priced budget is spent.
+Every request carries a request id into the structured logs.
 """
 
 from __future__ import annotations
@@ -63,7 +69,12 @@ from .config import load_settings
 from .console import queue_view, vocabularies_view, workspace_view
 from .console_page import CONSOLE_HTML
 from .documents import read_document_verified, register_document
-from .errors import CreditError, NotFoundError, ValidationError
+from .errors import (
+    CreditError,
+    ModelBudgetExceededError,
+    NotFoundError,
+    ValidationError,
+)
 from .logging_setup import configure_logging, request_id_var
 from .models import (
     AdjustmentReasonCode,
@@ -141,6 +152,17 @@ async def request_id_middleware(request: Request, call_next):  # noqa: ANN001, A
 async def credit_error_handler(request: Request, exc: CreditError) -> JSONResponse:
     status = 404 if isinstance(exc, NotFoundError) else 422
     return JSONResponse(status_code=status, content={"detail": str(exc)})
+
+
+@app.exception_handler(ModelBudgetExceededError)
+async def model_budget_error_handler(
+    request: Request, exc: ModelBudgetExceededError
+) -> JSONResponse:
+    # Round 15: a budget refusal is not a malformed request — the
+    # file's priced model budget is spent. 429 keeps that distinct
+    # from the 422 domain refusals above (the same mapping the AML
+    # blueprint's gateway uses).
+    return JSONResponse(status_code=429, content={"detail": str(exc)})
 
 
 @app.get("/health")
@@ -1521,3 +1543,36 @@ def console_queue(as_of: date) -> list[dict]:
 def console_workspace(credit_file_id: str, as_of: date) -> dict:
     _file_or_404(credit_file_id)
     return workspace_view(pipeline, credit_file_id, as_of=as_of)
+
+
+# ------------------------------------------------------------------
+# Round 15: the model gateway. Reads only — the profiles the
+# deployment holds (variable names and configured flags, never
+# key values), a file's priced call ledger, its cost rollup with
+# the budget position, and the portfolio's daily spend. Calls
+# happen through the gated drafting routes above; a file whose
+# priced budget is spent gets 429 from those routes, and the
+# refusal itself is readable here (ledger + audit trail).
+# ------------------------------------------------------------------
+
+
+@app.get("/model/profiles")
+def list_model_profiles() -> list[dict]:
+    return pipeline.model_profiles()
+
+
+@app.get("/model-costs/daily")
+def get_portfolio_model_costs() -> list[dict]:
+    return pipeline.portfolio_model_costs()
+
+
+@app.get("/applications/{credit_file_id}/model-ledger")
+def get_file_model_ledger(credit_file_id: str) -> list[dict]:
+    _file_or_404(credit_file_id)
+    return pipeline.file_model_ledger(credit_file_id)
+
+
+@app.get("/applications/{credit_file_id}/model-costs")
+def get_file_model_costs(credit_file_id: str) -> dict:
+    _file_or_404(credit_file_id)
+    return pipeline.file_model_costs(credit_file_id)
