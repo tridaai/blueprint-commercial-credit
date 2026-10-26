@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .errors import StoreUnavailableError
 from .models import (
+    AccessDenial,
     AnnualReviewOutcome,
     AnnualReviewPack,
     AuditEvent,
@@ -33,6 +34,8 @@ from .models import (
     ModelBudgetEvent,
     ModelCallEntry,
     PolicyReport,
+    QuarantineEvent,
+    QuarantineReview,
     RatingAssignment,
     RatingOverride,
     ReadinessReport,
@@ -81,6 +84,10 @@ class InMemoryCreditStore:
         self._rating_override_order: dict[str, list[str]] = {}
         self._ledger_entries: list[ModelCallEntry] = []
         self._budget_events: list[ModelBudgetEvent] = []
+        self._quarantine_events: dict[str, QuarantineEvent] = {}
+        self._quarantine_order: dict[str, list[str]] = {}
+        self._quarantine_reviews: dict[str, list[QuarantineReview]] = {}
+        self._denials: list[AccessDenial] = []
 
     def save_credit_file(self, credit_file: CreditFile) -> None:
         self._files[credit_file.credit_file_id] = credit_file.model_copy(deep=True)
@@ -539,6 +546,47 @@ class InMemoryCreditStore:
             for event in self._budget_events
             if event.credit_file_id == credit_file_id
         ]
+
+    # -- Quarantine + access denials (round 17): append-only -----
+
+    def save_quarantine_event(self, event: QuarantineEvent) -> None:
+        self._quarantine_events[event.event_id] = event.model_copy(deep=True)
+        self._quarantine_order.setdefault(event.credit_file_id, []).append(
+            event.event_id
+        )
+
+    def list_quarantine_events(
+        self, credit_file_id: str
+    ) -> list[QuarantineEvent]:
+        return [
+            self._quarantine_events[event_id].model_copy(deep=True)
+            for event_id in self._quarantine_order.get(credit_file_id, [])
+        ]
+
+    def get_quarantine_event(
+        self, event_id: str
+    ) -> QuarantineEvent | None:
+        event = self._quarantine_events.get(event_id)
+        return event.model_copy(deep=True) if event else None
+
+    def save_quarantine_review(self, review: QuarantineReview) -> None:
+        self._quarantine_reviews.setdefault(review.credit_file_id, []).append(
+            review.model_copy(deep=True)
+        )
+
+    def list_quarantine_reviews(
+        self, credit_file_id: str
+    ) -> list[QuarantineReview]:
+        return [
+            review.model_copy(deep=True)
+            for review in self._quarantine_reviews.get(credit_file_id, [])
+        ]
+
+    def append_denial(self, denial: AccessDenial) -> None:
+        self._denials.append(denial.model_copy(deep=True))
+
+    def list_denials(self) -> list[AccessDenial]:
+        return [d.model_copy(deep=True) for d in self._denials]
 
     def ping(self) -> bool:
         return True

@@ -254,6 +254,14 @@ class CreditFile(BaseModel):
     # closing date is a new recording that supersedes in the audit
     # trail, and covenant sets pin the date they were built from.
     closing_date: date | None = None
+    # Round 17: the named analyst the file is assigned to, when it
+    # is. Assignment is a recorded act (an audit event names who
+    # assigned it and when); retrieval access for assigned-scope
+    # roles keys off this field. None = the unassigned pickup
+    # queue, visible to assigned-scope roles until someone claims
+    # the file. The field changes only through the assign act —
+    # never as a side effect of a read.
+    assigned_to: str | None = None
     checklist: list[ChecklistItem] = Field(default_factory=list)
     documents: list[SourceDocument] = Field(default_factory=list)
     policy_history: list[PolicyHistoryEntry] = Field(default_factory=list)
@@ -2252,3 +2260,79 @@ class ModelBudgetEvent(BaseModel):
         description="The file's priced spend at refusal time."
     )
     recorded_at: datetime = Field(default_factory=utcnow)
+
+
+# ---------------------------------------------------------------------
+# Round 17: quarantine + access control. Borrower documents are
+# untrusted text: an instruction planted in a statement's notes is
+# recorded, fenced at every model surface, and never obeyed — and
+# retrieval of the file's artefacts is governed by one role policy,
+# with every refusal recorded.
+# ---------------------------------------------------------------------
+
+
+class QuarantineEvent(BaseModel):
+    """One instruction-pattern match in one document field.
+
+    Recorded at ingestion by the deterministic scanner
+    (quarantine.py) under a versioned pattern pack. The document
+    itself is never rejected and never altered — the event is the
+    record that a span of its text matched an instruction pattern:
+    the document, the field the text lives in, the pattern, and
+    the exact span. Everywhere that text later reaches a model,
+    the span is fenced; a figure that appears only inside such
+    spans grounds nothing in a memo. `figures` carries the
+    money-like numeric tokens found inside the matched span, so
+    the figure discipline never has to re-derive them.
+    """
+
+    event_id: str = Field(default_factory=lambda: new_id("qev"))
+    credit_file_id: str
+    document_id: str
+    field: str  # JSON path of the string field, or "filename" / "text"
+    pattern_id: str
+    pattern_family: str
+    pack_version: str
+    span_start: int = Field(ge=0)
+    span_end: int = Field(ge=0)
+    matched_text: str
+    figures: list[Decimal] = Field(default_factory=list)
+    recorded_at: datetime = Field(default_factory=utcnow)
+
+
+class QuarantineReview(BaseModel):
+    """A named officer's review of one quarantine event.
+
+    The review is an audit act, recorded; it changes nothing
+    about fencing. Fences derive from the stored scan, not from
+    anyone's judgement that a span looks harmless — a reviewed
+    span stays fenced, and its figures stay ungrounded.
+    """
+
+    review_id: str = Field(default_factory=lambda: new_id("qrv"))
+    event_id: str
+    credit_file_id: str
+    reviewer: str
+    note: str = ""
+    reviewed_at: datetime = Field(default_factory=utcnow)
+
+
+class AccessDenial(BaseModel):
+    """One refused access, recorded (round 17).
+
+    Every refusal the access policy produces — a hidden file
+    answered 404, a family answered 403, a read-only role's
+    write refused before gate logic — lands here as well as on
+    the file's own audit trail (when the file exists). The
+    denial list is how an examiner reconciles what was asked
+    for against what was refused; it is append-only.
+    """
+
+    denial_id: str = Field(default_factory=lambda: new_id("den"))
+    credit_file_id: str | None = None
+    caller: str
+    role: str
+    family: str  # artefact family, or "write" for a refused write
+    reason_code: str
+    surface: str  # the route or surface that produced the refusal
+    at: datetime = Field(default_factory=utcnow)

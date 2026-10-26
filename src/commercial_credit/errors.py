@@ -9,6 +9,21 @@ class CreditError(Exception):
     """Base class for all blueprint errors."""
 
 
+class AccessDeniedError(CreditError):
+    """An access-policy refusal the caller may see (round 17).
+
+    Carries the policy's coded reason (`role_not_permitted`,
+    `readonly_role`, `unknown_role`, `caller_required`) so the
+    API answers a coded 403, never a bare one. Refusals that
+    must not reveal a file's existence do not use this error —
+    they answer with the ordinary NotFoundError instead.
+    """
+
+    def __init__(self, message: str, *, reason_code: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
 class NotFoundError(CreditError):
     """A credit file, document or extraction batch does not exist."""
 

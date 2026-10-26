@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from .models import (
+    AccessDenial,
     AnnualReviewOutcome,
     AnnualReviewPack,
     AuditEvent,
@@ -33,6 +34,8 @@ from .models import (
     ModelBudgetEvent,
     ModelCallEntry,
     PolicyReport,
+    QuarantineEvent,
+    QuarantineReview,
     RatingAssignment,
     RatingOverride,
     ReadinessReport,
@@ -297,6 +300,32 @@ class CreditFileStore(Protocol):
     def list_budget_events(
         self, credit_file_id: str
     ) -> list[ModelBudgetEvent]: ...
+
+    # -- Quarantine + access denials (round 17): append-only -----
+    # Quarantine events are recorded at document ingestion and
+    # never updated or deleted; a review is a separate record.
+    # Access denials are the access policy's refusal record,
+    # listed globally (the denial list is a portfolio surface).
+
+    def save_quarantine_event(self, event: QuarantineEvent) -> None: ...
+
+    def list_quarantine_events(
+        self, credit_file_id: str
+    ) -> list[QuarantineEvent]: ...
+
+    def get_quarantine_event(
+        self, event_id: str
+    ) -> QuarantineEvent | None: ...
+
+    def save_quarantine_review(self, review: QuarantineReview) -> None: ...
+
+    def list_quarantine_reviews(
+        self, credit_file_id: str
+    ) -> list[QuarantineReview]: ...
+
+    def append_denial(self, denial: AccessDenial) -> None: ...
+
+    def list_denials(self) -> list[AccessDenial]: ...
 
     def ping(self) -> bool: ...
 
