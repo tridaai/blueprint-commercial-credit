@@ -390,6 +390,26 @@ returns):
                             ledger and the audit trail, with the
                             offline continuation working.
 
+Round 16 counters — the Postgres production profile, graded
+only when CREDIT_EVAL_DATABASE_URL (else DATABASE_URL) is set;
+without a URL the checks are skipped and the skip is counted,
+never silent:
+
+  pg_migration_failures     the migration runner on a real empty
+                            Postgres database: every migration
+                            applies in order and a re-run applies
+                            none. REQUIRED: 0.
+  prod_smoke_step_failures  scripts/prod_smoke.py boots the API
+                            on Postgres and walks one credit file
+                            through the whole lifecycle over HTTP.
+                            REQUIRED: 0.
+  pg_suite_parity_gap       the entire pytest suite re-run
+                            against Postgres (tests/pg_parity.py)
+                            must produce the same per-test
+                            outcomes as the default profile.
+                            REQUIRED: 0.
+  pg_checks_skipped         1 when no database URL was provided.
+
 Later rounds add counters as their machinery lands.
 Exit code 0 = GATE: PASS.
 """
@@ -584,6 +604,55 @@ def _fixture_spread(credit_file_id: str, doc_prefix: str,
         adjustments=list(adjustments),
     )
     return spread, extractions
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _suite_outcomes(
+    env_extra: dict[str, str], drop: tuple[str, ...], workdir: Path
+) -> dict[str, str]:
+    """Run the pytest suite in a subprocess and return per-test
+    outcomes ({classname::name: passed|failure|error|skipped})
+    from its JUnit report. Round 16 uses this to compare the
+    default profile against the Postgres parity profile."""
+    import os
+    import subprocess
+    import uuid
+    import xml.etree.ElementTree as ET
+
+    xml_path = workdir / f"suite-{uuid.uuid4().hex[:8]}.xml"
+    env = {
+        k: v for k, v in os.environ.items()
+        if k not in drop
+        and k.lower() not in ("http_proxy", "https_proxy", "all_proxy")
+    }
+    env.update(env_extra)
+    env["NO_PROXY"] = "127.0.0.1,localhost"
+    subprocess.run(
+        [
+            sys.executable, "-m", "pytest", "-q",
+            f"--junitxml={xml_path}",
+        ],
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+        timeout=1800,
+    )
+    outcomes: dict[str, str] = {}
+    root = ET.parse(xml_path).getroot()
+    suites = [root] if root.tag == "testsuite" else list(root)
+    for suite in suites:
+        for case in suite.iter("testcase"):
+            node = f"{case.get('classname')}::{case.get('name')}"
+            outcome = "passed"
+            for child in case:
+                if child.tag == "failure":
+                    outcome = "failure"
+                elif child.tag == "error":
+                    outcome = "error"
+                elif child.tag == "skipped":
+                    outcome = "skipped"
+            outcomes[node] = outcome
+    return outcomes
 
 
 def main() -> int:
@@ -3992,6 +4061,174 @@ def main() -> int:
     )
     if not gateway_positive:
         failures.append("a gateway positive path did not land")
+
+    # --------------------------------------------------------------
+    # Round 16: the Postgres production profile. Graded only when
+    # a database URL is provided (CREDIT_EVAL_DATABASE_URL, else
+    # DATABASE_URL): the migration runner on a real empty
+    # database, the production smoke over HTTP, and full-suite
+    # parity — the entire pytest suite re-run against Postgres
+    # through the tests/pg_parity.py swap must produce the same
+    # per-test outcomes as the default profile. Without a URL the
+    # checks are skipped AND COUNTED — never silent.
+    # --------------------------------------------------------------
+    import os as _os
+    import re as _re
+    import subprocess as _subprocess
+    import tempfile as _tempfile
+    import uuid as _uuid
+
+    import psycopg as _psycopg
+
+    from commercial_credit.config import MIGRATIONS_DIR as _MIG_DIR
+    from commercial_credit.db import (
+        migration_files as _migration_files,
+        run_migrations as _run_migrations,
+    )
+
+    pg_url = (
+        _os.environ.get("CREDIT_EVAL_DATABASE_URL")
+        or _os.environ.get("DATABASE_URL")
+    )
+    pg_migration_failures = 0
+    prod_smoke_step_failures = 0
+    pg_suite_parity_gap = 0
+    pg_suite_tests_compared = 0
+    pg_checks_skipped = 0
+
+    if not pg_url:
+        pg_checks_skipped = 1
+        print(
+            "round16_postgres_checks: SKIPPED — neither "
+            "CREDIT_EVAL_DATABASE_URL nor DATABASE_URL is set "
+            "(counted, not silent)"
+        )
+    else:
+        # -- Migrations on a fresh database, twice. --------------
+        mig_db = f"credit_eval_{_uuid.uuid4().hex[:12]}"
+        mig_url = pg_url.rsplit("/", 1)[0] + f"/{mig_db}"
+        try:
+            with _psycopg.connect(pg_url, autocommit=True) as admin:
+                admin.execute(
+                    f'CREATE DATABASE "{mig_db}" TEMPLATE template0 '
+                    "ENCODING 'UTF8'"
+                )
+            expected = [p.name for p in _migration_files(_MIG_DIR)]
+            first = _run_migrations(mig_url, _MIG_DIR)
+            if first != expected:
+                pg_migration_failures += 1
+                print(
+                    "round16_migrations_first_run: applied "
+                    f"{len(first)} of {len(expected)} expected"
+                )
+            second = _run_migrations(mig_url, _MIG_DIR)
+            if second != []:
+                pg_migration_failures += 1
+                print(
+                    "round16_migrations_rerun: re-applied "
+                    f"{second} (idempotency broken)"
+                )
+        except Exception as exc:  # a broken runner is a failure
+            pg_migration_failures += 1
+            print(f"round16_migrations: ERROR {exc!r}")
+        finally:
+            try:
+                with _psycopg.connect(pg_url, autocommit=True) as admin:
+                    admin.execute(
+                        "SELECT pg_terminate_backend(pid) FROM "
+                        "pg_stat_activity WHERE datname = %s AND "
+                        "pid <> pg_backend_pid()",
+                        (mig_db,),
+                    )
+                    admin.execute(f'DROP DATABASE IF EXISTS "{mig_db}"')
+            except Exception:
+                pass
+
+        # -- Production smoke over HTTP. --------------------------
+        smoke_env = {
+            k: v for k, v in _os.environ.items()
+            if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")
+        }
+        smoke_env["DATABASE_URL"] = pg_url
+        smoke_env["NO_PROXY"] = "127.0.0.1,localhost"
+        try:
+            proc = _subprocess.run(
+                [sys.executable, "scripts/prod_smoke.py"],
+                cwd=REPO_ROOT, env=smoke_env, capture_output=True,
+                text=True, timeout=600,
+            )
+            match = _re.search(
+                r"SMOKE: (\d+)/(\d+) steps passed", proc.stdout
+            )
+            if match:
+                done, total = int(match.group(1)), int(match.group(2))
+                prod_smoke_step_failures += total - done
+            else:
+                prod_smoke_step_failures += 1
+                print(
+                    "round16_prod_smoke: no SMOKE summary line; "
+                    f"exit={proc.returncode}"
+                )
+                print(proc.stdout[-2000:])
+                print(proc.stderr[-2000:])
+        except Exception as exc:
+            prod_smoke_step_failures += 1
+            print(f"round16_prod_smoke: ERROR {exc!r}")
+
+        # -- Full-suite parity: default profile vs Postgres. ------
+        with _tempfile.TemporaryDirectory() as td:
+            workdir = Path(td)
+            default_outcomes = _suite_outcomes(
+                {},
+                ("CREDIT_TEST_DATABASE_URL", "DATABASE_URL",
+                 "CREDIT_EVAL_DATABASE_URL"),
+                workdir,
+            )
+            pg_outcomes = _suite_outcomes(
+                {"CREDIT_TEST_DATABASE_URL": pg_url},
+                ("DATABASE_URL", "CREDIT_EVAL_DATABASE_URL"),
+                workdir,
+            )
+        # The Postgres-profile tests are profile-conditional by
+        # design (they skip without a URL); they are graded by
+        # their own leg above, not by cross-profile comparison.
+        default_outcomes = {
+            k: v for k, v in default_outcomes.items()
+            if "test_postgres_profile" not in k
+        }
+        pg_outcomes = {
+            k: v for k, v in pg_outcomes.items()
+            if "test_postgres_profile" not in k
+        }
+        pg_suite_tests_compared = len(
+            set(default_outcomes) | set(pg_outcomes)
+        )
+        pg_suite_parity_gap = len(
+            set(default_outcomes) ^ set(pg_outcomes)
+        ) + sum(
+            1
+            for node in set(default_outcomes) & set(pg_outcomes)
+            if default_outcomes[node] != pg_outcomes[node]
+        )
+
+    print(
+        f"pg_migration_failures: {pg_migration_failures} (required 0)"
+    )
+    if pg_migration_failures:
+        failures.append("a migration failed or mis-applied on Postgres")
+    print(
+        f"prod_smoke_step_failures: {prod_smoke_step_failures} "
+        "(required 0)"
+    )
+    if prod_smoke_step_failures:
+        failures.append("the production smoke failed a step on Postgres")
+    print(
+        f"pg_suite_parity_gap: {pg_suite_parity_gap} (required 0; "
+        f"{pg_suite_tests_compared} tests compared)"
+    )
+    if pg_suite_parity_gap:
+        failures.append("suite outcomes diverged between profiles")
+    print(f"pg_checks_skipped: {pg_checks_skipped}")
 
     if failures:
         print("GATE: FAIL")
