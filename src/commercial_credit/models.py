@@ -2077,3 +2077,178 @@ class RatingOverride(BaseModel):
     supersedes_override_id: str | None = None
     note: str = ""
     at: datetime = Field(default_factory=utcnow)
+
+
+# ---------------------------------------------------------------------
+# Round 15: the model gateway — profiles, prices, and the cost
+# ledger. Profiles are governed configuration data, never code
+# branches; every call through the gateway is priced from the
+# versioned price table and appended to the ledger, offline calls
+# at zero included, so the ledger is the complete record of what
+# drafting and extraction cost, file by file.
+# ---------------------------------------------------------------------
+
+
+class ProviderKind(str, Enum):
+    """How a model profile's endpoint speaks.
+
+    ``offline`` is the deterministic composer — no model call at
+    all. ``anthropic`` is the hosted-frontier shape (Messages
+    API). ``openai_compatible`` is the shape an in-boundary
+    open-weight server (vLLM, NIM, a private gateway) exposes.
+    The kind decides the adapter; the profile decides everything
+    else, as data.
+    """
+
+    OFFLINE = "offline"
+    ANTHROPIC = "anthropic"
+    OPENAI_COMPATIBLE = "openai-compatible"
+
+
+class ModelProfileDefinition(BaseModel):
+    """One model profile, as governed configuration data.
+
+    A deployment adds a profile by adding a definition (and a
+    price entry), never by patching the gateway. Endpoint and key
+    are named as *environment variables*, never as values — the
+    definition is safe to commit; the secret never is.
+    ``endpoint_default`` is the public default base URL for a
+    hosted provider (a URL is not a secret); an in-boundary
+    endpoint has no default, so a deployment that has not set one
+    is unconfigured by construction.
+    """
+
+    profile_id: str = Field(min_length=1)
+    provider_kind: ProviderKind
+    model: str = Field(min_length=1)
+    endpoint_env: str | None = Field(
+        default=None,
+        description="Environment variable naming the endpoint "
+        "base URL. Required for live profiles.",
+    )
+    endpoint_default: str | None = Field(
+        default=None,
+        description="Fallback base URL when the env var is unset "
+        "(hosted providers' public endpoints only).",
+    )
+    api_key_env: str | None = Field(
+        default=None,
+        description="Environment variable naming the API key. "
+        "The value is read at wiring time and never stored on "
+        "the definition, a ledger entry, or a log line.",
+    )
+    key_required: bool = Field(
+        default=True,
+        description="True when the endpoint refuses keyless "
+        "calls (hosted providers). An in-boundary server inside "
+        "the bank's own network may set this False — the "
+        "endpoint itself stays required.",
+    )
+    timeout_seconds: float = Field(default=60.0, gt=0)
+
+
+class ModelPrice(BaseModel):
+    """One model's prices in the governed price table.
+
+    Prices are reference data with a basis, maintained by the
+    deployment — the table is versioned as a whole, and every
+    ledger entry pins the table version it was priced under, so
+    a later price change never rewrites what a past call cost.
+    """
+
+    model: str = Field(min_length=1)
+    input_per_mtok_usd: Decimal = Field(
+        description="USD per 1M input tokens, as an exact Decimal."
+    )
+    output_per_mtok_usd: Decimal = Field(
+        description="USD per 1M output tokens, as an exact Decimal."
+    )
+    basis: str = Field(
+        default="",
+        description="Where the price comes from (provider list "
+        "price, internal serving-cost allocation, zero for the "
+        "offline composer) — stated, never implied.",
+    )
+
+
+class PriceTable(BaseModel):
+    """The versioned price table: every model a profile may name,
+    priced. A profile whose model has no entry here cannot be
+    loaded — an unpriceable call is a configuration error, refused
+    at load time, not discovered on an invoice."""
+
+    version: str = Field(min_length=1)
+    as_of: date
+    entries: list[ModelPrice] = Field(min_length=1)
+
+
+class ModelCallEntry(BaseModel):
+    """One model call, priced, in the cost ledger (round 15).
+
+    EVERY call through the gateway appends one of these —
+    including offline calls at zero — so the ledger is the
+    complete record of what the drafting cost, file by file. The
+    entry carries the unit prices it was priced with (not just
+    the table version), so the cost is re-checkable from the
+    entry alone: ``cost = (tokens_in * input_price + tokens_out
+    * output_price) / 1_000_000``, exact Decimal arithmetic. A
+    call whose output a verifier later refuses is ledgered all
+    the same — it cost what it cost.
+
+    ``token_basis`` states where the token counts came from:
+    ``reported`` (the provider's usage block) or the adapter's
+    stated estimate basis when a provider reported none.
+    ``called_at`` comes from the gateway's injected clock, so
+    tests and evals price a call at a known instant.
+    """
+
+    entry_id: str = Field(default_factory=lambda: new_id("led"))
+    credit_file_id: str | None = Field(
+        default=None,
+        description="The credit file the call served; None is "
+        "the system scope (a call not made for any one file).",
+    )
+    purpose: str = Field(
+        description="memo_draft | review_summary | "
+        "extraction_assist | … — what the call was for.",
+    )
+    profile_id: str
+    model: str
+    tokens_in: int = Field(ge=0)
+    tokens_out: int = Field(ge=0)
+    token_basis: str = Field(
+        description="reported | estimated:chars/4 — the stated "
+        "basis of the token counts.",
+    )
+    price_table_version: str
+    input_per_mtok_usd: Decimal
+    output_per_mtok_usd: Decimal
+    cost_usd: Decimal = Field(
+        description="The call's priced cost, exact Decimal USD."
+    )
+    latency_ms: int = Field(ge=0)
+    called_at: datetime = Field(default_factory=utcnow)
+
+
+class ModelBudgetEvent(BaseModel):
+    """A budget refusal, recorded (round 15).
+
+    When a file's priced spend reaches the deployment's per-file
+    cap, further live-profile calls for that file are refused
+    before any transport is touched. The refusal is a record,
+    not a log line: this artefact in the ledger store, and an
+    audit event on the file's own trail.
+    """
+
+    event_id: str = Field(default_factory=lambda: new_id("bud"))
+    credit_file_id: str
+    profile_id: str
+    model: str
+    purpose: str
+    cap_usd: Decimal = Field(
+        description="The per-file cap in force, exact Decimal USD."
+    )
+    spent_usd: Decimal = Field(
+        description="The file's priced spend at refusal time."
+    )
+    recorded_at: datetime = Field(default_factory=utcnow)
