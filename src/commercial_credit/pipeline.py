@@ -74,7 +74,7 @@ from .covenant_testing import (
     validate_waiver_decision,
 )
 from .documents import read_document_verified, register_document
-from .errors import NotFoundError, ValidationError
+from .errors import AccessDeniedError, NotFoundError, ValidationError
 from .extraction import OfflineReferenceExtractor, receive_extraction
 from .models import (
     BREACH_CURED,
@@ -124,10 +124,17 @@ from .models import (
     ReadinessReport,
     ReviewBlocker,
     ReviewSummary,
+    QuarantineReview,
     Spread,
     SpreadAdjustment,
     new_id,
     utcnow,
+)
+from .access import (
+    REASON_NOT_ASSIGNEE,
+    REASON_ROLE_NOT_PERMITTED,
+    Caller,
+    authorize_write,
 )
 from .gateway import ModelAssistedExtractor, ModelGateway
 from .memo import MemoInputs, RatingFacts, _canonical_hash, verify_memo
@@ -149,6 +156,8 @@ from .officer_gate import (
 from .policy import CURRENT_POLICY_VERSION
 from .policy import evaluate_policy as run_policy_evaluation
 from .ports import CreditFileStore, DocumentStore, Extractor
+from .quarantine import printed_figures
+from .quarantine import quarantine_only_figures as _q_only_figures
 from .readiness import build_readiness_report
 from .readiness import readiness_refusal_message
 from .readiness import render_outstanding_items
@@ -334,6 +343,9 @@ class CreditPipeline:
             if isinstance(extractor, ModelAssistedExtractor):
                 extractor = extractor.for_file(credit_file.credit_file_id)
             values = receive_extraction(extractor.extract(doc, content))
+            values = self._refuse_quarantined_values(
+                credit_file.credit_file_id, doc, content, values
+            )
             if values:
                 self.store.save_extractions(credit_file.credit_file_id, values)
                 total += len(values)
@@ -342,6 +354,190 @@ class CreditPipeline:
                             f"{len(values)} values from {doc.document_id} "
                             "with complete provenance")
         return {"extracted_document_ids": done, "extraction_count": total}
+
+    # -------------------------------------------------------------
+    # Round 17: quarantine enforcement + file assignment.
+    # -------------------------------------------------------------
+
+    def _quarantine_only_figures(self, credit_file: CreditFile) -> frozenset:
+        """Figures that appear only inside this file's quarantined
+        spans: every recorded span figure, minus every figure
+        actually printed in any of the file's documents. These
+        ground nothing in a memo (memo.build_trace_universe
+        strikes them) and are refused at extraction (below)."""
+        events = self.store.list_quarantine_events(
+            credit_file.credit_file_id
+        )
+        if not events:
+            return frozenset()
+        printed: set = set()
+        for doc in credit_file.documents:
+            try:
+                content = read_document_verified(self.documents, doc)
+            except Exception:
+                continue
+            printed |= printed_figures(content)
+        return _q_only_figures(events, printed)
+
+    def _refuse_quarantined_values(
+        self,
+        credit_file_id: str,
+        doc: SourceDocument,
+        content: bytes,
+        values: list,
+    ) -> list:
+        """Refuse extracted values whose only ground is a
+        quarantined span (round 17).
+
+        A value is refused when its amount was recorded inside a
+        quarantined span of this document AND the amount is not a
+        figure printed in the document itself. The refusal is
+        per-value and recorded — the batch continues, because a
+        borrower must not be able to stall their own file by
+        planting an instruction, and nothing is dropped silently.
+        The reference extractor only ever returns printed
+        figures, so on the offline path this refuses nothing.
+        """
+        events = [
+            e
+            for e in self.store.list_quarantine_events(credit_file_id)
+            if e.document_id == doc.document_id and e.figures
+        ]
+        if not events:
+            return values
+        span_figures = {f for e in events for f in e.figures}
+        printed = printed_figures(content)
+        planted = span_figures - printed
+        if not planted:
+            return values
+        kept = [v for v in values if v.value not in planted]
+        refused = [v for v in values if v.value in planted]
+        if refused:
+            self._audit(
+                credit_file_id,
+                "extraction_value_quarantine_refused",
+                f"{len(refused)} extracted value(s) from "
+                f"{doc.document_id} refused: their amounts appear "
+                "only inside quarantined instruction spans ("
+                + ", ".join(
+                    f"{v.field}={v.value}" for v in refused
+                )
+                + ")",
+            )
+        return kept
+
+    def assign_file(
+        self,
+        credit_file_id: str,
+        *,
+        actor: str,
+        actor_role: str,
+        assignee: str,
+    ) -> CreditFile:
+        """Assign a credit file to a named analyst (round 17).
+
+        A recorded act: the audit trail names who assigned it.
+        Credit officers and the system may assign or reassign
+        anyone; an analyst preparer may only claim an unassigned
+        file for themselves (the pickup queue); anyone else is
+        refused by coded reason. Reassignment takes effect
+        immediately — retrieval reads the field as it stands.
+        """
+        credit_file = self._load(credit_file_id)
+        decision = authorize_write(Caller(actor, actor_role))
+        if not decision.allowed:
+            raise AccessDeniedError(
+                f"assignment refused: {decision.reason_code}",
+                reason_code=decision.reason_code,
+                family="files",
+                credit_file_id=credit_file_id,
+                caller=actor,
+                role=actor_role,
+            )
+        if actor_role == "analyst_preparer":
+            if credit_file.assigned_to is not None:
+                raise AccessDeniedError(
+                    "an analyst preparer may claim only an "
+                    "unassigned file; this file is assigned to "
+                    f"{credit_file.assigned_to}",
+                    reason_code=REASON_NOT_ASSIGNEE,
+                    family="files",
+                    credit_file_id=credit_file_id,
+                    caller=actor,
+                    role=actor_role,
+                )
+            if assignee != actor:
+                raise AccessDeniedError(
+                    "an analyst preparer may claim a file only "
+                    "for themselves",
+                    reason_code=REASON_NOT_ASSIGNEE,
+                    family="files",
+                    credit_file_id=credit_file_id,
+                    caller=actor,
+                    role=actor_role,
+                )
+        elif actor_role not in ("credit_officer", "system"):
+            raise AccessDeniedError(
+                f"role {actor_role} may not assign credit files",
+                reason_code=REASON_ROLE_NOT_PERMITTED,
+                family="files",
+                credit_file_id=credit_file_id,
+                caller=actor,
+                role=actor_role,
+            )
+        previous = credit_file.assigned_to
+        credit_file.assigned_to = assignee
+        self.store.save_credit_file(credit_file)
+        self._audit(
+            credit_file_id,
+            "file_assigned",
+            f"assigned to {assignee} by {actor} ({actor_role})"
+            + (f"; previously {previous}" if previous else ""),
+            actor=actor,
+        )
+        return credit_file
+
+    def review_quarantine_event(
+        self,
+        credit_file_id: str,
+        event_id: str,
+        *,
+        reviewer: str,
+        note: str = "",
+    ) -> QuarantineReview:
+        """Record a named officer's review of a quarantine event.
+
+        The review is an audit act only: it never un-fences the
+        span and never grounds its figures — the fences derive
+        from the stored scan, not from the review.
+        """
+        if not reviewer.strip():
+            raise ValidationError(
+                "a quarantine review names its reviewer; an "
+                "unnamed review records nothing"
+            )
+        event = self.store.get_quarantine_event(event_id)
+        if event is None or event.credit_file_id != credit_file_id:
+            raise NotFoundError(
+                f"quarantine event {event_id} not found on credit "
+                f"file {credit_file_id}"
+            )
+        review = QuarantineReview(
+            event_id=event_id,
+            credit_file_id=credit_file_id,
+            reviewer=reviewer,
+            note=note,
+        )
+        self.store.save_quarantine_review(review)
+        self._audit(
+            credit_file_id,
+            "quarantine_reviewed",
+            f"quarantine event {event_id} ({event.pattern_id} in "
+            f"{event.field} of document {event.document_id}) "
+            f"reviewed by {reviewer}; the span stays fenced",
+            actor=reviewer,
+        )
+        return review
 
     def _node_spreading(self, state: PipelineState) -> PipelineState:
         spread = self.build_spread(state["credit_file_id"])
@@ -683,6 +879,7 @@ class CreditPipeline:
             global_pack=global_artefact,
             composer=self._memo_composer(profile, credit_file_id),
             rating=self._current_rating_facts(credit_file_id),
+            quarantined_figures=self._quarantine_only_figures(credit_file),
         )
         if self.store.get_memo(memo.memo_id) is not None:
             return memo
@@ -773,6 +970,7 @@ class CreditPipeline:
             pack=pack,
             policy_report=report,
             global_pack=global_pack,
+            quarantined_figures=self._quarantine_only_figures(credit_file),
         )
 
     def _record_review_event(self, event: MemoReviewEvent) -> MemoReviewEvent:
@@ -3055,6 +3253,7 @@ class CreditPipeline:
             blockers=readiness.blockers,
             rating=rating_pair[0] if rating_pair else None,
             rating_override=rating_pair[1] if rating_pair else None,
+            quarantined_figures=self._quarantine_only_figures(credit_file),
         )
 
     def assemble_review_pack(
@@ -3398,6 +3597,7 @@ class CreditPipeline:
             blockers=readiness.blockers,
             rating=rating,
             rating_override=rating_override,
+            quarantined_figures=self._quarantine_only_figures(credit_file),
         )
 
     def record_review_outcome(

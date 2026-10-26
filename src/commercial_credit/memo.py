@@ -174,6 +174,13 @@ class MemoInputs:
     pack: ComputationPack
     policy_report: PolicyReport
     global_pack: ComputationPack | None = None
+    # Round 17: figures that appear only inside quarantined
+    # document spans (planted instructions), assembled by the
+    # pipeline from the file's quarantine records. The trace
+    # universe excludes exactly this set: a figure whose only
+    # presence in the file is inside a planted instruction
+    # grounds nothing, however it is cited.
+    quarantined_figures: frozenset = frozenset()
 
 
 @dataclass(frozen=True)
@@ -405,6 +412,14 @@ def build_trace_universe(inputs: MemoInputs) -> dict[Decimal, str]:
         Decimal(len(report.outcomes)),
         f"policy report {report.report_id}, tests evaluated",
     )
+    # Round 17: figures that appear only inside quarantined
+    # document spans are struck from the universe. By
+    # construction the set holds no figure printed anywhere in
+    # the file's documents, so what is struck here could only
+    # have entered as a planted number riding an instruction —
+    # it grounds nothing, however it is cited.
+    for figure in inputs.quarantined_figures:
+        universe.pop(figure, None)
     return universe
 
 
@@ -1354,6 +1369,7 @@ def compose_memo(
     global_pack: ComputationPack | None = None,
     composer: MemoComposer | None = None,
     rating: RatingFacts | None = None,
+    quarantined_figures: frozenset = frozenset(),
 ) -> CreditMemo:
     """Compose a draft memo from pinned artefacts and verify it.
 
@@ -1376,6 +1392,7 @@ def compose_memo(
         pack=pack,
         policy_report=policy_report,
         global_pack=global_pack,
+        quarantined_figures=quarantined_figures,
     )
     sections = composer.compose(inputs)
     draft = CreditMemo(

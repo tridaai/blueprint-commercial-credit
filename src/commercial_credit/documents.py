@@ -16,12 +16,14 @@ import hashlib
 from .checklist import match_checklist_item
 from .errors import DocumentIntegrityError, NotFoundError
 from .models import (
+    AuditEvent,
     CreditFile,
     DocumentKind,
     SourceDocument,
     new_id,
 )
 from .ports import CreditFileStore, DocumentStore
+from .quarantine import build_events, scan_document
 
 
 def sha256_hex(data: bytes) -> str:
@@ -126,6 +128,35 @@ def register_document(
         else CreditFileStatus.COLLECTING_DOCUMENTS
     )
     store.save_credit_file(credit_file)
+    # Round 17: the document's text is untrusted. The scanner
+    # runs over it here, at ingestion — every match is recorded
+    # as a quarantine event on the file and an audit entry names
+    # the count. The document is never rejected and never
+    # altered: a planted instruction becomes part of the file's
+    # record, fenced wherever the text later reaches a model.
+    events = build_events(
+        scan_document(data, filename=filename),
+        credit_file_id=credit_file.credit_file_id,
+        document_id=document_id,
+    )
+    for event in events:
+        store.save_quarantine_event(event)
+    if events:
+        store.append_audit(
+            AuditEvent(
+                credit_file_id=credit_file.credit_file_id,
+                actor="document-intake-scan",
+                action="document_quarantined",
+                detail=(
+                    f"{len(events)} instruction-pattern match(es) in "
+                    f"{filename}: "
+                    + ", ".join(
+                        f"{e.pattern_id} at {e.field}"
+                        for e in events
+                    )
+                ),
+            )
+        )
     return doc
 
 

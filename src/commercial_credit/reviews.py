@@ -284,6 +284,10 @@ class ReviewInputs:
     # chain. Carried as an input; never a stance input.
     rating: RatingAssignment | None = None
     rating_override: RatingOverride | None = None
+    # Round 17: figures that appear only inside quarantined
+    # document spans — struck from the review universe exactly
+    # as from the memo universe.
+    quarantined_figures: frozenset = frozenset()
 
     @property
     def complete(self) -> bool:
@@ -497,6 +501,7 @@ def build_review_universe(inputs: ReviewInputs) -> dict[Decimal, str]:
         spread=inputs.spread,
         pack=inputs.pack,
         policy_report=inputs.current_report,
+        quarantined_figures=inputs.quarantined_figures,
     ))
 
     def add(value: Decimal | None, source: str) -> None:

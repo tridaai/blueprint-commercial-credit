@@ -67,7 +67,7 @@ def test_migrations_apply_from_empty_and_rerun_is_a_noop():
     url = _fresh_database()
     try:
         expected = [p.name for p in migration_files(MIGRATIONS_DIR)]
-        assert len(expected) == 13
+        assert len(expected) == 14
         first = run_migrations(url, MIGRATIONS_DIR)
         assert first == expected
         second = run_migrations(url, MIGRATIONS_DIR)

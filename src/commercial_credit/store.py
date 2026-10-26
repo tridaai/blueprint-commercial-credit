@@ -688,6 +688,20 @@ class SqliteCreditStore:
                 credit_file_id TEXT NOT NULL,
                 profile_id TEXT NOT NULL,
                 recorded_at TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS quarantine_events (
+                event_id TEXT PRIMARY KEY,
+                credit_file_id TEXT NOT NULL, document_id TEXT NOT NULL,
+                recorded_at TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS quarantine_reviews (
+                review_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL, credit_file_id TEXT NOT NULL,
+                reviewed_at TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS access_denials (
+                denial_id TEXT PRIMARY KEY,
+                credit_file_id TEXT, caller TEXT NOT NULL,
+                role TEXT NOT NULL, family TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                at TEXT NOT NULL, payload TEXT NOT NULL);
             """
         )
         self._conn.commit()
@@ -1333,6 +1347,88 @@ class SqliteCreditStore:
         return [
             ModelBudgetEvent.model_validate_json(r[0]) for r in rows
         ]
+
+    # -- Quarantine + access denials (round 17): append-only -----
+
+    def save_quarantine_event(self, event: QuarantineEvent) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO quarantine_events (event_id, "
+                "credit_file_id, document_id, recorded_at, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    event.event_id, event.credit_file_id,
+                    event.document_id, event.recorded_at.isoformat(),
+                    event.model_dump_json(),
+                ),
+            )
+
+    def list_quarantine_events(
+        self, credit_file_id: str
+    ) -> list[QuarantineEvent]:
+        rows = self._conn.execute(
+            "SELECT payload FROM quarantine_events "
+            "WHERE credit_file_id = ? ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [
+            QuarantineEvent.model_validate_json(r[0]) for r in rows
+        ]
+
+    def get_quarantine_event(
+        self, event_id: str
+    ) -> QuarantineEvent | None:
+        row = self._conn.execute(
+            "SELECT payload FROM quarantine_events WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        return QuarantineEvent.model_validate_json(row[0]) if row else None
+
+    def save_quarantine_review(self, review: QuarantineReview) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO quarantine_reviews (review_id, event_id, "
+                "credit_file_id, reviewed_at, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    review.review_id, review.event_id,
+                    review.credit_file_id,
+                    review.reviewed_at.isoformat(),
+                    review.model_dump_json(),
+                ),
+            )
+
+    def list_quarantine_reviews(
+        self, credit_file_id: str
+    ) -> list[QuarantineReview]:
+        rows = self._conn.execute(
+            "SELECT payload FROM quarantine_reviews "
+            "WHERE credit_file_id = ? ORDER BY rowid",
+            (credit_file_id,),
+        ).fetchall()
+        return [
+            QuarantineReview.model_validate_json(r[0]) for r in rows
+        ]
+
+    def append_denial(self, denial: AccessDenial) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO access_denials (denial_id, credit_file_id, "
+                "caller, role, family, reason_code, at, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    denial.denial_id, denial.credit_file_id,
+                    denial.caller, denial.role, denial.family,
+                    denial.reason_code, denial.at.isoformat(),
+                    denial.model_dump_json(),
+                ),
+            )
+
+    def list_denials(self) -> list[AccessDenial]:
+        rows = self._conn.execute(
+            "SELECT payload FROM access_denials ORDER BY rowid"
+        ).fetchall()
+        return [AccessDenial.model_validate_json(r[0]) for r in rows]
 
     def get_breach_case(self, breach_id: str) -> BreachCase | None:
         row = self._conn.execute(
@@ -2300,6 +2396,88 @@ class PostgresCreditStore:
                 (credit_file_id,),
             ).fetchall()
         return [self._validate(ModelBudgetEvent, row) for row in rows]
+
+    # -- Quarantine + access denials (round 17): append-only -----
+
+    def save_quarantine_event(self, event: QuarantineEvent) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO quarantine_events (event_id, "
+                "credit_file_id, document_id, recorded_at, payload) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                (
+                    event.event_id, event.credit_file_id,
+                    event.document_id, event.recorded_at,
+                    event.model_dump_json(),
+                ),
+            )
+
+    def list_quarantine_events(
+        self, credit_file_id: str
+    ) -> list[QuarantineEvent]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM quarantine_events "
+                "WHERE credit_file_id = %s ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        return [self._validate(QuarantineEvent, row) for row in rows]
+
+    def get_quarantine_event(
+        self, event_id: str
+    ) -> QuarantineEvent | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT payload FROM quarantine_events "
+                "WHERE event_id = %s",
+                (event_id,),
+            ).fetchone()
+        return self._validate(QuarantineEvent, row) if row else None
+
+    def save_quarantine_review(self, review: QuarantineReview) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO quarantine_reviews (review_id, event_id, "
+                "credit_file_id, reviewed_at, payload) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb)",
+                (
+                    review.review_id, review.event_id,
+                    review.credit_file_id, review.reviewed_at,
+                    review.model_dump_json(),
+                ),
+            )
+
+    def list_quarantine_reviews(
+        self, credit_file_id: str
+    ) -> list[QuarantineReview]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM quarantine_reviews "
+                "WHERE credit_file_id = %s ORDER BY id",
+                (credit_file_id,),
+            ).fetchall()
+        return [self._validate(QuarantineReview, row) for row in rows]
+
+    def append_denial(self, denial: AccessDenial) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO access_denials (denial_id, credit_file_id, "
+                "caller, role, family, reason_code, at, payload) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+                (
+                    denial.denial_id, denial.credit_file_id,
+                    denial.caller, denial.role, denial.family,
+                    denial.reason_code, denial.at,
+                    denial.model_dump_json(),
+                ),
+            )
+
+    def list_denials(self) -> list[AccessDenial]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM access_denials ORDER BY id"
+            ).fetchall()
+        return [self._validate(AccessDenial, row) for row in rows]
 
     def ping(self) -> bool:
         try:

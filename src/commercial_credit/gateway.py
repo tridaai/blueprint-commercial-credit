@@ -106,6 +106,7 @@ from .models import (
     utcnow,
 )
 from .ports import CreditFileStore, ModelLedgerStore
+from .quarantine import fence_text
 from .reviews import OfflineReviewComposer, ReviewInputs
 
 #: Purpose names the wired surfaces call under. The vocabulary
@@ -562,7 +563,15 @@ def _polish_prompt(paragraphs: list[str], *, artefact: str) -> str:
     candidate were computed in code from provenanced inputs; the
     model's task is wording only, and the artefact's verifier —
     not this prompt — is what enforces that afterwards."""
-    candidate = json.dumps(paragraphs, indent=2)
+    # Round 17: candidate paragraphs are assembled from file
+    # facts, and file facts include borrower text. Any span of a
+    # paragraph that matches the instruction-pattern pack is
+    # fenced before the text reaches the model — the model sees
+    # the fence marker, never a bare instruction riding a
+    # borrower's words.
+    candidate = json.dumps(
+        [fence_text(paragraph) for paragraph in paragraphs], indent=2
+    )
     return (
         f"You are polishing the narrative paragraphs of a bank "
         f"{artefact}. The paragraphs below were assembled in code "
@@ -1208,7 +1217,14 @@ class ModelAssistedExtractor:
     def extract(
         self, document: SourceDocument, content: bytes
     ) -> list[ExtractedValue]:
-        text = content.decode("utf-8", errors="replace")
+        # Round 17: the document's text is fenced before it is
+        # placed in the prompt — spans matching the instruction
+        # pack are replaced by fence markers, so a planted
+        # instruction in a statement's notes is data the model
+        # can see was quarantined, never prose it could follow.
+        # The stored bytes are untouched; fencing happens on the
+        # prompt copy only.
+        text = fence_text(content.decode("utf-8", errors="replace"))
         reply = self._gateway.generate(
             self._profile_id,
             credit_file_id=self._credit_file_id,

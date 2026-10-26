@@ -19,9 +19,26 @@ class AccessDeniedError(CreditError):
     they answer with the ordinary NotFoundError instead.
     """
 
-    def __init__(self, message: str, *, reason_code: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str,
+        family: str = "",
+        credit_file_id: str | None = None,
+        caller: str = "",
+        role: str = "",
+    ) -> None:
         super().__init__(message)
         self.reason_code = reason_code
+        # Denial-record context (round 17): the API's error
+        # handler records every coded refusal from these fields,
+        # so a refusal raised anywhere lands in the denial list
+        # exactly once, attributed.
+        self.family = family
+        self.credit_file_id = credit_file_id
+        self.caller = caller
+        self.role = role
 
 
 class NotFoundError(CreditError):
