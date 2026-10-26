@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass, field as dc_field, replace as dc_replace
 from decimal import Decimal, InvalidOperation
 
 from .models import QuarantineEvent
@@ -171,9 +171,16 @@ _COMPILED: list[tuple[str, str, re.Pattern[str]]] = [
 ]
 
 # A sentence ends at ., ! or ? followed by whitespace or the end
-# of the text, or at a newline. ("e.g." does not end a sentence:
-# its full stop is followed by a letter.)
+# of the text, or at a newline — EXCEPT a full stop that belongs
+# to an abbreviation chain of single letters ("e.g.", "i.e.",
+# "U.S."): neither stop in such a chain ends a sentence. This is
+# load-bearing, not cosmetic: a span that ends early at "e.g."
+# can cut a dictated figure out of the recorded span, and a
+# figure outside every span is a figure the extraction refusal
+# and the verifier exclusion never see. Over-capture is the safe
+# direction for a quarantine span; under-capture is the hole.
 _SENTENCE_END = re.compile(r"[.!?](?=\s|$)|[\n\r]")
+_ABBREVIATION = re.compile(r"(?:\b[A-Za-z]\.)+")
 
 # Numeric tokens inside a span. A token counts as a figure when
 # it is money-like: it carries a "$", a thousands comma, a
@@ -215,15 +222,33 @@ class SpanMatch:
     figures: list[Decimal] = dc_field(default_factory=list)
 
 
+def _abbreviation_stops(text: str) -> set[int]:
+    """Indices of the full stops that belong to abbreviation
+    chains in this text — never sentence ends."""
+    stops: set[int] = set()
+    for m in _ABBREVIATION.finditer(text):
+        for i in range(m.start(), m.end()):
+            if text[i] == ".":
+                stops.add(i)
+    return stops
+
+
 def _sentence_span(text: str, start: int, end: int) -> tuple[int, int]:
     """Extend a match to the boundaries of its sentence."""
+    stops = _abbreviation_stops(text)
+
+    def is_end(m: re.Match) -> bool:
+        return not (m.group() == "." and m.start() in stops)
+
     lo = 0
     for m in _SENTENCE_END.finditer(text, 0, start):
-        lo = m.end()
+        if is_end(m):
+            lo = m.end()
     hi = len(text)
-    m = _SENTENCE_END.search(text, end)
-    if m is not None:
-        hi = m.end()
+    for m in _SENTENCE_END.finditer(text, end):
+        if is_end(m):
+            hi = m.end()
+            break
     # Trim surrounding whitespace so the recorded span is exact
     # prose, not padding.
     while lo < start and text[lo].isspace():
@@ -304,6 +329,39 @@ def fence_text(text: str) -> str:
     return fence_spans(text, matches)
 
 
+def fence_document_text(text: str) -> str:
+    """Fence a whole document's text for a model surface.
+
+    A structured document is fenced field by field, exactly as
+    the ingestion scan reads it: fencing the raw serialised text
+    in one pass would let a span run past the end of the string
+    it started in (a sentence whose full stop is followed by a
+    quote and a comma has no sentence end inside the string) and
+    corrupt the document's structure on the prompt copy — the
+    model would be handed broken JSON instead of a readable
+    statement with its instructions fenced. Unstructured text is
+    fenced whole. The stored bytes are never touched; this runs
+    on the prompt copy only.
+    """
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return fence_text(text)
+    if not isinstance(payload, (dict, list)):
+        return fence_text(text)
+
+    def walk(node: object) -> object:
+        if isinstance(node, str):
+            return fence_text(node)
+        if isinstance(node, list):
+            return [walk(value) for value in node]
+        if isinstance(node, dict):
+            return {key: walk(value) for key, value in node.items()}
+        return node
+
+    return json.dumps(walk(payload), indent=2)
+
+
 def _string_leaves(payload: object, prefix: str = "") -> list[tuple[str, str]]:
     """(field path, text) for every string leaf of a JSON payload."""
     out: list[tuple[str, str]] = []
@@ -368,10 +426,18 @@ def scan_document(content: bytes, *, filename: str) -> DocumentScan:
     string leaf, at its JSON path — so an event names exactly
     where the instruction sits. Anything else is scanned as one
     text field. The filename is scanned too: it is borrower
-    text the file renders.
+    text the file renders. Filenames carry phrases hyphen- or
+    underscore-joined, so the filename is scanned with those
+    separators read as spaces — a one-for-one substitution,
+    so the recorded spans still index the real filename, and
+    the recorded text is re-sliced from it verbatim.
     """
     matches: list[tuple[str, SpanMatch]] = []
-    for match in scan_text(filename):
+    readable = filename.replace("-", " ").replace("_", " ")
+    for match in scan_text(readable):
+        verbatim = filename[match.start : match.end]
+        if verbatim != match.text:
+            match = dc_replace(match, text=verbatim)
         matches.append(("filename", match))
     text: str | None = None
     payload: object = None

@@ -106,7 +106,7 @@ from .models import (
     utcnow,
 )
 from .ports import CreditFileStore, ModelLedgerStore
-from .quarantine import fence_text
+from .quarantine import fence_document_text, fence_text
 from .reviews import OfflineReviewComposer, ReviewInputs
 
 #: Purpose names the wired surfaces call under. The vocabulary
@@ -1222,9 +1222,13 @@ class ModelAssistedExtractor:
         # pack are replaced by fence markers, so a planted
         # instruction in a statement's notes is data the model
         # can see was quarantined, never prose it could follow.
-        # The stored bytes are untouched; fencing happens on the
-        # prompt copy only.
-        text = fence_text(content.decode("utf-8", errors="replace"))
+        # The fencing is structure-aware (fence_document_text):
+        # a structured statement is fenced field by field, so
+        # the prompt copy stays readable JSON. The stored bytes
+        # are untouched; fencing happens on the prompt copy only.
+        text = fence_document_text(
+            content.decode("utf-8", errors="replace")
+        )
         reply = self._gateway.generate(
             self._profile_id,
             credit_file_id=self._credit_file_id,
