@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import logging
 import uuid
 from datetime import date
@@ -65,11 +66,23 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
+from .access import (
+    FAMILY_AUDIT,
+    FAMILY_FILES,
+    FAMILY_LEDGER,
+    Caller,
+    authorize_global,
+    authorize_read,
+    authorize_write,
+    file_visible,
+    visible_files,
+)
 from .config import load_settings
 from .console import queue_view, vocabularies_view, workspace_view
 from .console_page import CONSOLE_HTML
 from .documents import read_document_verified, register_document
 from .errors import (
+    AccessDeniedError,
     CreditError,
     ModelBudgetExceededError,
     NotFoundError,
@@ -77,8 +90,10 @@ from .errors import (
 )
 from .logging_setup import configure_logging, request_id_var
 from .models import (
+    AccessDenial,
     AdjustmentReasonCode,
     AdverseActionReason,
+    AuditEvent,
     Borrower,
     CommitteeCondition,
     CommitteeMember,
@@ -111,6 +126,142 @@ def _file_or_404(credit_file_id: str):  # noqa: ANN202
     if credit_file is None:
         raise NotFoundError(f"credit file {credit_file_id} not found")
     return credit_file
+
+
+# ---------------------------------------------------------------------
+# Round 17: retrieval access control. The caller is named by the
+# X-Caller / X-Caller-Role headers; a request naming no caller
+# acts as the system itself (the local/demo posture — see
+# access.py). Every read of a credit file's artefacts passes
+# _guarded_file (or a list filter); every refusal is recorded.
+# ---------------------------------------------------------------------
+
+
+def _caller_of(request: Request) -> Caller:
+    role = request.headers.get("x-caller-role")
+    if role is None:
+        return Caller(caller_id="system", role="system")
+    return Caller(
+        caller_id=request.headers.get("x-caller") or "", role=role
+    )
+
+
+def _record_denial(
+    *,
+    credit_file_id: str | None,
+    caller: str,
+    role: str,
+    family: str,
+    reason_code: str,
+    surface: str,
+) -> None:
+    """Record one refusal: the denial list, and the file's own
+    audit trail when the file exists."""
+    store.append_denial(
+        AccessDenial(
+            credit_file_id=credit_file_id,
+            caller=caller,
+            role=role,
+            family=family,
+            reason_code=reason_code,
+            surface=surface,
+        )
+    )
+    if credit_file_id and store.get_credit_file(credit_file_id) is not None:
+        store.append_audit(
+            AuditEvent(
+                credit_file_id=credit_file_id,
+                actor="access-control",
+                action="access_denied",
+                detail=(
+                    f"{caller} ({role}) refused {family}: "
+                    f"{reason_code} at {surface}"
+                ),
+            )
+        )
+
+
+def _guarded_file(request: Request, credit_file_id: str, family: str):  # noqa: ANN202
+    """Load a credit file for a read, under the access policy.
+
+    A caller with no read right on the file is answered exactly
+    as if it did not exist; a caller who may see the file but
+    not this family gets the coded refusal (recorded by the
+    AccessDeniedError handler).
+    """
+    caller = _caller_of(request)
+    credit_file = store.get_credit_file(credit_file_id)
+    if credit_file is None:
+        raise NotFoundError(f"credit file {credit_file_id} not found")
+    decision = authorize_read(caller, credit_file, family)
+    if decision.allowed:
+        return credit_file
+    if decision.hide_existence:
+        _record_denial(
+            credit_file_id=credit_file_id,
+            caller=caller.caller_id,
+            role=caller.role,
+            family=family,
+            reason_code=decision.reason_code,
+            surface=request.url.path,
+        )
+        raise NotFoundError(f"credit file {credit_file_id} not found")
+    raise AccessDeniedError(
+        f"role {caller.role} may not read {family} of credit file "
+        f"{credit_file_id}: {decision.reason_code}",
+        reason_code=decision.reason_code,
+        family=family,
+        credit_file_id=credit_file_id,
+        caller=caller.caller_id,
+        role=caller.role,
+    )
+
+
+def _guard_list(request: Request, family: str) -> Caller:
+    """Judge a portfolio list read; returns the caller so the
+    handler can scope-filter what it returns."""
+    caller = _caller_of(request)
+    policy_decision = authorize_global(caller, family)
+    if policy_decision.allowed:
+        return caller
+    # List surfaces scope-filter rather than refuse wholesale —
+    # an assigned-scope caller holding the family sees their own
+    # book. Refuse only when the family itself is not held (or
+    # the caller is malformed).
+    from .access import ROLE_POLICY
+
+    policy = ROLE_POLICY.get(caller.role)
+    if (
+        policy is not None
+        and family in policy["families"]
+        and caller.caller_id.strip()
+    ):
+        return caller
+    raise AccessDeniedError(
+        f"role {caller.role} may not read {family}: "
+        f"{policy_decision.reason_code}",
+        reason_code=policy_decision.reason_code,
+        family=family,
+        caller=caller.caller_id,
+        role=caller.role,
+    )
+
+
+def _guard_global(request: Request, family: str) -> Caller:
+    """Judge a portfolio-level (non-list) read: whole-book roles
+    holding the family, or a coded refusal."""
+    caller = _caller_of(request)
+    decision = authorize_global(caller, family)
+    if not decision.allowed:
+        raise AccessDeniedError(
+            f"role {caller.role} may not read {family}: "
+            f"{decision.reason_code}",
+            reason_code=decision.reason_code,
+            family=family,
+            caller=caller.caller_id,
+            role=caller.role,
+        )
+    return caller
 
 
 class OpenApplicationRequest(BaseModel):
@@ -165,6 +316,90 @@ async def model_budget_error_handler(
     return JSONResponse(status_code=429, content={"detail": str(exc)})
 
 
+@app.exception_handler(AccessDeniedError)
+async def access_denied_handler(
+    request: Request, exc: AccessDeniedError
+) -> JSONResponse:
+    # Round 17: a coded access refusal is a 403, and it is
+    # recorded — this handler is the single recording point for
+    # every AccessDeniedError the guards and gates raise, so a
+    # refusal lands in the denial list exactly once.
+    caller = _caller_of(request)
+    _record_denial(
+        credit_file_id=exc.credit_file_id,
+        caller=exc.caller or caller.caller_id,
+        role=exc.role or caller.role,
+        family=exc.family or FAMILY_FILES,
+        reason_code=exc.reason_code,
+        surface=request.url.path,
+    )
+    return JSONResponse(
+        status_code=403,
+        content={"detail": str(exc), "code": exc.reason_code},
+    )
+
+
+@app.middleware("http")
+async def access_write_middleware(request: Request, call_next):  # noqa: ANN001, ANN202
+    """Round 17: the read-only role writes nothing, anywhere.
+
+    The refusal happens before any gate logic runs, on every
+    mutating route. Identity arrives two ways: the caller headers
+    (judged strictly against the access policy — an unknown role
+    is refused too), or the body's asserted actor_role (the
+    gates' own convention; among policy roles, auditor_readonly
+    is the one that may never write, however it arrives).
+    """
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return await call_next(request)
+    role = request.headers.get("x-caller-role")
+    caller_id = request.headers.get("x-caller") or ""
+    strict = role is not None
+    if role is None:
+        body = await request.body()
+        if body:
+            try:
+                payload = json.loads(body)
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                role = payload.get("actor_role")
+                caller_id = (
+                    payload.get("actor")
+                    or payload.get("actor_id")
+                    or caller_id
+                )
+    if role is not None and (strict or role == "auditor_readonly"):
+        decision = authorize_write(Caller(caller_id, role))
+        if not decision.allowed:
+            path = request.url.path
+            parts = path.split("/")
+            file_id = (
+                parts[2]
+                if len(parts) > 2 and parts[1] == "applications"
+                else None
+            )
+            _record_denial(
+                credit_file_id=file_id,
+                caller=caller_id,
+                role=role,
+                family="write",
+                reason_code=decision.reason_code,
+                surface=path,
+            )
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": (
+                        f"write refused before gate logic: "
+                        f"{decision.reason_code}"
+                    ),
+                    "code": decision.reason_code,
+                },
+            )
+    return await call_next(request)
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -195,18 +430,22 @@ def open_from_los(body: OpenFromLosRequest) -> dict:
 
 
 @app.get("/applications")
-def list_applications() -> list[dict]:
-    return [cf.model_dump(mode="json") for cf in store.list_credit_files()]
+def list_applications(request: Request) -> list[dict]:
+    caller = _guard_list(request, FAMILY_FILES)
+    return [
+        cf.model_dump(mode="json")
+        for cf in visible_files(caller, store.list_credit_files())
+    ]
 
 
 @app.get("/applications/{credit_file_id}")
-def get_application(credit_file_id: str) -> dict:
-    return _file_or_404(credit_file_id).model_dump(mode="json")
+def get_application(request: Request, credit_file_id: str) -> dict:
+    return _guarded_file(request, credit_file_id, "files").model_dump(mode="json")
 
 
 @app.get("/applications/{credit_file_id}/checklist")
-def get_checklist(credit_file_id: str) -> list[dict]:
-    credit_file = _file_or_404(credit_file_id)
+def get_checklist(request: Request, credit_file_id: str) -> list[dict]:
+    credit_file = _guarded_file(request, credit_file_id, "files")
     return [item.model_dump(mode="json") for item in credit_file.checklist]
 
 
@@ -233,8 +472,8 @@ def add_document(credit_file_id: str, body: RegisterDocumentRequest) -> dict:
 
 
 @app.get("/applications/{credit_file_id}/documents/{document_id}")
-def get_document(credit_file_id: str, document_id: str) -> dict:
-    credit_file = _file_or_404(credit_file_id)
+def get_document(request: Request, credit_file_id: str, document_id: str) -> dict:
+    credit_file = _guarded_file(request, credit_file_id, "documents")
     doc = credit_file.document(document_id)
     if doc is None:
         raise NotFoundError(f"document {document_id} not found")
@@ -259,8 +498,8 @@ def extract(credit_file_id: str) -> dict:
 
 
 @app.get("/applications/{credit_file_id}/audit")
-def get_audit(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def get_audit(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "audit")
     return [e.model_dump(mode="json") for e in store.list_audit(credit_file_id)]
 
 
@@ -275,20 +514,20 @@ class AddAdjustmentRequest(BaseModel):
 
 
 @app.get("/applications/{credit_file_id}/spread")
-def get_spread(credit_file_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_spread(request: Request, credit_file_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "spreads")
     spread = pipeline.get_spread(credit_file_id)
     return spread.model_dump(mode="json")
 
 
 @app.get("/applications/{credit_file_id}/disagreements")
-def list_disagreements(credit_file_id: str, material: bool | None = None) -> list[dict]:
+def list_disagreements(request: Request, credit_file_id: str, material: bool | None = None) -> list[dict]:
     """The disagreements the file's spread records between its
     source types (round 8): every source's figure with its
     provenance, the deltas, and the materiality verdict. The
     as-reported view — nothing here is the spread's working figure
     alone, and nothing is averaged."""
-    _file_or_404(credit_file_id)
+    _guarded_file(request, credit_file_id, "spreads")
     return [
         d.model_dump(mode="json")
         for d in pipeline.list_disagreements(credit_file_id, material=material)
@@ -296,15 +535,15 @@ def list_disagreements(credit_file_id: str, material: bool | None = None) -> lis
 
 
 @app.get("/applications/{credit_file_id}/disagreements/{disagreement_id}")
-def get_disagreement(credit_file_id: str, disagreement_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_disagreement(request: Request, credit_file_id: str, disagreement_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "spreads")
     record = pipeline.get_disagreement(credit_file_id, disagreement_id)
     return record.model_dump(mode="json")
 
 
 @app.get("/applications/{credit_file_id}/adjustments")
-def list_adjustments(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def list_adjustments(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "spreads")
     return [
         a.model_dump(mode="json") for a in store.list_adjustments(credit_file_id)
     ]
@@ -337,8 +576,8 @@ class ComputeRequest(BaseModel):
 
 
 @app.get("/applications/{credit_file_id}/computations")
-def get_computations(credit_file_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_computations(request: Request, credit_file_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "computations")
     pack = pipeline.compute_metrics(credit_file_id)
     return pack.model_dump(mode="json")
 
@@ -356,8 +595,8 @@ def compute(credit_file_id: str, body: ComputeRequest) -> dict:
 
 
 @app.get("/applications/{credit_file_id}/computations/packs")
-def list_computation_packs(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def list_computation_packs(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "computations")
     return [
         p.model_dump(mode="json")
         for p in store.list_computation_packs(credit_file_id)
@@ -365,8 +604,8 @@ def list_computation_packs(credit_file_id: str) -> list[dict]:
 
 
 @app.get("/applications/{credit_file_id}/computations/{pack_id}")
-def get_computation_pack(credit_file_id: str, pack_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_computation_pack(request: Request, credit_file_id: str, pack_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "computations")
     pack = store.get_computation_pack(pack_id)
     if pack is None or pack.credit_file_id != credit_file_id:
         raise NotFoundError(f"computation pack {pack_id} not found")
@@ -434,8 +673,8 @@ def evaluate_policy(credit_file_id: str, body: EvaluatePolicyRequest) -> dict:
 
 
 @app.get("/applications/{credit_file_id}/policy-reports")
-def list_policy_reports(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def list_policy_reports(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "policy")
     return [
         r.model_dump(mode="json")
         for r in store.list_policy_reports(credit_file_id)
@@ -443,8 +682,8 @@ def list_policy_reports(credit_file_id: str) -> list[dict]:
 
 
 @app.get("/applications/{credit_file_id}/policy-reports/{report_id}")
-def get_policy_report(credit_file_id: str, report_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_policy_report(request: Request, credit_file_id: str, report_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "policy")
     report = store.get_policy_report(report_id)
     if report is None or report.credit_file_id != credit_file_id:
         raise NotFoundError(f"policy report {report_id} not found")
@@ -459,16 +698,17 @@ def get_policy_report(credit_file_id: str, report_id: str) -> dict:
 
 @app.get("/applications/{credit_file_id}/readiness-report")
 def get_current_readiness_report(
+    request: Request,
     credit_file_id: str, as_of: date | None = None
 ) -> dict:
-    _file_or_404(credit_file_id)
+    _guarded_file(request, credit_file_id, "files")
     report = pipeline.compute_readiness(credit_file_id, as_of=as_of)
     return report.model_dump(mode="json")
 
 
 @app.get("/applications/{credit_file_id}/readiness-reports")
-def list_readiness_reports(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def list_readiness_reports(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "files")
     return [
         r.model_dump(mode="json")
         for r in pipeline.list_readiness_reports(credit_file_id)
@@ -476,17 +716,18 @@ def list_readiness_reports(credit_file_id: str) -> list[dict]:
 
 
 @app.get("/applications/{credit_file_id}/readiness-reports/{report_id}")
-def get_readiness_report(credit_file_id: str, report_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_readiness_report(request: Request, credit_file_id: str, report_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "files")
     report = pipeline.get_readiness_report(credit_file_id, report_id)
     return report.model_dump(mode="json")
 
 
 @app.get("/applications/{credit_file_id}/outstanding-items")
 def get_outstanding_items(
+    request: Request,
     credit_file_id: str, as_of: date | None = None
 ) -> dict:
-    _file_or_404(credit_file_id)
+    _guarded_file(request, credit_file_id, "files")
     report = pipeline.compute_readiness(credit_file_id, as_of=as_of)
     text = pipeline.outstanding_items(credit_file_id, as_of=as_of)
     return {
@@ -516,29 +757,29 @@ def compose_memo(credit_file_id: str, body: ComposeMemoRequest) -> dict:
 
 
 @app.get("/applications/{credit_file_id}/memos")
-def list_memos(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def list_memos(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "memos")
     return [
         m.model_dump(mode="json") for m in store.list_memos(credit_file_id)
     ]
 
 
 @app.get("/applications/{credit_file_id}/memos/{memo_id}")
-def get_memo(credit_file_id: str, memo_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_memo(request: Request, credit_file_id: str, memo_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "memos")
     return pipeline.get_memo(credit_file_id, memo_id).model_dump(mode="json")
 
 
 @app.get("/applications/{credit_file_id}/memos/{memo_id}/verification")
-def get_memo_verification(credit_file_id: str, memo_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_memo_verification(request: Request, credit_file_id: str, memo_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "memos")
     memo = pipeline.get_memo(credit_file_id, memo_id)
     return memo.verification.model_dump(mode="json")
 
 
 @app.get("/applications/{credit_file_id}/memos/{memo_id}/text")
-def get_memo_text(credit_file_id: str, memo_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_memo_text(request: Request, credit_file_id: str, memo_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "memos")
     memo = pipeline.get_memo(credit_file_id, memo_id)
     return {"memo_id": memo.memo_id, "text": render_memo(memo)}
 
@@ -651,15 +892,15 @@ def recompose_memo(credit_file_id: str, body: RecomposeMemoRequest) -> dict:
 
 
 @app.get("/applications/{credit_file_id}/memos/{memo_id}/diff")
-def get_memo_diff(credit_file_id: str, memo_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_memo_diff(request: Request, credit_file_id: str, memo_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "memos")
     diff = pipeline.get_memo_diff(credit_file_id, memo_id)
     return diff.model_dump(mode="json")
 
 
 @app.get("/applications/{credit_file_id}/memos/{memo_id}/history")
-def get_memo_history(credit_file_id: str, memo_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_memo_history(request: Request, credit_file_id: str, memo_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "memos")
     history = pipeline.memo_history(credit_file_id, memo_id)
     return {
         "memo_id": history["memo_id"],
@@ -744,8 +985,8 @@ def decide_committee(
 
 
 @app.get("/applications/{credit_file_id}/memos/{memo_id}/committee")
-def get_committee_state(credit_file_id: str, memo_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_committee_state(request: Request, credit_file_id: str, memo_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "decisions")
     state = pipeline.committee_state(credit_file_id, memo_id)
     return {
         "memo_id": state["memo_id"],
@@ -766,9 +1007,10 @@ def get_committee_state(credit_file_id: str, memo_id: str) -> dict:
     "/decisions/{decision_id}"
 )
 def get_committee_decision(
+    request: Request,
     credit_file_id: str, memo_id: str, decision_id: str
 ) -> dict:
-    _file_or_404(credit_file_id)
+    _guarded_file(request, credit_file_id, "decisions")
     decision = pipeline.get_committee_decision(credit_file_id, decision_id)
     if decision.memo_id != memo_id:
         raise NotFoundError(
@@ -781,8 +1023,8 @@ def get_committee_decision(
     "/applications/{credit_file_id}/memos/{memo_id}/committee"
     "/adverse-action-notice"
 )
-def get_adverse_action_notice(credit_file_id: str, memo_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_adverse_action_notice(request: Request, credit_file_id: str, memo_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "decisions")
     text = pipeline.get_adverse_action_notice(credit_file_id, memo_id)
     decisions = pipeline.list_committee_decisions(credit_file_id, memo_id)
     declines = [d for d in decisions if d.outcome == "decline"]
@@ -819,8 +1061,8 @@ def record_closing(credit_file_id: str, body: RecordClosingRequest) -> dict:
 
 
 @app.get("/applications/{credit_file_id}/covenant-sets")
-def list_covenant_sets(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def list_covenant_sets(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "covenants")
     return [
         s.model_dump(mode="json")
         for s in pipeline.list_covenant_sets(credit_file_id)
@@ -828,8 +1070,8 @@ def list_covenant_sets(credit_file_id: str) -> list[dict]:
 
 
 @app.get("/applications/{credit_file_id}/covenant-sets/{set_id}")
-def get_covenant_set(credit_file_id: str, set_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_covenant_set(request: Request, credit_file_id: str, set_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "covenants")
     return pipeline.get_covenant_set(
         credit_file_id, set_id
     ).model_dump(mode="json")
@@ -858,9 +1100,10 @@ def _schedule_view(schedule: dict) -> dict:
 
 @app.get("/applications/{credit_file_id}/covenant-schedule")
 def get_covenant_schedule(
+    request: Request,
     credit_file_id: str, as_of: date, set_id: str | None = None
 ) -> dict:
-    _file_or_404(credit_file_id)
+    _guarded_file(request, credit_file_id, "covenants")
     schedule = pipeline.covenant_schedule(
         credit_file_id, as_of=as_of, set_id=set_id
     )
@@ -868,8 +1111,8 @@ def get_covenant_schedule(
 
 
 @app.get("/applications/{credit_file_id}/covenant-amendments")
-def list_covenant_amendments(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def list_covenant_amendments(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "covenants")
     return [
         a.model_dump(mode="json")
         for a in pipeline.list_covenant_amendments(credit_file_id)
@@ -929,9 +1172,16 @@ def _review_instance_view(instance) -> dict:  # noqa: ANN001, ANN202
 
 
 @app.get("/covenant-due-work")
-def get_covenant_due_work(as_of: date) -> list[dict]:
+def get_covenant_due_work(request: Request, as_of: date) -> list[dict]:
+    caller = _guard_list(request, "covenants")
+    visible = {
+        cf.credit_file_id
+        for cf in visible_files(caller, store.list_credit_files())
+    }
     out: list[dict] = []
     for entry in pipeline.covenant_due_work(as_of=as_of):
+        if entry["credit_file_id"] not in visible:
+            continue
         item = {
             "borrower": entry["borrower"],
             "credit_file_id": entry["credit_file_id"],
@@ -1051,8 +1301,8 @@ def run_covenant_test(
 
 
 @app.get("/applications/{credit_file_id}/covenant-test-results")
-def list_covenant_test_results(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def list_covenant_test_results(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "covenants")
     return pipeline.covenant_test_results(credit_file_id)
 
 
@@ -1060,9 +1310,10 @@ def list_covenant_test_results(credit_file_id: str) -> list[dict]:
     "/applications/{credit_file_id}/covenants/{covenant_id}/history"
 )
 def get_covenant_history(
+    request: Request,
     credit_file_id: str, covenant_id: str, as_of: date
 ) -> dict:
-    _file_or_404(credit_file_id)
+    _guarded_file(request, credit_file_id, "covenants")
     return pipeline.covenant_history(
         credit_file_id, covenant_id, as_of=as_of
     )
@@ -1070,20 +1321,31 @@ def get_covenant_history(
 
 @app.get("/breach-cases")
 def list_breach_cases(
-    as_of: date, credit_file_id: str | None = None
+    request: Request, as_of: date, credit_file_id: str | None = None
 ) -> list[dict]:
+    caller = _guard_list(request, "breach_cases")
     if credit_file_id is not None:
-        _file_or_404(credit_file_id)
-    return pipeline.list_breach_cases(
-        as_of=as_of, credit_file_id=credit_file_id
-    )
+        _guarded_file(request, credit_file_id, "breach_cases")
+        return pipeline.list_breach_cases(
+            as_of=as_of, credit_file_id=credit_file_id
+        )
+    visible = {
+        cf.credit_file_id
+        for cf in visible_files(caller, store.list_credit_files())
+    }
+    return [
+        view
+        for view in pipeline.list_breach_cases(as_of=as_of)
+        if view["credit_file_id"] in visible
+    ]
 
 
 @app.get("/applications/{credit_file_id}/breach-cases")
 def list_file_breach_cases(
+    request: Request,
     credit_file_id: str, as_of: date
 ) -> list[dict]:
-    _file_or_404(credit_file_id)
+    _guarded_file(request, credit_file_id, "breach_cases")
     return pipeline.list_breach_cases(
         as_of=as_of, credit_file_id=credit_file_id
     )
@@ -1091,9 +1353,10 @@ def list_file_breach_cases(
 
 @app.get("/applications/{credit_file_id}/breach-cases/{breach_id}")
 def get_breach_case(
+    request: Request,
     credit_file_id: str, breach_id: str, as_of: date
 ) -> dict:
-    _file_or_404(credit_file_id)
+    _guarded_file(request, credit_file_id, "breach_cases")
     return pipeline.get_breach_case(
         credit_file_id, breach_id, as_of=as_of
     )
@@ -1225,9 +1488,10 @@ def default_breach(
 
 @app.get("/applications/{credit_file_id}/annual-reviews")
 def get_annual_review_schedule(
+    request: Request,
     credit_file_id: str, as_of: date, set_id: str | None = None
 ) -> dict:
-    _file_or_404(credit_file_id)
+    _guarded_file(request, credit_file_id, "reviews")
     schedule = pipeline.annual_review_schedule(
         credit_file_id, as_of=as_of, set_id=set_id
     )
@@ -1278,8 +1542,8 @@ def assemble_review_pack(
 
 
 @app.get("/applications/{credit_file_id}/annual-review-packs")
-def list_review_packs(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def list_review_packs(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "reviews")
     return [
         pack.model_dump(mode="json")
         for pack in pipeline.list_review_packs(credit_file_id)
@@ -1289,8 +1553,8 @@ def list_review_packs(credit_file_id: str) -> list[dict]:
 @app.get(
     "/applications/{credit_file_id}/annual-review-packs/{pack_id}"
 )
-def get_review_pack(credit_file_id: str, pack_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_review_pack(request: Request, credit_file_id: str, pack_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "reviews")
     return pipeline.get_review_pack(
         credit_file_id, pack_id
     ).model_dump(mode="json")
@@ -1338,8 +1602,8 @@ def record_review_outcome(
 
 
 @app.get("/applications/{credit_file_id}/annual-review-outcomes")
-def list_review_outcomes(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def list_review_outcomes(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "reviews")
     return [
         outcome.model_dump(mode="json")
         for outcome in pipeline.list_review_outcomes(credit_file_id)
@@ -1347,8 +1611,8 @@ def list_review_outcomes(credit_file_id: str) -> list[dict]:
 
 
 @app.get("/applications/{credit_file_id}/committee-referrals")
-def list_committee_referrals(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def list_committee_referrals(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "reviews")
     return [
         referral.model_dump(mode="json")
         for referral in pipeline.list_committee_referrals(credit_file_id)
@@ -1356,7 +1620,12 @@ def list_committee_referrals(credit_file_id: str) -> list[dict]:
 
 
 @app.get("/annual-review-due-work")
-def get_annual_review_due_work(as_of: date) -> list[dict]:
+def get_annual_review_due_work(request: Request, as_of: date) -> list[dict]:
+    caller = _guard_list(request, "reviews")
+    visible = {
+        cf.credit_file_id
+        for cf in visible_files(caller, store.list_credit_files())
+    }
     return [
         {
             "borrower": entry["borrower"],
@@ -1364,6 +1633,7 @@ def get_annual_review_due_work(as_of: date) -> list[dict]:
             "review_instance": _review_instance_view(entry["instance"]),
         }
         for entry in pipeline.review_due_work(as_of=as_of)
+        if entry["credit_file_id"] in visible
     ]
 
 
@@ -1421,8 +1691,8 @@ def assign_rating(
 
 
 @app.get("/applications/{credit_file_id}/risk-ratings")
-def list_ratings(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def list_ratings(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "ratings")
     return [
         _rating_view_json(pipeline.rating_view(assignment))
         for assignment in pipeline.list_rating_assignments(
@@ -1434,8 +1704,8 @@ def list_ratings(credit_file_id: str) -> list[dict]:
 @app.get(
     "/applications/{credit_file_id}/risk-ratings/{assignment_id}"
 )
-def get_rating(credit_file_id: str, assignment_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_rating(request: Request, credit_file_id: str, assignment_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "ratings")
     assignment = pipeline.get_rating_assignment(
         credit_file_id, assignment_id
     )
@@ -1443,8 +1713,8 @@ def get_rating(credit_file_id: str, assignment_id: str) -> dict:
 
 
 @app.get("/applications/{credit_file_id}/risk-rating-history")
-def get_rating_history(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def get_rating_history(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "ratings")
     history = []
     for view in pipeline.rating_history(credit_file_id):
         entry = _rating_view_json(view)
@@ -1535,13 +1805,22 @@ def console_vocabularies() -> dict:
 
 
 @app.get("/console/queue")
-def console_queue(as_of: date) -> list[dict]:
-    return queue_view(pipeline, as_of=as_of)
+def console_queue(request: Request, as_of: date) -> list[dict]:
+    caller = _guard_list(request, FAMILY_FILES)
+    visible = {
+        cf.credit_file_id
+        for cf in visible_files(caller, store.list_credit_files())
+    }
+    return [
+        row
+        for row in queue_view(pipeline, as_of=as_of)
+        if row["credit_file_id"] in visible
+    ]
 
 
 @app.get("/console/workspace/{credit_file_id}")
-def console_workspace(credit_file_id: str, as_of: date) -> dict:
-    _file_or_404(credit_file_id)
+def console_workspace(request: Request, credit_file_id: str, as_of: date) -> dict:
+    _guarded_file(request, credit_file_id, "files")
     return workspace_view(pipeline, credit_file_id, as_of=as_of)
 
 
@@ -1557,22 +1836,117 @@ def console_workspace(credit_file_id: str, as_of: date) -> dict:
 
 
 @app.get("/model/profiles")
-def list_model_profiles() -> list[dict]:
+def list_model_profiles(request: Request) -> list[dict]:
+    _guard_global(request, FAMILY_LEDGER)
     return pipeline.model_profiles()
 
 
 @app.get("/model-costs/daily")
-def get_portfolio_model_costs() -> list[dict]:
+def get_portfolio_model_costs(request: Request) -> list[dict]:
+    _guard_global(request, FAMILY_LEDGER)
     return pipeline.portfolio_model_costs()
 
 
 @app.get("/applications/{credit_file_id}/model-ledger")
-def get_file_model_ledger(credit_file_id: str) -> list[dict]:
-    _file_or_404(credit_file_id)
+def get_file_model_ledger(request: Request, credit_file_id: str) -> list[dict]:
+    _guarded_file(request, credit_file_id, "ledger")
     return pipeline.file_model_ledger(credit_file_id)
 
 
 @app.get("/applications/{credit_file_id}/model-costs")
-def get_file_model_costs(credit_file_id: str) -> dict:
-    _file_or_404(credit_file_id)
+def get_file_model_costs(request: Request, credit_file_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "ledger")
     return pipeline.file_model_costs(credit_file_id)
+
+
+# ---------------------------------------------------------------------
+# Round 17 endpoints: the quarantine queue + review act, file
+# assignment, and the access-denial list.
+# ---------------------------------------------------------------------
+
+
+@app.get("/applications/{credit_file_id}/quarantine")
+def get_file_quarantine(request: Request, credit_file_id: str) -> dict:
+    _guarded_file(request, credit_file_id, "documents")
+    return {
+        "credit_file_id": credit_file_id,
+        "events": [
+            e.model_dump(mode="json")
+            for e in store.list_quarantine_events(credit_file_id)
+        ],
+        "reviews": [
+            r.model_dump(mode="json")
+            for r in store.list_quarantine_reviews(credit_file_id)
+        ],
+    }
+
+
+@app.get("/quarantine/queue")
+def get_quarantine_queue(request: Request) -> list[dict]:
+    """The analyst quarantine queue: unreviewed events across the
+    caller's visible book, oldest first."""
+    caller = _guard_list(request, "documents")
+    out: list[dict] = []
+    for credit_file in visible_files(caller, store.list_credit_files()):
+        reviewed = {
+            r.event_id
+            for r in store.list_quarantine_reviews(
+                credit_file.credit_file_id
+            )
+        }
+        for event in store.list_quarantine_events(
+            credit_file.credit_file_id
+        ):
+            if event.event_id in reviewed:
+                continue
+            row = event.model_dump(mode="json")
+            row["borrower"] = credit_file.borrower.legal_name
+            out.append(row)
+    out.sort(key=lambda r: (r["recorded_at"], r["event_id"]))
+    return out
+
+
+class ReviewQuarantineRequest(BaseModel):
+    reviewer: str
+    note: str = ""
+
+
+@app.post(
+    "/applications/{credit_file_id}/quarantine/{event_id}/review",
+    status_code=201,
+)
+def review_quarantine(
+    credit_file_id: str, event_id: str, body: ReviewQuarantineRequest
+) -> dict:
+    _file_or_404(credit_file_id)
+    review = pipeline.review_quarantine_event(
+        credit_file_id,
+        event_id,
+        reviewer=body.reviewer,
+        note=body.note,
+    )
+    return review.model_dump(mode="json")
+
+
+class AssignFileRequest(BaseModel):
+    actor: str
+    actor_role: str
+    assignee: str
+
+
+@app.post("/applications/{credit_file_id}/assign")
+def assign_file(credit_file_id: str, body: AssignFileRequest) -> dict:
+    _file_or_404(credit_file_id)
+    credit_file = pipeline.assign_file(
+        credit_file_id,
+        actor=body.actor,
+        actor_role=body.actor_role,
+        assignee=body.assignee,
+    )
+    return credit_file.model_dump(mode="json")
+
+
+@app.get("/access/denials")
+def list_access_denials(request: Request) -> list[dict]:
+    _guard_global(request, FAMILY_AUDIT)
+    return [d.model_dump(mode="json") for d in store.list_denials()]

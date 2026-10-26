@@ -393,6 +393,15 @@ def workspace_view(pipeline, credit_file_id: str, *, as_of: date) -> dict:  # no
         "file": _dump(credit_file),
         "checklist": [_dump(i) for i in credit_file.checklist],
         "documents": [_dump(d) for d in credit_file.documents],
+        # Round 17: the file's quarantine record rides the
+        # workspace — the analyst sees the fenced spans' events
+        # and their reviews beside the documents they came from.
+        "quarantine_events": [
+            _dump(e) for e in store.list_quarantine_events(credit_file_id)
+        ],
+        "quarantine_reviews": [
+            _dump(r) for r in store.list_quarantine_reviews(credit_file_id)
+        ],
         "readiness": readiness,
         "spread": spread,
         "adjustments": [
