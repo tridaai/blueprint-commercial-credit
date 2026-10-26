@@ -912,6 +912,80 @@ now exercised against real Postgres 16, in the open.
   README says so rather than claiming a run that never
   happened.
 
+## What round 17 adds
+
+**Injection defences and retrieval access control**: borrower
+text stops being trusted, and retrieval stops being open. Two
+disciplines, both enforced in code and graded end to end.
+
+- **A deterministic instruction-pattern scanner** —
+  `src/commercial_credit/quarantine.py` carries a versioned
+  pattern pack (`2026.10.1`) as data: instruction overrides,
+  role impersonation, output dictation, concealment, policy
+  overrides. It runs over every document at ingestion, field by
+  field at its JSON path (the filename too, separators read as
+  spaces), and records **quarantine events** on the credit file
+  naming document, field, pattern and the sentence-exact span
+  with any figures inside it. Documents are never rejected —
+  evidence is evidence — and spans are sentence-exact in the
+  safe direction: an abbreviation's full stops ("e.g.", "U.S.")
+  never end a span early, so a dictated figure cannot be cut
+  out of the record by punctuation.
+- **Fencing on every model surface** — wherever borrower text
+  reaches a model (the extraction prompt, the memo and review
+  polish prompts), quarantined spans are replaced by a fence
+  marker that names the pattern and carries no figure: the
+  model sees that text was quarantined, never the bare
+  instruction. Structured documents are fenced field by field,
+  so the prompt copy stays readable; stored bytes are never
+  touched.
+- **A planted figure grounds nothing** — figures that appear
+  only inside quarantined spans are refused at extraction (the
+  batch continues; the refusal is audited) and struck from the
+  memo verifier's trace universe, so a number dictated by an
+  instruction can neither enter the file nor legitimise a memo
+  figure. Graded: an injected statement leaves extraction,
+  spread, computation and memo identical to the clean run —
+  normalised only for the document's own hash and the ids
+  chained from it, which honestly record that the document
+  differs.
+- **The quarantine queue** — unreviewed events surface at
+  `GET /quarantine/queue` and per file at
+  `GET /applications/{id}/quarantine`; a named officer's review
+  is recorded (`POST …/quarantine/{event_id}/review`) and never
+  un-fences: fences derive from the append-only event record,
+  not from anyone's judgement call.
+- **One access module, a versioned role policy** —
+  `src/commercial_credit/access.py` (`2026.10.1`): five roles
+  (system, credit officer, committee member, analyst preparer,
+  auditor read-only) over fourteen artefact families, with file
+  scope (whole book vs assigned; unassigned files are the
+  pickup queue). Assignment is a recorded act
+  (`POST /applications/{id}/assign`) — a preparer may claim an
+  unassigned file for themselves, an officer may reassign, and
+  reassignment is effective immediately.
+- **Existence hiding and coded refusals** — a caller with no
+  read right on a file gets a 404 body byte-identical to a
+  nonexistent file; a caller who may see the file but not the
+  family gets a coded 403 (`role_not_permitted`,
+  `not_assignee`, `unknown_role`, `caller_required`). The
+  read-only role is refused (`readonly_role`) by middleware
+  before any gate logic, on every write path. Every refusal is
+  recorded as an access-denial record, listed at
+  `GET /access/denials`, and written to the file's own audit
+  trail. Every retrieval surface — workspace, queue, memo and
+  pack reads, document reads, the ledger — goes through the
+  same policy; there is no unguarded read path. The eval gate
+  grades the full role × family × scope matrix against a
+  written-out expectation, the hiding byte-equality, and the
+  denial record's completeness.
+- **Stated boundary** — the scanner is field-scoped at
+  ingestion and whole-text at model surfaces; an instruction
+  split across two fields so no single field contains a match
+  is a stated boundary of the pattern approach, not a hidden
+  one. Pattern packs are data: widening the vocabulary is a
+  version bump, reviewed like a policy change.
+
 ## The laws (enforced in code, never in prompts)
 
 1. **No model-computed numbers.** Extraction returns values +
@@ -982,6 +1056,12 @@ now exercised against real Postgres 16, in the open.
   not a validated, back-tested model.
 - There is no real LOS or core-banking integration — ports and a
   reference feed only.
+- Round 17's access control governs the API's retrieval and
+  write surfaces under the shipped role policy; it is an
+  application-level policy, not an identity provider — a
+  deployment still puts its own authentication in front of the
+  service, and the caller headers the policy judges are the
+  deployment's to assert.
 - The sample borrower book is generated for this blueprint, with
   figures known by construction so extraction can be graded against
   ground truth; that is the repo's one data note.

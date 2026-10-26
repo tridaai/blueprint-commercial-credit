@@ -833,6 +833,48 @@ the reference extractor), and the profiles' own variables
 (`ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`,
 `IN_BOUNDARY_MODEL_URL`, `IN_BOUNDARY_MODEL_API_KEY`).
 
+## Trust boundaries (round 17)
+
+Two boundaries are drawn in code, not in prompts.
+
+**Borrower text is untrusted input.** The ingestion funnel runs
+a deterministic instruction-pattern scanner
+(`quarantine.py`, pattern pack `2026.10.1` as data) over every
+document field and the filename; matches become append-only
+`quarantine_events` naming document, field, pattern, span and
+the figures inside the span. Spans are sentence-exact with
+abbreviation-safe boundaries — over-capture is the safe
+direction, because the figures recorded in spans are the
+ground two later controls key on: extraction refuses any value
+whose amount lives only inside a quarantined span, and the
+memo verifier's trace universe (`memo.build_trace_universe`)
+strikes exactly the quarantine-only figure set. On model
+surfaces the gateway fences spans before text enters a prompt
+(`fence_text` for prose paragraphs,
+`fence_document_text` for structured documents, fenced field
+by field so the prompt copy stays valid); the fence marker is
+figure-free and pattern-free, so fencing is idempotent and a
+fenced span can neither re-trigger the scanner nor read as a
+number. Reviews of quarantine events are recorded acts; they
+change nothing about the fences, which derive from the event
+record alone.
+
+**Retrieval is policy-gated.** One module (`access.py`, policy
+`2026.10.1` as data) judges every read and writes before gate
+logic: roles × artefact families × file scope. Its decisions
+have three shapes — allow; coded refusal (the artefact family
+is one the caller may know about); and existence hiding (no
+read right on the file: the API answers with the same 404 body
+a nonexistent file produces). Handlers call the guard first,
+list surfaces scope-filter through it, and the write
+middleware refuses the read-only role before any handler
+runs. Assignment lives on the credit file (`assigned_to`,
+changed only through the recorded assign act) — it is the
+scope the policy reads, so a reassignment takes effect on the
+next request, not at some cache's leisure. Every refusal is
+recorded twice: the `access_denials` list (itself a guarded
+audit-family read) and the file's own audit trail.
+
 ## Storage
 
 PostgreSQL is the deployment store. `migrations/` holds numbered SQL
