@@ -1,4 +1,4 @@
-.PHONY: demo test evals serve install install-pip
+.PHONY: demo test evals serve install install-pip prod-smoke
 
 install:  ## Install the locked set with uv (primary workflow)
 	uv sync --extra dev
@@ -18,6 +18,9 @@ test:  ## Run the pytest suite
 
 evals:  ## Run the eval gate (provenance completeness = 100% required)
 	uv run python evals/run_evals.py
+
+prod-smoke:  ## Production smoke on Postgres (R16): needs DATABASE_URL set
+	uv run python scripts/prod_smoke.py
 
 serve:  ## Serve the API on http://localhost:8000
 	uv run uvicorn commercial_credit.api:app --port 8000
