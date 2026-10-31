@@ -446,6 +446,64 @@ control:
                             the refusals actually performed.
                             REQUIRED: 0.
 
+Round 18 counters — eval depth: the lines themselves, walked.
+
+  policy_boundary_          every figure threshold in the pack
+    outcome_wrong             at exactly its value and one figure
+                            quantum (0.0001) either side — DSCR,
+                            leverage (incl. a segment ceiling),
+                            fixed-charge coverage, global DSCR —
+                            the concentration limit judged on the
+                            unrounded share, and the statement /
+                            appraisal age limits at exactly their
+                            month count and one month past, under
+                            both pack versions where they differ.
+                            REQUIRED: 0 wrong of the graded cases.
+  readiness_staleness_      the insurance certificate's receipt
+    edge_wrong                window and the statements' fiscal
+                            window at exactly their limits (fresh)
+                            and one month past (stale blocker).
+                            REQUIRED: 0.
+  readiness_mixed_          a file with exactly one stale input
+    blocker_wrong             among fresh ones: that input is the
+                            only blocker, the convene refusal names
+                            it, and its refresh alone clears the
+                            convene. REQUIRED: 0.
+  covenant_cure_clock_      the breach cure clock at its
+    edge_wrong                deadline: not overdue the day
+                            before or on the deadline day itself,
+                            overdue the day after, the day counts
+                            exact. REQUIRED: 0.
+  committee_uncoded_        decline probes tied to a test the
+    adverse_accepted          pinned report does not contain, to
+                            a traced figure misstated by a cent,
+                            and to a mismatched code/test pairing;
+                            deferral probes with no codes, codes
+                            but no re-presentment requirements,
+                            and an unknown code. REQUIRED: 0.
+  adverse_decision_         every committee decision stored in
+    census_gaps               the run re-read: each decline
+                            carries coded reasons from the
+                            vocabulary under its pinned vocabulary
+                            version and renders its notice; each
+                            deferral carries coded reasons and
+                            named requirements. REQUIRED: 0.
+  disagreement_provenance_  every source of every disagreement
+    gaps                      record on the round 8 fixture:
+                            complete provenance, the document on
+                            file by id and hash, and deltas that
+                            recompute from the record's figures.
+                            Completeness REQUIRED: 100%.
+  injection_disagreement_   the round 17 planted instruction
+    detection_wrong /         inside the FY2024 audited
+    state_changes             statement — itself a witness on the
+                            contested lines: the note is recorded
+                            whole, the seven disagreements detect
+                            exactly as on the clean run, the
+                            working figures and memo record are
+                            unchanged, and the dictated figure
+                            grounds nothing. REQUIRED: 0 / 0.
+
 Later rounds add counters as their machinery lands.
 Exit code 0 = GATE: PASS.
 """
@@ -4543,6 +4601,681 @@ def main() -> int:
     print(f"denial_audit_gaps: {_q_gaps} (required 0)")
     if _q_gaps:
         failures.append("a refusal went unrecorded as a denial")
+
+    # --------------------------------------------------------------
+    # Round 18: eval depth. The earlier rounds grade that the
+    # machinery refuses what it must and lands what it should, on
+    # fixtures decided well inside the lines. This round walks
+    # the lines themselves: every policy threshold at exactly its
+    # value and one figure quantum either side, the staleness
+    # windows at exactly their limit and one month past, the
+    # cure clock at its deadline, a census over every adverse
+    # decision the run stored, the disagreement records'
+    # provenance re-performed source by source, and the round 17
+    # injection planted inside a document that also carries a
+    # genuine disagreement.
+    # --------------------------------------------------------------
+    from commercial_credit.committee import (
+        ADVERSE_REASON_CODES as _R18_ADVERSE_CODES,
+    )
+    from commercial_credit.committee import (
+        DEFERRAL_REASON_CODES as _R18_DEFERRAL_CODES,
+    )
+    from commercial_credit.models import SourceDocument as _R18Doc
+
+    # -- Policy thresholds at their boundaries. Debt service in
+    # these fixtures is 100,000 (60,000 prior-year CPLTD + 40,000
+    # interest) unless a case rebuilds it, so the coverage ratios
+    # are exact to the quantum.
+    def _r18_pack(doc_prefix, *, ebit, da="0", interest="40000",
+                  prior_cpltd="60000", capex="0", liab="0",
+                  equity="1000000"):
+        cf_id = f"cf-r18-{doc_prefix}"
+        spread, extractions = _fixture_spread(
+            cf_id, doc_prefix,
+            {
+                2023: {"current_portion_ltd": prior_cpltd},
+                2024: {
+                    "ebit": ebit,
+                    "depreciation_and_amortization": da,
+                    "interest_expense": interest,
+                    "current_portion_ltd": "60000",
+                    "capital_expenditures": capex,
+                    "total_liabilities": liab,
+                    "total_equity": equity,
+                },
+            },
+        )
+        pack = compute_entity_pack(
+            credit_file_id=cf_id, entity="Eval Fixture Borrower, LLC",
+            spread=spread, extractions=extractions,
+        )
+        return cf_id, pack
+
+    def _r18_figure(pack, key):
+        fig = next(
+            f for f in pack.figures
+            if f.key == key and f.fiscal_year == 2024
+        )
+        return fig.value
+
+    _r18_boundary = {"wrong": 0, "cases": 0}
+
+    def _r18_case(label, report, test_id, expected):
+        _r18_boundary["cases"] += 1
+        got = report.outcome(test_id).outcome
+        if got != expected:
+            _r18_boundary["wrong"] += 1
+            print(f"  boundary case {label}: {test_id} read "
+                  f"{got}, hand-decided {expected}")
+
+    # DSCR floor 1.25 (v1): EBITDA / 100,000.
+    for _ebit, _want in (("125000", "pass"), ("124990", "fail"),
+                         ("125010", "pass")):
+        _cf_id, _pack = _r18_pack(f"dscr{_ebit}", ebit=_ebit)
+        if _r18_figure(_pack, "dscr") != Decimal(_ebit) / Decimal("100000"):
+            _r18_boundary["wrong"] += 1
+        _r18_case(
+            f"dscr ebit={_ebit}",
+            evaluate_policy(
+                _policy_file(_cf_id), _pack,
+                policy_version="v1", as_of=as_of,
+            ),
+            "min_dscr", _want,
+        )
+    # Leverage ceiling 2.00 (manufacturing): liabilities / equity.
+    for _liab, _want in (("2000000", "pass"), ("2000100", "fail"),
+                         ("1999900", "pass")):
+        _cf_id, _pack = _r18_pack(f"lev{_liab}", ebit="125000", liab=_liab)
+        _r18_case(
+            f"leverage liab={_liab}",
+            evaluate_policy(
+                _policy_file(_cf_id), _pack,
+                policy_version="v1", as_of=as_of,
+            ),
+            "max_leverage_by_segment", _want,
+        )
+    # The segment's own ceiling (professional services, 3.00).
+    for _liab, _want in (("3000000", "pass"), ("3000100", "fail")):
+        _cf_id, _pack = _r18_pack(f"seg{_liab}", ebit="125000", liab=_liab)
+        _r18_case(
+            f"segment leverage liab={_liab}",
+            evaluate_policy(
+                _policy_file(
+                    _cf_id,
+                    segment=BorrowerSegment.PROFESSIONAL_SERVICES,
+                ),
+                _pack, policy_version="v1", as_of=as_of,
+            ),
+            "max_leverage_by_segment", _want,
+        )
+    # FCCR floor 1.10: (EBITDA − 50,000 capex) / 100,000.
+    for _ebit, _want in (("160000", "pass"), ("159990", "fail"),
+                         ("160010", "pass")):
+        _cf_id, _pack = _r18_pack(f"fccr{_ebit}", ebit=_ebit, capex="50000")
+        _r18_case(
+            f"fccr ebit={_ebit}",
+            evaluate_policy(
+                _policy_file(_cf_id), _pack,
+                policy_version="v1", as_of=as_of,
+            ),
+            "min_fixed_charge_coverage", _want,
+        )
+    # Global DSCR floor 1.20: borrower 70,000 / 50,000 plus the
+    # guarantor's EBITDA over its own 50,000 of debt service.
+    for _g_ebit, _want in (("50000", "pass"), ("49990", "fail"),
+                           ("50010", "pass")):
+        _cf_id, _b_pack = _r18_pack(
+            f"glob{_g_ebit}", ebit="70000", interest="20000",
+            prior_cpltd="30000",
+        )
+        _g_spread, _g_ext = _fixture_spread(
+            _cf_id, f"g{_g_ebit}",
+            {
+                2023: {"current_portion_ltd": "30000"},
+                2024: {
+                    "ebit": _g_ebit,
+                    "depreciation_and_amortization": "0",
+                    "interest_expense": "20000",
+                },
+            },
+        )
+        _g_pack = compute_entity_pack(
+            credit_file_id=_cf_id, entity="Eval Guarantor",
+            spread=_g_spread, extractions=_g_ext,
+        )
+        _global = compute_global_pack(
+            credit_file_id=_cf_id, borrower_pack=_b_pack,
+            entity_packs={"Eval Guarantor": _g_pack},
+            expected_guarantors=["Eval Guarantor"],
+        )
+        _r18_case(
+            f"global dscr guarantor ebit={_g_ebit}",
+            evaluate_policy(
+                _policy_file(_cf_id, guarantors=("Eval Guarantor",)),
+                _b_pack, policy_version="v1", global_pack=_global,
+                as_of=as_of,
+            ),
+            "min_global_dscr", _want,
+        )
+    # Concentration limit 0.10 of the 250,000,000 capital base,
+    # judged on the UNROUNDED share: 25,000,001 is over the limit
+    # even though the share displays as 0.1000. (Before round 18
+    # the comparison read the rounded figure and amounts up to
+    # 25,012,499 passed; the fix is graded here and in the tests.)
+    _conc_id, _conc_pack = _r18_pack(
+        "conc", ebit="125000", liab="800000", equity="1000000"
+    )
+    for _amount, _want in (
+        ("24999000", "pass"), ("25000000", "pass"),
+        ("25000001", "fail"), ("25001000", "fail"),
+        ("25012499", "fail"), ("25012500", "fail"),
+    ):
+        _r18_case(
+            f"concentration amount={_amount}",
+            evaluate_policy(
+                _policy_file(_conc_id, amount=_amount), _conc_pack,
+                policy_version="v1", as_of=as_of,
+            ),
+            "max_single_borrower_concentration", _want,
+        )
+    # Statement age: FY2024 year-end is exactly 18 complete
+    # months old at 2026-07-01 (v1 limit, pass) and 19 at
+    # 2026-07-31 (fail); under v2's 15-month limit, 2026-04-01
+    # is exactly 15 (pass) and 2026-05-01 is 16 (fail).
+    for _version, _when, _want in (
+        ("v1", date(2026, 7, 1), "pass"),
+        ("v1", date(2026, 7, 31), "fail"),
+        ("v2", date(2026, 4, 1), "pass"),
+        ("v2", date(2026, 5, 1), "fail"),
+    ):
+        _r18_case(
+            f"statement age {_version} at {_when}",
+            evaluate_policy(
+                _policy_file(_conc_id), _conc_pack,
+                policy_version=_version, as_of=_when,
+            ),
+            "financial_statement_age", _want,
+        )
+    # Appraisal age (CRE, limit 12): received 2025-06-15, exactly
+    # 12 complete months old at 2026-06-15 (pass), 13 at
+    # 2026-07-15 (fail).
+    _cre_file = CreditFile(
+        credit_file_id="cf-r18-cre",
+        borrower=Borrower(
+            legal_name="Eval CRE Borrower, LLC", ein_last4="9999",
+            segment=BorrowerSegment.REAL_ESTATE,
+            state_of_formation="OH", years_in_business=8,
+            primary_contact_name="Eval Fixture",
+            primary_contact_email="eval@fixture.example",
+        ),
+        facility=FacilityRequest(
+            facility_type=FacilityType.CRE_LOAN,
+            amount=Decimal("2000000"), purpose="eval fixture",
+            term_months=60,
+        ),
+        documents=[_R18Doc(
+            document_id="doc-r18-appraisal",
+            credit_file_id="cf-r18-cre",
+            kind=DocumentKind.APPRAISAL,
+            filename="appraisal.json", sha256="ab" * 32,
+            byte_size=128, storage_key="docs/doc-r18-appraisal",
+            received_at=datetime(2025, 6, 15, tzinfo=timezone.utc),
+        )],
+    )
+    _cre_file.checklist = generate_checklist(_cre_file.facility)
+    for item in _cre_file.checklist:
+        item.satisfied_by_document_id = "doc-eval"
+    for _when, _want in ((date(2026, 6, 15), "pass"),
+                         (date(2026, 7, 15), "fail")):
+        _r18_case(
+            f"appraisal age at {_when}",
+            evaluate_policy(
+                _cre_file, _conc_pack,
+                policy_version="v1", as_of=_when,
+            ),
+            "appraisal_age", _want,
+        )
+    print(f"policy_boundary_outcome_wrong: {_r18_boundary['wrong']} "
+          f"of {_r18_boundary['cases']} boundary cases (required 0)")
+    if _r18_boundary["wrong"]:
+        failures.append("a policy threshold boundary read wrong")
+
+    # -- Readiness staleness edges + the mixed file. The ready
+    # Calloway file, with one document's receipt date moved: the
+    # insurance certificate (receipt limit 12 months) is fresh at
+    # exactly 12 and stale at 13; the statements entry (fiscal
+    # age against the pinned v1 limit of 18) is fresh at exactly
+    # 18 and stale at 19.
+    def _r18_set_received(pipe, cf, kind, received):
+        stored = pipe.store.get_credit_file(cf)
+        doc = next(d for d in stored.documents if d.kind == kind)
+        doc.received_at = received
+        pipe.store.save_credit_file(stored)
+
+    def _r18_entry(report, label_part):
+        return next(
+            e for e in report.entries if label_part in e.label
+        )
+
+    _r18_edge_wrong = 0
+    ep = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    e_file = ep.open_application(
+        _ready_borrower(), _ready_facility(),
+        documents=_ready_documents(),
+    )
+    ecf = e_file.credit_file_id
+    _, e_final = _officer_final_for(ep, ecf, as_of=date(2026, 6, 30))
+    _r18_set_received(
+        ep, ecf, DocumentKind.INSURANCE_CERTIFICATE,
+        datetime(2025, 6, 30, tzinfo=timezone.utc),
+    )
+    _rep = ep.compute_readiness(
+        ecf, memo_id=e_final.memo_id, as_of=date(2026, 6, 30)
+    )
+    _ins = _r18_entry(_rep, "Insurance")
+    if not (
+        _ins.age_months == 12 and _ins.limit_months == 12
+        and _ins.state == "present_fresh" and not _ins.blocker
+        and _rep.ready
+    ):
+        _r18_edge_wrong += 1
+    _r18_set_received(
+        ep, ecf, DocumentKind.INSURANCE_CERTIFICATE,
+        datetime(2025, 5, 30, tzinfo=timezone.utc),
+    )
+    _rep = ep.compute_readiness(
+        ecf, memo_id=e_final.memo_id, as_of=date(2026, 6, 30)
+    )
+    _ins = _r18_entry(_rep, "Insurance")
+    if not (
+        _ins.age_months == 13 and _ins.state == "present_stale"
+        and _ins.blocker and not _rep.ready
+    ):
+        _r18_edge_wrong += 1
+    _rep = ep.compute_readiness(
+        ecf, memo_id=e_final.memo_id, as_of=date(2027, 7, 1)
+    )
+    _stmts = next(e for e in _rep.entries if e.input_key == "chk-01")
+    if not (
+        _stmts.age_months == 18 and _stmts.limit_months == 18
+        and _stmts.state == "present_fresh" and not _stmts.blocker
+    ):
+        _r18_edge_wrong += 1
+    _rep = ep.compute_readiness(
+        ecf, memo_id=e_final.memo_id, as_of=date(2027, 7, 31)
+    )
+    _stmts = next(e for e in _rep.entries if e.input_key == "chk-01")
+    if not (
+        _stmts.age_months == 19 and _stmts.state == "present_stale"
+        and _stmts.blocker
+    ):
+        _r18_edge_wrong += 1
+    print(f"readiness_staleness_edge_wrong: {_r18_edge_wrong} "
+          f"of 4 edge cases (required 0)")
+    if _r18_edge_wrong:
+        failures.append("a readiness staleness edge read wrong")
+
+    # The mixed file: exactly one stale input among fresh ones
+    # blocks the convene by itself, is the only blocker, and its
+    # refresh alone clears the way.
+    _r18_mixed_wrong = 0
+    mp = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    m_file = mp.open_application(
+        _ready_borrower(), _ready_facility(),
+        documents=_ready_documents(),
+    )
+    mcf = m_file.credit_file_id
+    _, m_final = _officer_final_for(mp, mcf, as_of=date(2026, 6, 30))
+    _r18_set_received(
+        mp, mcf, DocumentKind.INSURANCE_CERTIFICATE,
+        datetime(2025, 5, 30, tzinfo=timezone.utc),
+    )
+    _m_rep = mp.compute_readiness(
+        mcf, memo_id=m_final.memo_id, as_of=date(2026, 6, 30)
+    )
+    if not (
+        _m_rep.blocker_count == 1
+        and "Insurance" in _m_rep.blockers[0].label
+    ):
+        _r18_mixed_wrong += 1
+    _m_refusal = ""
+    try:
+        mp.convene_committee(
+            mcf, m_final.memo_id, actor=C_OFFICER,
+            actor_role=C_OFFICER_ROLE, as_of=date(2026, 6, 30),
+        )
+    except ValidationError as exc:
+        _m_refusal = str(exc)
+    if "Insurance" not in _m_refusal:
+        _r18_mixed_wrong += 1
+    _m_stored = mp.store.get_credit_file(mcf)
+    _m_doc = register_document(
+        mp.store, mp.documents, _m_stored,
+        kind=DocumentKind.INSURANCE_CERTIFICATE,
+        filename="insurance-certificate-2026.json",
+        data=json.dumps({}).encode(),
+    )
+    _m_stored = mp.store.get_credit_file(mcf)
+    _m_stored.document(_m_doc.document_id).received_at = datetime(
+        2026, 6, 1, tzinfo=timezone.utc
+    )
+    mp.store.save_credit_file(_m_stored)
+    _m_rep2 = mp.compute_readiness(
+        mcf, memo_id=m_final.memo_id, as_of=date(2026, 6, 30)
+    )
+    mp.convene_committee(
+        mcf, m_final.memo_id, actor=C_OFFICER,
+        actor_role=C_OFFICER_ROLE, as_of=date(2026, 6, 30),
+    )
+    if not (
+        _m_rep2.ready
+        and mp.memo_status(mcf, m_final.memo_id) == "in_committee"
+    ):
+        _r18_mixed_wrong += 1
+    print(f"readiness_mixed_blocker_wrong: {_r18_mixed_wrong} "
+          f"(required 0)")
+    if _r18_mixed_wrong:
+        failures.append("the mixed fresh/stale readiness path read wrong")
+
+    # -- The cure clock at its deadline. A fresh approved file's
+    # FY2026 DSCR breach: the deadline is the test date plus the
+    # covenant's 30-day cure period, and the breach reads overdue
+    # only strictly after it.
+    _r18_clock_wrong = 0
+    kp18 = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    kcf18, _kdec18 = _t_approved(kp18)
+    _t_deliver(kp18, kcf18, 2026, _T_FY2026)
+    kp18.run_due_covenant_tests(kcf18, as_of=date(2027, 8, 1))
+    _k_breach = next(
+        b for b in kp18.list_breach_cases(
+            as_of=date(2027, 8, 1), credit_file_id=kcf18
+        )
+        if b["metric_key"] == "dscr"
+    )
+    from datetime import timedelta as _r18_td
+
+    _k_deadline = date.fromisoformat(_k_breach["cure_deadline"])
+    _k_test_date = date.fromisoformat(_k_breach["test_date"])
+    if _k_deadline != _k_test_date + _r18_td(days=30):
+        _r18_clock_wrong += 1
+    for _when, _want_days, _want_overdue in (
+        (_k_deadline - _r18_td(days=1), 1, False),
+        (_k_deadline, 0, False),
+        (_k_deadline + _r18_td(days=1), -1, True),
+    ):
+        _view = kp18.get_breach_case(
+            kcf18, _k_breach["breach_id"], as_of=_when
+        )
+        if not (
+            _view["days_to_cure_deadline"] == _want_days
+            and _view["cure_overdue"] is _want_overdue
+        ):
+            _r18_clock_wrong += 1
+    _on_day = kp18.get_breach_case(
+        kcf18, _k_breach["breach_id"], as_of=_k_deadline
+    )
+    if _on_day["days_in_breach"] != 30:
+        _r18_clock_wrong += 1
+    print(f"covenant_cure_clock_edge_wrong: {_r18_clock_wrong} "
+          f"(required 0)")
+    if _r18_clock_wrong:
+        failures.append("the cure clock's deadline edge read wrong")
+
+    # -- Adverse-action depth: uncoded and mistied probes the
+    # round 7 counters did not carry, then a census over every
+    # decision this run stored — no decline without coded
+    # reasons, no deferral without codes and requirements.
+    cp18, ccf18, _cd18, cfinal18 = _committee_file()
+    cp18.convene_committee(
+        ccf18, cfinal18.memo_id, actor=C_OFFICER,
+        actor_role=C_OFFICER_ROLE,
+    )
+    _r18_uncoded = 0
+    _r18_uncoded += _refused(lambda: _decide(
+        cp18, ccf18, cfinal18.memo_id, outcome="decline",
+        adverse_reasons=[AdverseActionReason(
+            code="financial_information_insufficient",
+            tie_kind="policy_test", test_id="min_dscr_typo",
+        )],
+    ))
+    _traced0 = cfinal18.verification.figures[0]
+    _r18_uncoded += _refused(lambda: _decide(
+        cp18, ccf18, cfinal18.memo_id, outcome="decline",
+        adverse_reasons=[AdverseActionReason(
+            code="key_figure_shortfall", tie_kind="figure",
+            figure_text=_traced0.text,
+            figure_value=str(
+                Decimal(_traced0.value) + Decimal("0.01")
+            ),
+            figure_source=_traced0.source,
+        )],
+    ))
+    _r18_uncoded += _refused(lambda: _decide(
+        cp18, ccf18, cfinal18.memo_id, outcome="decline",
+        adverse_reasons=[AdverseActionReason(
+            code="debt_service_coverage_below_policy",
+            tie_kind="policy_test",
+            test_id="max_leverage_by_segment",
+        )],
+    ))
+    _r18_uncoded += _refused(lambda: _decide(
+        cp18, ccf18, cfinal18.memo_id, outcome="defer",
+    ))
+    _r18_uncoded += _refused(lambda: _decide(
+        cp18, ccf18, cfinal18.memo_id, outcome="defer",
+        deferral_reasons=["awaiting_required_documents"],
+    ))
+    _r18_uncoded += _refused(lambda: _decide(
+        cp18, ccf18, cfinal18.memo_id, outcome="defer",
+        deferral_reasons=["when_the_committee_is_ready"],
+        representment_requirements=["chk-03 (Business tax returns) on file"],
+    ))
+    print(f"committee_uncoded_adverse_accepted: {_r18_uncoded} "
+          f"of 6 probes (required 0)")
+    if _r18_uncoded:
+        failures.append("an uncoded or mistied adverse probe was accepted")
+
+    _r18_census_gaps = 0
+    _r18_decisions_seen = 0
+    _r18_declines_seen = 0
+    for _pipe, _cf, _mid in (
+        (cp1, ccf1, cfinal1.memo_id),
+        (cp2, ccf2, cfinal2.memo_id),
+        (cp3, ccf3, cfinal3.memo_id),
+        (dp, dcf2, d_final.memo_id),
+    ):
+        for _decision in _pipe.list_committee_decisions(_cf, _mid):
+            _r18_decisions_seen += 1
+            if _decision.outcome == "decline":
+                _r18_declines_seen += 1
+                if not _decision.adverse_reasons:
+                    _r18_census_gaps += 1
+                if any(
+                    r.code not in _R18_ADVERSE_CODES
+                    for r in _decision.adverse_reasons
+                ):
+                    _r18_census_gaps += 1
+                if (
+                    _decision.reason_vocabulary
+                    != "adverse-action-reasons-v1"
+                ):
+                    _r18_census_gaps += 1
+                _notice = _pipe.get_adverse_action_notice(_cf, _mid)
+                if "NOTICE OF ACTION TAKEN" not in _notice:
+                    _r18_census_gaps += 1
+            elif _decision.outcome == "defer":
+                if not _decision.deferral_reasons or any(
+                    c not in _R18_DEFERRAL_CODES
+                    for c in _decision.deferral_reasons
+                ):
+                    _r18_census_gaps += 1
+                if not _decision.representment_requirements:
+                    _r18_census_gaps += 1
+    print(f"adverse_decision_census_gaps: {_r18_census_gaps} over "
+          f"{_r18_decisions_seen} stored decisions "
+          f"({_r18_declines_seen} declines) (required 0)")
+    if _r18_census_gaps:
+        failures.append("a stored adverse decision lacks its coded record")
+
+    # -- Disagreement provenance, re-performed source by source
+    # over the round 8 fixture: every source traces to a document
+    # on the file (id and hash), carries complete provenance, and
+    # its deltas recompute from the record's own figures.
+    _r18_prov_gaps = 0
+    _r18_sources_seen = 0
+    _r18_sources_complete = 0
+    _r18_docs_by_id = {d.document_id: d for d in r8_file.documents}
+    for _record in r8_spread.disagreements:
+        _working = _record.source(_record.working_source_type)
+        if (
+            _working is None
+            or _working.value != _record.working_value
+            or _working.delta_abs != Decimal("0")
+            or _working.delta_rel != Decimal("0")
+        ):
+            _r18_prov_gaps += 1
+        for _source in _record.sources:
+            _r18_sources_seen += 1
+            _p = _source.provenance
+            _complete = bool(
+                _p.document_id == _source.document_id
+                and _p.page >= 1
+                and ((_p.line or "").strip() or (_p.cell or "").strip())
+            )
+            if _complete:
+                _r18_sources_complete += 1
+            else:
+                _r18_prov_gaps += 1
+            _doc = _r18_docs_by_id.get(_source.document_id)
+            if _doc is None or _doc.sha256 != _source.document_sha256:
+                _r18_prov_gaps += 1
+            if _source.delta_abs != abs(
+                _source.value - _record.working_value
+            ):
+                _r18_prov_gaps += 1
+            if _source.source_type != _record.working_source_type:
+                if _record.working_value != 0:
+                    if _source.delta_rel != (
+                        _source.delta_abs / abs(_record.working_value)
+                    ):
+                        _r18_prov_gaps += 1
+                elif _source.delta_rel is not None:
+                    _r18_prov_gaps += 1
+    _r18_prov_ratio = (
+        _r18_sources_complete / _r18_sources_seen
+        if _r18_sources_seen else 0.0
+    )
+    print(f"disagreement_provenance_completeness: "
+          f"{_r18_sources_complete}/{_r18_sources_seen} = "
+          f"{_r18_prov_ratio:.3f} (required 1.000)")
+    print(f"disagreement_provenance_gaps: {_r18_prov_gaps} "
+          f"(required 0)")
+    if _r18_prov_gaps or _r18_prov_ratio != 1.0:
+        failures.append("a disagreement source does not trace")
+
+    # -- The round 17 injection inside a document that carries a
+    # genuine disagreement: the FY2024 audited statement is one
+    # of the three witnesses on the contested lines. The note
+    # must be recorded, and the disagreement machinery must read
+    # exactly as it does on the clean run graded in round 8.
+    _x_pipe = CreditPipeline(
+        store=InMemoryCreditStore(), documents=LocalDocumentStore()
+    )
+    _x_docs = [
+        {
+            "kind": DocumentKind.FINANCIAL_STATEMENT.value,
+            "filename": f"hartline-fy{year}-statements.json",
+            "data_hex": (
+                _q_injected().hex() if year == 2024
+                else statement_document(year).hex()
+            ),
+            "period_label": f"FY{year}",
+        }
+        for year in (2022, 2023, 2024)
+    ]
+    _x_file = _x_pipe.open_application(
+        borrower, facility,
+        documents=_x_docs + hartline_disagreement_documents(),
+    )
+    _x_events = _x_pipe.store.list_quarantine_events(
+        _x_file.credit_file_id
+    )
+    _x_patterns = {e.pattern_id for e in _x_events}
+    _x_detection_wrong = 0
+    if not {
+        "override.ignore_previous", "dictation.report_as",
+        "conceal.do_not_report",
+    } <= _x_patterns:
+        _x_detection_wrong += 1
+    if _Q_PLANTED not in {f for e in _x_events for f in e.figures}:
+        _x_detection_wrong += 1
+    _x_spread = _x_pipe.get_spread(_x_file.credit_file_id)
+    _x_records = list(_x_spread.disagreements)
+    if not (
+        len(_x_records) == 7
+        and {d.line_key for d in _x_records if d.material}
+        == {"revenue", "cost_of_goods_sold", "gross_profit",
+            "ebit", "net_income"}
+        and {d.line_key for d in _x_records if not d.material}
+        == {"inventory", "total_current_assets"}
+    ):
+        _x_detection_wrong += 1
+    _x_pack = _x_pipe.compute_metrics(_x_file.credit_file_id)
+    _x_flagged = {
+        f.key for f in _x_pack.figures
+        if f.fiscal_year == 2024 and f.status == "computed"
+        and f.disagreement_ids
+    }
+    if _x_flagged != {
+        "gross_margin", "operating_margin",
+        "return_on_assets", "return_on_equity",
+    }:
+        _x_detection_wrong += 1
+    print(f"injection_disagreement_detection_wrong: "
+          f"{_x_detection_wrong} (required 0)")
+    if _x_detection_wrong:
+        failures.append("the injection disturbed disagreement detection")
+
+    _x_state_changes = 0
+    _x_revenue = next(
+        l for l in _x_spread.lines if l.key == "revenue"
+    )
+    if _x_revenue.values.get(2024) != Decimal("12374000"):
+        _x_state_changes += 1
+    _x_record = next(
+        d for d in _x_records if d.line_key == "revenue"
+    )
+    if {s.value for s in _x_record.sources} != {
+        Decimal("12374000"), Decimal("11905000"), Decimal("12410000")
+    }:
+        _x_state_changes += 1
+    _x_report = _x_pipe.evaluate_policy(
+        _x_file.credit_file_id, pack_version="v1",
+        as_of=date(2025, 6, 30),
+    )
+    _x_memo = _x_pipe.compose_memo(
+        _x_file.credit_file_id, report_id=_x_report.report_id
+    )
+    if sorted(_x_memo.verification.disagreements_expected) != sorted(
+        d.disagreement_id for d in _x_records if d.material
+    ):
+        _x_state_changes += 1
+    if _Q_PLANTED in {
+        v.value
+        for v in _x_pipe.store.get_extractions(_x_file.credit_file_id)
+    }:
+        _x_state_changes += 1
+    print(f"injection_disagreement_state_changes: "
+          f"{_x_state_changes} (required 0)")
+    if _x_state_changes:
+        failures.append("the injection changed a disagreement artefact")
 
     # --------------------------------------------------------------
     # Round 16: the Postgres production profile. Graded only when
