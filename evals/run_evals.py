@@ -504,6 +504,29 @@ Round 18 counters — eval depth: the lines themselves, walked.
                             unchanged, and the dictated figure
                             grounds nothing. REQUIRED: 0 / 0.
 
+Round 19 counters — portfolio views: the book, folded and
+re-performed.
+
+  portfolio_figure_         every figure of every section of
+    mismatches                the portfolio view over a
+                            four-file book, graded against
+                            hand-decided sums and counts — and
+                            the module's independent
+                            re-performance must agree.
+                            REQUIRED: 0.
+  portfolio_verifier_       a tampered exposure total, watch
+    misses                    count and rollup count must each
+                            be named by the re-performance,
+                            section by section. REQUIRED: 0.
+  portfolio_access_leaks    a preparer's view runs over their
+                            own book only — the file assigned
+                            elsewhere appears nowhere in it, not
+                            even in a count; the decisions
+                            section is withheld under the coded
+                            reason and the refusal is recorded;
+                            a malformed caller is refused by
+                            code. REQUIRED: 0.
+
 Later rounds add counters as their machinery lands.
 Exit code 0 = GATE: PASS.
 """
@@ -5276,6 +5299,428 @@ def main() -> int:
           f"{_x_state_changes} (required 0)")
     if _x_state_changes:
         failures.append("the injection changed a disagreement artefact")
+
+    # --------------------------------------------------------------
+    # Round 19: portfolio views. A four-file book: the seed
+    # Hartline file worked through intake, two bare applications,
+    # and one file saved directly with no artefacts yet. Reports,
+    # decisions and breach cases are saved as artefacts of
+    # record (their minting workflows are graded in their own
+    # rounds); every figure of every section is then graded
+    # against hand-decided sums and counts, the module's own
+    # re-performance must agree, a tampered view must be named,
+    # and the access counters grade the fold's discipline over
+    # a preparer's scoped book.
+    # --------------------------------------------------------------
+    from datetime import date as _r19_date
+
+    from commercial_credit.access import Caller as _R19Caller
+    from commercial_credit.access import (
+        visible_files as _r19_visible_files,
+    )
+    from commercial_credit.documents import (
+        LocalDocumentStore as _R19DocStore,
+    )
+    from commercial_credit.models import (
+        AdverseActionReason as _R19Reason,
+    )
+    from commercial_credit.models import Borrower as _R19Borrower
+    from commercial_credit.models import (
+        BorrowerSegment as _R19Segment,
+    )
+    from commercial_credit.models import BreachCase as _R19Breach
+    from commercial_credit.models import (
+        CommitteeDecision as _R19Decision,
+    )
+    from commercial_credit.models import CreditFile as _R19CreditFile
+    from commercial_credit.models import CreditMemo as _R19Memo
+    from commercial_credit.models import (
+        FacilityRequest as _R19Facility,
+    )
+    from commercial_credit.models import FacilityType as _R19FType
+    from commercial_credit.models import (
+        MemoVerification as _R19Verification,
+    )
+    from commercial_credit.models import PolicyReport as _R19Report
+    from commercial_credit.pipeline import (
+        CreditPipeline as _R19Pipeline,
+    )
+    from commercial_credit.portfolio import (
+        portfolio_view as _r19_portfolio_view,
+    )
+    from commercial_credit.portfolio import (
+        verify_portfolio_view as _r19_verify_view,
+    )
+    from commercial_credit.seed import (
+        ReferenceLosFeed as _R19Los,
+    )
+    from commercial_credit.seed import (
+        statement_document as _r19_statement,
+    )
+    from commercial_credit.store import (
+        InMemoryCreditStore as _R19Store,
+    )
+
+    _r19_as_of = _r19_date(2025, 6, 30)
+    _r19_pipe = _R19Pipeline(
+        store=_R19Store(), documents=_R19DocStore()
+    )
+    _r19_borrower, _r19_facility = _R19Los().fetch_application(
+        "LOS-2026-0117"
+    )
+    _r19_hartline = _r19_pipe.open_application(
+        _r19_borrower,
+        _r19_facility,
+        documents=[
+            {
+                "kind": "financial_statement",
+                "filename": f"hartline-fy{year}-statements.json",
+                "data_hex": _r19_statement(year).hex(),
+                "period_label": f"FY{year}",
+            }
+            for year in (2022, 2023, 2024)
+        ],
+    )
+
+    def _r19_bare(name, segment, amount, ein):
+        return _r19_pipe.open_application(
+            _R19Borrower(
+                legal_name=name, ein_last4=ein, segment=segment,
+                state_of_formation="OH", years_in_business=4,
+                primary_contact_name="Contact",
+                primary_contact_email="c@example.com",
+            ),
+            _R19Facility(
+                facility_type=_R19FType.TERM_LOAN,
+                amount=Decimal(amount), purpose="working capital",
+                term_months=36,
+            ),
+        )
+
+    _r19_retail = _r19_bare(
+        "Retail Row LLC", _R19Segment.RETAIL, "500000", "3333"
+    )
+    _r19_health = _r19_bare(
+        "Health Way LLC", _R19Segment.HEALTHCARE, "750000", "4444"
+    )
+    _r19_direct = _R19CreditFile(
+        credit_file_id="cf-r19-direct",
+        borrower=_R19Borrower(
+            legal_name="Estate Hold LLC", ein_last4="5555",
+            segment=_R19Segment.REAL_ESTATE,
+            state_of_formation="OH", years_in_business=6,
+            primary_contact_name="Contact",
+            primary_contact_email="c@example.com",
+        ),
+        facility=_R19Facility(
+            facility_type=_R19FType.TERM_LOAN,
+            amount=Decimal("250000"), purpose="acquisition",
+            term_months=36,
+        ),
+    )
+    _r19_pipe.store.save_credit_file(_r19_direct)
+    _r19_store = _r19_pipe.store
+    _r19_hid = _r19_hartline.credit_file_id
+
+    def _r19_report(fid, rid, summary):
+        return _R19Report(
+            report_id=rid, credit_file_id=fid,
+            policy_pack_id="policy-pack", policy_version="v1",
+            computation_pack_id="pack-1", as_of=_r19_as_of,
+            outcomes=[], summary=summary,
+        )
+
+    _r19_store.save_policy_report(_r19_report(
+        _r19_hid, "r19-h-pass",
+        {"pass": 8, "fail": 0, "not_evaluable": 0,
+         "blocker_failures": 0}))
+    _r19_store.save_policy_report(_r19_report(
+        _r19_hid, "r19-h-blocker",
+        {"pass": 6, "fail": 1, "not_evaluable": 0,
+         "blocker_failures": 1}))
+    _r19_store.save_policy_report(_r19_report(
+        _r19_retail.credit_file_id, "r19-r-fail",
+        {"pass": 6, "fail": 2, "not_evaluable": 0,
+         "blocker_failures": 0}))
+    _r19_store.save_policy_report(_r19_report(
+        _r19_health.credit_file_id, "r19-he-nfe",
+        {"pass": 5, "fail": 0, "not_evaluable": 3,
+         "blocker_failures": 0}))
+
+    def _r19_memo(fid, memo_id):
+        return _R19Memo(
+            memo_id=memo_id, credit_file_id=fid,
+            borrower_name="Borrower", facility_type="term_loan",
+            spread_id="spread-1", computation_pack_id="pack-1",
+            policy_pack_id="policy-pack", policy_version="v1",
+            policy_report_id="policy-1", as_of=_r19_as_of,
+            composer_profile="offline",
+            verification=_R19Verification(
+                composer_profile="offline", figure_count=0),
+        )
+
+    def _r19_decision(fid, memo_id, did, outcome, **kw):
+        return _R19Decision(
+            decision_id=did, credit_file_id=fid, memo_id=memo_id,
+            outcome=outcome, quorum_required=3, members=[],
+            recorded_by="officer-1",
+            recorded_by_role="credit_officer", **kw)
+
+    for _fid, _mid in ((_r19_hid, "r19-memo-a"),
+                       (_r19_hid, "r19-memo-b"),
+                       ("cf-r19-direct", "r19-memo-c"),
+                       (_r19_retail.credit_file_id, "r19-memo-d")):
+        _r19_store.save_memo(_r19_memo(_fid, _mid))
+    _r19_store.save_committee_decision(_r19_decision(
+        _r19_hid, "r19-memo-a", "r19-dec-a1", "defer",
+        deferral_reasons=["awaiting_required_documents"],
+        representment_requirements=["documents"]))
+    _r19_store.save_committee_decision(_r19_decision(
+        _r19_hid, "r19-memo-a", "r19-dec-a2", "approve"))
+    _r19_store.save_committee_decision(_r19_decision(
+        _r19_hid, "r19-memo-b", "r19-dec-b", "decline",
+        adverse_reasons=[
+            _R19Reason(code="debt_service_coverage_below_policy",
+                       tie_kind="file_fact", checklist_item_id="chk-01"),
+            _R19Reason(code="leverage_above_policy_limit",
+                       tie_kind="file_fact", checklist_item_id="chk-02"),
+        ]))
+    _r19_store.save_committee_decision(_r19_decision(
+        "cf-r19-direct", "r19-memo-c", "r19-dec-c", "defer",
+        deferral_reasons=["awaiting_appraisal_or_valuation"],
+        representment_requirements=["appraisal"]))
+    _r19_store.save_committee_decision(_r19_decision(
+        _r19_retail.credit_file_id, "r19-memo-d", "r19-dec-d",
+        "decline",
+        adverse_reasons=[
+            _R19Reason(code="debt_service_coverage_below_policy",
+                       tie_kind="file_fact", checklist_item_id="chk-01"),
+        ]))
+
+    def _r19_breach(fid, bid, borrower, *, state, test, cure):
+        return _R19Breach(
+            breach_id=bid, credit_file_id=fid,
+            borrower_name=borrower, set_id="set-1",
+            covenant_id="cov-1", covenant_version=1,
+            covenant_name="Maximum leverage", metric_key="leverage",
+            operator="<=", threshold=Decimal("2.00"),
+            test_result_id=f"result-{bid}", instance_id=f"inst-{bid}",
+            test_date=test, period_label="Q1", cure_deadline=cure,
+            state=state)
+
+    _r19_store.save_breach_case(_r19_breach(
+        _r19_hid, "r19-br-overdue", "Hartline", state="open",
+        test=_r19_date(2025, 3, 31), cure=_r19_date(2025, 5, 30)))
+    _r19_store.save_breach_case(_r19_breach(
+        _r19_retail.credit_file_id, "r19-br-later", "Retail Row",
+        state="open", test=_r19_date(2025, 6, 1),
+        cure=_r19_date(2025, 7, 1)))
+    _r19_store.save_breach_case(_r19_breach(
+        _r19_hid, "r19-br-cured", "Hartline", state="cured",
+        test=_r19_date(2025, 1, 31), cure=_r19_date(2025, 3, 2)))
+
+    _r19_system = _R19Caller(caller_id="system", role="system")
+    _r19_files = _r19_visible_files(
+        _r19_system, _r19_store.list_credit_files()
+    )
+    _r19_view = _r19_portfolio_view(
+        _r19_pipe, _r19_files, caller=_r19_system, as_of=_r19_as_of
+    )
+    _r19_sections = _r19_view["sections"]
+    _r19_wrong = 0
+
+    def _r19_expect(label, got, want):
+        nonlocal _r19_wrong
+        if got != want:
+            _r19_wrong += 1
+            print(f"  portfolio case {label}: read {got!r}, "
+                  f"hand-decided {want!r}")
+
+    _r19_expect("files in scope", _r19_view["files_in_scope"], 4)
+    _r19_seg = {
+        r["segment"]: r
+        for r in _r19_sections["exposure_by_segment"]["by_segment"]
+    }
+    _r19_expect(
+        "manufacturing exposure",
+        _r19_seg["manufacturing"]["facility_amount"], "1500000")
+    _r19_expect(
+        "segment total",
+        _r19_sections["exposure_by_segment"]["total"],
+        {"files": 4, "facility_amount": "3000000"})
+    _r19_buckets = {
+        r["outcome"]: r
+        for r in _r19_sections["exposure_by_policy_outcome"][
+            "by_outcome"]
+    }
+    _r19_expect("blocker bucket", _r19_buckets["blocker_fail"],
+                {"outcome": "blocker_fail", "files": 1,
+                 "facility_amount": "1500000"})
+    _r19_expect("fail bucket files", _r19_buckets["fail"]["files"], 1)
+    _r19_expect("nfe bucket files",
+                _r19_buckets["not_fully_evaluable"]["files"], 1)
+    _r19_expect("not evaluated bucket",
+                _r19_buckets["not_evaluated"],
+                {"outcome": "not_evaluated", "files": 1,
+                 "facility_amount": "250000"})
+    _r19_expect("pass bucket files", _r19_buckets["pass"]["files"], 0)
+    _r19_watch = _r19_sections["covenant_watch"]
+    _r19_expect(
+        "watch order",
+        [c["breach_id"] for c in _r19_watch["open"]],
+        ["r19-br-overdue", "r19-br-later"])
+    _r19_expect("watch overdue", _r19_watch["overdue_count"], 1)
+    _r19_expect(
+        "watch overdue days",
+        _r19_watch["open"][0]["days_to_cure_deadline"], -31)
+    _r19_expect(
+        "watch by state",
+        {r["state"]: r["cases"] for r in _r19_watch["by_state"]},
+        {"cured": 1, "open": 2})
+    _r19_census = _r19_sections["staleness_census"]
+    _r19_expect("census ready", _r19_census["ready_files"], 1)
+    _r19_expect("census blocked", _r19_census["blocked_files"], 3)
+    _r19_expect(
+        "census not computable",
+        _r19_census["not_computable_files"], 0)
+    _r19_expect(
+        "census occurrences",
+        sum(r["occurrences"]
+            for r in _r19_census["blockers_by_input"]),
+        sum(len(r["blockers"]) for r in _r19_census["blocked"]))
+    _r19_rollup = _r19_sections["adverse_rollup"]
+    _r19_expect("rollup decided", _r19_rollup["decided_memos"], 4)
+    _r19_expect(
+        "rollup outcomes",
+        {r["outcome"]: r["decisions"]
+         for r in _r19_rollup["by_outcome"]},
+        {"approve": 1, "approve_with_conditions": 0,
+         "decline": 2, "defer": 1})
+    _r19_expect(
+        "rollup decline codes",
+        _r19_rollup["declines_by_reason_code"],
+        [{"code": "debt_service_coverage_below_policy",
+          "decisions": 2},
+         {"code": "leverage_above_policy_limit", "decisions": 1}])
+    _r19_expect(
+        "rollup deferral codes",
+        _r19_rollup["deferrals_by_reason_code"],
+        [{"code": "awaiting_appraisal_or_valuation",
+          "decisions": 1}])
+    _r19_problems = _r19_verify_view(
+        _r19_view, _r19_pipe, _r19_files, caller=_r19_system,
+        as_of=_r19_as_of,
+    )
+    _r19_wrong += len(_r19_problems)
+    for _problem in _r19_problems:
+        print(f"  portfolio re-performance: {_problem}")
+    print(f"portfolio_figure_mismatches: {_r19_wrong} (required 0)")
+    if _r19_wrong:
+        failures.append("portfolio figures diverge from the "
+                        "hand-decided book or the re-performance")
+
+    # The verifier must name a tampered figure, section by section.
+    import copy as _r19_copy
+
+    _r19_misses = 0
+    for _section, _mutate in (
+        ("exposure_by_segment",
+         lambda s: s["total"].update(facility_amount="1")),
+        ("covenant_watch", lambda s: s.update(open_count=0)),
+        ("adverse_rollup", lambda s: s.update(decided_memos=0)),
+    ):
+        _tampered = _r19_copy.deepcopy(_r19_view)
+        _mutate(_tampered["sections"][_section])
+        _named = _r19_verify_view(
+            _tampered, _r19_pipe, _r19_files, caller=_r19_system,
+            as_of=_r19_as_of,
+        )
+        if not any(_section in p for p in _named):
+            _r19_misses += 1
+    print(f"portfolio_verifier_misses: {_r19_misses} (required 0)")
+    if _r19_misses:
+        failures.append("the portfolio verifier let a tampered "
+                        "figure stand")
+
+    # Access: the preparer's book excludes the file assigned
+    # elsewhere; nothing of it may appear anywhere in their
+    # view, and the decisions section is withheld.
+    _r19_pipe.assign_file(
+        _r19_hid, actor="officer-1", actor_role="credit_officer",
+        assignee="someone-else")
+    _r19_pipe.assign_file(
+        _r19_retail.credit_file_id, actor="officer-1",
+        actor_role="credit_officer", assignee="preparer-1")
+    _r19_preparer = _R19Caller(
+        caller_id="preparer-1", role="analyst_preparer")
+    _r19_pfiles = _r19_visible_files(
+        _r19_preparer, _r19_store.list_credit_files()
+    )
+    _r19_pview = _r19_portfolio_view(
+        _r19_pipe, _r19_pfiles, caller=_r19_preparer,
+        as_of=_r19_as_of,
+    )
+    _r19_leaks = 0
+    if _r19_pview["files_in_scope"] != 3:
+        _r19_leaks += 1
+    if _r19_hid in json.dumps(_r19_pview):
+        _r19_leaks += 1
+    if "manufacturing" in json.dumps(
+        _r19_pview["sections"]["exposure_by_segment"]
+    ):
+        _r19_leaks += 1
+    if _r19_pview["sections"]["adverse_rollup"] != {
+        "withheld": True, "family": "decisions",
+        "reason_code": "role_not_permitted",
+    }:
+        _r19_leaks += 1
+    if _r19_verify_view(
+        _r19_pview, _r19_pipe, _r19_pfiles, caller=_r19_preparer,
+        as_of=_r19_as_of,
+    ):
+        _r19_leaks += 1
+    # The served surface: the same view over HTTP, the refusal
+    # recorded, a malformed caller refused by code.
+    from fastapi.testclient import TestClient as _R19Client
+
+    from commercial_credit import api as _r19_api
+
+    _r19_old_pipeline, _r19_old_store = (
+        _r19_api.pipeline, _r19_api.store)
+    _r19_api.pipeline = _r19_pipe
+    _r19_api.store = _r19_store
+    try:
+        _r19_client = _R19Client(_r19_api.app)
+        _r19_resp = _r19_client.get(
+            "/portfolio", params={"as_of": "2025-06-30"},
+            headers={"x-caller": "preparer-1",
+                     "x-caller-role": "analyst_preparer"})
+        if _r19_resp.status_code != 200 or _r19_resp.json()[
+            "files_in_scope"
+        ] != 3:
+            _r19_leaks += 1
+        _r19_denials = [
+            d for d in _r19_store.list_denials()
+            if d.family == "decisions" and d.credit_file_id is None
+        ]
+        if len(_r19_denials) != 1 or _r19_denials[0].reason_code != (
+            "role_not_permitted"
+        ):
+            _r19_leaks += 1
+        _r19_resp = _r19_client.get(
+            "/portfolio", params={"as_of": "2025-06-30"},
+            headers={"x-caller": "x", "x-caller-role": "superuser"})
+        if _r19_resp.status_code != 403 or _r19_resp.json().get(
+            "code"
+        ) != "unknown_role":
+            _r19_leaks += 1
+    finally:
+        _r19_api.pipeline = _r19_old_pipeline
+        _r19_api.store = _r19_old_store
+    print(f"portfolio_access_leaks: {_r19_leaks} (required 0)")
+    if _r19_leaks:
+        failures.append("the portfolio view leaked past the "
+                        "access policy")
 
     # --------------------------------------------------------------
     # Round 16: the Postgres production profile. Graded only when
