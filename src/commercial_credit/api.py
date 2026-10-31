@@ -284,7 +284,7 @@ class RegisterDocumentRequest(BaseModel):
 
 app = FastAPI(
     title="Trida AI Blueprint — Commercial Credit Memo & Covenant Monitoring Agent",
-    version="0.1.0",
+    version="1.0.0",
 )
 
 
