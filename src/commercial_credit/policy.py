@@ -582,7 +582,8 @@ def _eval_concentration(
     outcome.operator = "<="
     outcome.threshold = test.limit
     amount = credit_file.facility.amount
-    share = (amount / pack.capital_base).quantize(
+    exact_share = amount / pack.capital_base
+    share = exact_share.quantize(
         _RATIO_PLACES, rounding=ROUND_HALF_UP
     )
     outcome.values_read = [
@@ -602,12 +603,22 @@ def _eval_concentration(
             source="facility amount / stated capital base",
         ),
     ]
-    passed = share <= test.limit
+    # The limit is judged on the exact share, never on the
+    # rounded display figure: rounding first would wave through
+    # every facility whose true share exceeds the limit by less
+    # than half a display quantum (at the stated capital base,
+    # amounts up to $25,012,499 against the 10% limit).
+    passed = exact_share <= test.limit
     outcome.outcome = "pass" if passed else "fail"
     outcome.detail = (
         f"The facility is {share} of the stated capital base "
         f"({pack.capital_base}), against a limit of {test.limit}."
     )
+    if exact_share != share:
+        outcome.detail += (
+            f" The unrounded share is {exact_share}; the limit "
+            f"is judged on the unrounded figure."
+        )
     return outcome
 
 
