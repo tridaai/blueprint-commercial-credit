@@ -875,6 +875,59 @@ next request, not at some cache's leisure. Every refusal is
 recorded twice: the `access_denials` list (itself a guarded
 audit-family read) and the file's own audit trail.
 
+## Portfolio views (round 19)
+
+One aggregate surface (`GET /portfolio?as_of=`, builders in
+`portfolio.py`) reads the book whole, in the console's
+discipline: computed fresh from the artefacts of record on
+each request, stored nowhere, and re-performed by an
+independent walk (`verify_portfolio_view`) that rebuilds
+every figure from the raw store lists — ageing derived from
+the breach models themselves, readiness folded from the
+reports' own entries — and names any section that disagrees.
+
+Five sections, each governed by one artefact family declared
+in `portfolio.SECTIONS` as data: exposure by segment (files)
+— facility amounts summed in Decimal, carried as strings;
+exposure by policy outcome (policy) — each file classified
+by its standing report, the last one saved (list order is
+save order in both stores), the bucket read from the report's
+own summary with blocker failures outranking failures and
+failures outranking not-evaluables, and a file with no report
+named `not_evaluated`; the covenant watch (breach_cases) —
+open cases ordered by cure deadline (the breach list's
+test-date order is a work queue; the watch is a clock), with
+the overdue count and a by-state census over every case in
+scope; the staleness census (files — readiness rides the
+files family on its own routes) — readiness computed fresh
+per file at the as-of date, blocked files named with their
+blocker entries, files whose readiness cannot compute yet
+named in their own bucket, and a blockers-by-input histogram
+carrying both file counts and occurrence counts; and the
+adverse rollup (decisions) — each memo's latest decision
+counted once under its outcome, declines and deferrals
+grouped by their round 7 coded vocabularies.
+
+**Access is the round 17 policy applied at the fold.** The
+handler scope-filters with `visible_files` and hands the
+builder ONLY the visible book: a file the caller may not see
+contributes nothing — not to a total, not to a count, not
+even to `files_in_scope` — so existence hiding holds for
+aggregates by construction rather than by post-filtering
+(which is why the console queue's compute-then-filter shape
+is not reused here). A section whose family the caller's
+role does not hold is withheld in place under the coded
+reason `role_not_permitted`, and the handler records one
+denial per withheld section (no file in scope, so the denial
+lands in the `access_denials` list only). The view states its
+discipline on its face: the access policy version, the
+caller's scope (`whole_book` or `assigned`) and role, and the
+count of files it ran over. The one whole-book-only aggregate
+that predates this round — the model-cost daily rollup —
+keeps its stricter `_guard_global` posture; the portfolio
+view is a list-shaped surface and follows the list surfaces'
+scope-filter discipline instead.
+
 ## Storage
 
 PostgreSQL is the deployment store. `migrations/` holds numbered SQL

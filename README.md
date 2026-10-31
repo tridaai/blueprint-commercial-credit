@@ -1049,6 +1049,49 @@ fixes the one real defect the deeper grading exposed.
   memo's disagreement record are unchanged, and the dictated
   figure grounds nothing.
 
+## What round 19 adds
+
+**Portfolio views**: the book, read whole. Until this round
+every surface read one file at a time or listed one artefact
+kind across files; nothing summed a dollar or counted an
+outcome across the book. `GET /portfolio?as_of=` serves one
+aggregate view, computed fresh from the artefacts of record,
+in five sections:
+
+- **Exposure by segment** — facility amounts summed over the
+  book by borrower segment, with the book total.
+- **Exposure by policy outcome** — the same book classified by
+  each file's standing policy report (the last one saved),
+  read from the report's own summary: pass, fail, blocker
+  failure, not fully evaluable, or — named, never folded into
+  pass — not evaluated.
+- **Covenant watch** — the book's open breach cases ordered
+  by the cure clock rather than failure date, the overdue
+  count stated, and every case in scope censused by state.
+- **Staleness census** — the book's committee-readiness at
+  the as-of date: ready files counted, blocked files named
+  with the exact blocker inputs the readiness report carries,
+  files whose readiness cannot compute yet named as such, and
+  the blockers histogrammed by input across the book.
+- **Adverse rollup** — each memo's latest committee decision
+  across the book: counts by outcome, declines grouped by
+  their coded ECOA reason, deferrals by their coded reason —
+  a superseded deferral counts as what it became, not twice.
+
+Every figure is re-performed by an independent walk
+(`verify_portfolio_view`): the eval gate grades the view
+against a hand-decided book, requires the re-performance to
+agree, and requires it to name tampered figures section by
+section. Round 17's access policy governs the whole view: the
+builder runs over the caller's visible book only, so a file
+the caller may not see contributes nothing — not to a total,
+not to a count, not even to the file count; each section is
+gated by its artefact family, and a section whose family the
+role does not hold (decisions, for an analyst preparer) is
+withheld in place under the coded reason, with the refusal
+recorded in the denial list. The view states its scope, the
+caller's role and the policy version on its face.
+
 ## The laws (enforced in code, never in prompts)
 
 1. **No model-computed numbers.** Extraction returns values +
@@ -1130,6 +1173,15 @@ fixes the one real defect the deeper grading exposed.
   their exact limits; a deployment that retunes a pack's
   numbers inherits the boundary method, not the boundary
   fixtures — the graded values are the shipped packs' own.
+- Round 19's portfolio views are read models, computed fresh
+  per request over the artefacts of record and stored
+  nowhere; they inherit round 17's application-level access
+  policy, including its boundary — the caller headers are
+  the deployment's to assert, behind its own authentication.
+  A file's standing policy report is the last one saved,
+  which is the store's list order in both profiles; a
+  deployment that needs as-of-pinned portfolio history would
+  pin it explicitly rather than read the standing view.
 - The sample borrower book is generated for this blueprint, with
   figures known by construction so extraction can be graded against
   ground truth; that is the repo's one data note.
