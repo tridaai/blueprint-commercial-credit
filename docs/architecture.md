@@ -3,16 +3,16 @@
 ## Shape
 
 ```
-LOS ──► intake ──► checklist ──► document intake ──► extraction ──► spreading ──► computation ──► [later rounds:
+LOS ──► intake ──► checklist ──► document intake ──► extraction ──► spreading ──► computation ──► [rounds 4–12:
         (LangGraph pipeline)        (S3 port,          (port: values    (template,     (engine:        policy → memo →
                                      SHA-256 recorded)   + provenance)   adjustments)   ratios, DSCR,   officer gate →
                                                                                        global CF)      committee gate →
                                                                                                        covenant loop]
 ```
 
-The pipeline is a LangGraph graph (`pipeline.py`). Rounds 1–3 wire
-the first six nodes end to end; later rounds extend the graph to the
-right, with the two human gates as graph interrupts. The same
+The pipeline is a LangGraph graph (`pipeline.py`). Rounds 1–3 wired
+the first six nodes end to end; rounds 4–12 extended the graph to
+the right, with the two human gates as graph interrupts. The same
 compiled graph serves the API, the demo and the evals — there is one
 spine, not three near-copies.
 
@@ -151,7 +151,7 @@ intake; `CreditPipeline.evaluate_policy` pins a version explicitly
 and appends a `PolicyHistoryEntry` (pack, version, report id,
 as-of) to the credit file the first time those inputs are seen.
 The memo (round 5) quotes the report and its pinned version;
-the gates (rounds 6–7) will read blocker failures from it.
+the gates (rounds 6–7) read blocker failures from it.
 
 ## Memo drafting and the figure verifier (round 5)
 
@@ -965,14 +965,16 @@ R11 covenant re-spreading + breach cases · R12 annual review packs ·
 R13 risk-rating scorecard support · R14 officer console · R15 model
 gateway profiles + cost ledger · R16 Postgres profile + prod smoke ·
 R17 injection defences + retrieval ACLs · R18 eval depth · R19
-portfolio views · R20 release hardening.
+portfolio views · R20 release hardening. All twenty rounds are
+shipped; R20 froze the tree as version 1.0.0 (see
+`docs/release-1.0.0.md`).
 
 ## What a production deploy still needs
 
 Real LOS/core integration behind the ports, a document-AI key for
 the extraction adapter, SSO in front of the API, TLS on every hop,
 secrets from a manager rather than the environment, and the bank's
-own model-risk governance (SR 11-7 style) around the scorecard the
-later rounds assemble inputs for. The blueprint's subject is the
+own model-risk governance (SR 11-7 style) around the scorecard
+(round 13). The blueprint's subject is the
 deterministic control structure around the model; those controls
 are what is tested here.

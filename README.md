@@ -14,8 +14,7 @@ schedule from fresh financials instead of stale ones.
 This blueprint builds that pipeline under one rule the whole design
 hangs on: **the model never computes a number.** Every figure is
 either read from a borrower document with a pointer to its page and
-line, or — in later rounds — computed in code from figures that
-were. The agent assembles, drafts and monitors; **the credit officer
+line, or computed in code from figures that were. The agent assembles, drafts and monitors; **the credit officer
 and the credit committee decide.** Nothing in this system approves
 credit.
 
@@ -140,7 +139,7 @@ officer will ever quote, computed in code from the spread:
   cash-flow page, so its EBITDA and cash-flow figures say exactly
   that, naming depreciation & amortisation as the missing input.
 
-Later rounds add the versioned policy pack, cited memo drafting
+Later rounds added the versioned policy pack, cited memo drafting
 with a figure verifier, the credit-officer and committee gates with
 coded adverse-action reasons, and the covenant monitoring loop. The
 round map is in `docs/architecture.md`.
@@ -180,7 +179,7 @@ run against every credit file the pipeline opens:
   report stays on the record, untouched, because a policy change
   never silently re-judges an in-flight credit.
 
-Later rounds add cited memo drafting with a figure verifier, the
+Later rounds added cited memo drafting with a figure verifier, the
 credit-officer and committee gates with coded adverse-action
 reasons, and the covenant monitoring loop.
 
@@ -227,7 +226,7 @@ draft may exist at all:
   handling lands. Whichever profile drafts, the verifier — not
   the drafter — decides whether the memo may be stored.
 
-Later rounds add the committee gate with coded adverse-action
+Later rounds added the committee gate with coded adverse-action
 reasons, and the covenant monitoring loop.
 
 ## What round 6 adds
@@ -305,7 +304,7 @@ codes tied to evidence (design law 3):
   A covenant's threshold must trace into the memo's pinned
   artefacts through the same trace universe the figure verifier
   uses, and the trace is recorded on the condition — an invented
-  threshold refuses the whole decision. Round 10 will schedule
+  threshold refuses the whole decision. Round 10 schedules
   these as covenants; this round records them.
 - **Declines carry coded reasons, tied or refused (law 3)** —
   every adverse-action reason is a code from the versioned
@@ -339,7 +338,7 @@ codes tied to evidence (design law 3):
   committee_approved_conditional | declined | deferred.
 
 Round 9 gates this transition on committee readiness (below);
-later rounds add the covenant monitoring loop that schedules
+rounds 10–12 added the covenant monitoring loop that schedules
 round 7's conditions.
 
 ## What round 8 adds
@@ -1092,6 +1091,29 @@ withheld in place under the coded reason, with the refusal
 recorded in the denial list. The view states its scope, the
 caller's role and the policy version on its face.
 
+## What round 20 adds
+
+**Release hardening**: the twenty-round build frozen as version
+1.0.0. No new machinery — the round sets the version (package
+metadata, the package `__version__`, the API's stated version, and
+the lockfile root entry), writes `CHANGELOG.md` (one entry per
+round, from the record) and `docs/release-1.0.0.md` (what a
+deployer gets, the freeze figures, the honest limits, and what a
+deployment still has to do), and sweeps this README and the
+architecture notes for claims that no longer matched the release
+state — early round sections that promised as future work what
+later rounds shipped now say so in the past tense, and the
+architecture round map closes at the shipped state. Every gate
+was re-run on the finished tree: the full test suite with the
+Postgres parity profile live, the eval gate including its
+Postgres legs, the demo, and the production smoke. The exact
+figures are recorded in the release notes.
+
+The work-in-progress notice at the top of this README stays: the
+automated gates are green, but hands-on developer testing and the
+companion blog post are still outstanding, and the notice comes
+off when both are done — not before.
+
 ## The laws (enforced in code, never in prompts)
 
 1. **No model-computed numbers.** Extraction returns values +
@@ -1134,6 +1156,14 @@ caller's role and the policy version on its face.
 
 ## Honest status
 
+- The twenty-round build is complete and frozen as version
+  1.0.0 (round 20): every gate re-run green on the release
+  tree — the full suite on both store profiles, the eval gate
+  with its Postgres legs, the demo and the production smoke.
+  `CHANGELOG.md` carries the round-by-round account and
+  `docs/release-1.0.0.md` the release notes. The
+  work-in-progress notice above stays until hands-on
+  developer testing and the companion blog post are done.
 - The Postgres profile is live-verified as of round 16: the
   full suite runs against Postgres with outcome parity, the
   migrations are graded on a real empty database, and the
