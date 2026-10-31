@@ -648,3 +648,113 @@ def test_api_convene_refusal_names_blockers_in_the_422(client):
     assert "committee-ready" in detail
     assert "chk-03" in detail and "Business tax returns" in detail
     assert "readiness-" in detail
+
+
+# ---------------------------------------------------------------------
+# Round 18: staleness edges — a document is fresh at exactly its
+# limit in complete calendar months and stale one month past it,
+# and a file with exactly one stale input among fresh ones is
+# blocked by that input alone.
+# ---------------------------------------------------------------------
+
+
+def _set_received(pipeline, cf, kind, received: datetime):
+    stored = pipeline.store.get_credit_file(cf)
+    doc = next(d for d in stored.documents if d.kind == kind)
+    doc.received_at = received
+    pipeline.store.save_credit_file(stored)
+
+
+def test_insurance_certificate_is_fresh_at_its_limit_and_stale_one_month_past():
+    # The readiness policy's receipt-age limit for an insurance
+    # certificate is 12 complete calendar months.
+    pipeline = hartline_pipeline()
+    credit_file, draft, final = officer_final(pipeline)
+    cf, fid = credit_file.credit_file_id, final.memo_id
+    _set_received(
+        pipeline, cf, DocumentKind.INSURANCE_CERTIFICATE,
+        datetime(2025, 6, 30, tzinfo=timezone.utc),
+    )
+    at_limit = pipeline.compute_readiness(
+        cf, memo_id=fid, as_of=date(2026, 6, 30)
+    )
+    insurance = entries_by_key(at_limit)["chk-08"]
+    assert insurance.age_months == 12 and insurance.limit_months == 12
+    assert insurance.state == "present_fresh" and not insurance.blocker
+    assert at_limit.ready
+
+    _set_received(
+        pipeline, cf, DocumentKind.INSURANCE_CERTIFICATE,
+        datetime(2025, 5, 30, tzinfo=timezone.utc),
+    )
+    past_limit = pipeline.compute_readiness(
+        cf, memo_id=fid, as_of=date(2026, 6, 30)
+    )
+    insurance = entries_by_key(past_limit)["chk-08"]
+    assert insurance.age_months == 13
+    assert insurance.state == "present_stale" and insurance.blocker
+    assert not past_limit.ready
+
+
+def test_statement_age_edge_in_readiness():
+    # Statements age by fiscal period against the pinned pack:
+    # FY2025 year-end is exactly 18 complete months old at
+    # 2027-07-01 (the v1 limit — fresh) and 19 at 2027-07-31.
+    pipeline = hartline_pipeline()
+    credit_file, draft, final = officer_final(pipeline)
+    cf, fid = credit_file.credit_file_id, final.memo_id
+    at_limit = pipeline.compute_readiness(
+        cf, memo_id=fid, as_of=date(2027, 7, 1)
+    )
+    statements = entries_by_key(at_limit)["chk-01"]
+    assert statements.age_months == 18 and statements.limit_months == 18
+    assert statements.state == "present_fresh" and not statements.blocker
+    past_limit = pipeline.compute_readiness(
+        cf, memo_id=fid, as_of=date(2027, 7, 31)
+    )
+    statements = entries_by_key(past_limit)["chk-01"]
+    assert statements.age_months == 19
+    assert statements.state == "present_stale" and statements.blocker
+
+
+def test_one_stale_input_among_fresh_ones_blocks_the_convene_by_itself():
+    pipeline = hartline_pipeline()
+    credit_file, draft, final = officer_final(pipeline)
+    cf, fid = credit_file.credit_file_id, final.memo_id
+    _set_received(
+        pipeline, cf, DocumentKind.INSURANCE_CERTIFICATE,
+        datetime(2025, 5, 30, tzinfo=timezone.utc),
+    )
+    report = pipeline.compute_readiness(
+        cf, memo_id=fid, as_of=date(2026, 6, 30)
+    )
+    assert report.blocker_count == 1
+    blocker = report.blockers[0]
+    assert blocker.input_key == "chk-08" and "Insurance" in blocker.label
+    with pytest.raises(ValidationError, match="Insurance"):
+        pipeline.convene_committee(
+            cf, fid, actor=OFFICER, actor_role=OFFICER_ROLE,
+            as_of=date(2026, 6, 30),
+        )
+    # Refreshing that one input — and nothing else — clears it.
+    stored = pipeline.store.get_credit_file(cf)
+    doc = register_document(
+        pipeline.store, pipeline.documents, stored,
+        kind=DocumentKind.INSURANCE_CERTIFICATE,
+        filename="insurance-certificate-2026.json",
+        data=json.dumps({}).encode(),
+    )
+    stored = pipeline.store.get_credit_file(cf)
+    stored.document(doc.document_id).received_at = datetime(
+        2026, 6, 1, tzinfo=timezone.utc
+    )
+    pipeline.store.save_credit_file(stored)
+    refreshed = pipeline.compute_readiness(
+        cf, memo_id=fid, as_of=date(2026, 6, 30)
+    )
+    assert refreshed.ready
+    convened = pipeline.convene_committee(
+        cf, fid, actor=OFFICER, actor_role=OFFICER_ROLE,
+        as_of=date(2026, 6, 30),
+    )
+    assert convened.status == "in_committee"

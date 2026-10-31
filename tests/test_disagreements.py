@@ -797,3 +797,42 @@ def test_api_disagreements_list_detail_and_spread_flags(client):
     }
     assert figures[("gross_margin", 2024)]["disagreement_ids"]
     assert figures[("current_ratio", 2024)]["disagreement_ids"] == []
+
+
+# ---------------------------------------------------------------------
+# Round 18: disagreement provenance completeness — every source
+# in every record traces to a document on the file (id AND hash),
+# carries complete provenance, and its deltas recompute.
+# ---------------------------------------------------------------------
+
+
+def test_every_disagreement_source_traces_to_its_document():
+    pipeline, credit_file = hartline_pipeline()
+    spread, by_key = hartline_disagreements(pipeline, credit_file)
+    assert len(by_key) == 7
+    documents = {d.document_id: d for d in credit_file.documents}
+    for record in spread.disagreements:
+        working = record.source(record.working_source_type)
+        assert working is not None
+        assert working.value == record.working_value
+        assert working.delta_abs == D("0") and working.delta_rel == D("0")
+        for source in record.sources:
+            provenance = source.provenance
+            assert provenance.document_id == source.document_id
+            assert provenance.page >= 1
+            assert (provenance.line or "").strip() or (
+                provenance.cell or ""
+            ).strip()
+            document = documents[source.document_id]
+            assert source.document_sha256 == document.sha256
+            assert source.delta_abs == abs(
+                source.value - record.working_value
+            )
+            if source.source_type == record.working_source_type:
+                continue
+            if record.working_value != 0:
+                assert source.delta_rel == (
+                    source.delta_abs / abs(record.working_value)
+                )
+            else:
+                assert source.delta_rel is None

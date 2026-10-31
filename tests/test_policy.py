@@ -775,3 +775,244 @@ def test_api_evaluates_under_a_pinned_version_and_serves_reports(client):
         json={"pack_version": "v9"},
     )
     assert bad.status_code == 404
+
+
+# ---------------------------------------------------------------------
+# Round 18: threshold boundaries — exactly at the limit, and one
+# figure quantum (0.0001) either side. Every expectation below is
+# hand-decided from the pack's stated floors and ceilings.
+# ---------------------------------------------------------------------
+
+
+def _boundary_pack(*, ebit, da="0", interest="40000", prior_cpltd="60000",
+                   capex="0", liab="0", equity="1000000",
+                   credit_file_id="cf-boundary"):
+    """Debt service is 60,000 prior CPLTD + 40,000 interest
+    = 100,000 unless overridden, so DSCR = (ebit + da) / 100,000
+    and FCCR = (ebit + da − capex) / 100,000 exactly."""
+    figures = {
+        2023: {"current_portion_ltd": prior_cpltd},
+        2024: {
+            "ebit": ebit,
+            "depreciation_and_amortization": da,
+            "interest_expense": interest,
+            "current_portion_ltd": "60000",
+            "capital_expenditures": capex,
+            "total_liabilities": liab,
+            "total_equity": equity,
+        },
+    }
+    spread, extractions = build_fixture_spread(
+        credit_file_id, "bnddoc", figures
+    )
+    return compute_entity_pack(
+        credit_file_id=credit_file_id,
+        entity="Fixture Borrower, LLC",
+        spread=spread,
+        extractions=extractions,
+    )
+
+
+def _boundary_outcome(test_id, **pack_kw):
+    pack = _boundary_pack(**pack_kw)
+    report = evaluate_policy(
+        make_file(), pack, policy_version="v1", as_of=AS_OF
+    )
+    return report.outcome(test_id)
+
+
+def test_dscr_exactly_at_the_floor_passes_and_one_quantum_below_fails():
+    # EBITDA 125,000 / debt service 100,000 = 1.2500, the v1 floor.
+    at = _boundary_outcome("min_dscr", ebit="125000")
+    assert at.outcome == "pass" and at.threshold == D("1.25")
+    # EBITDA 124,990 / 100,000 = 1.2499 — one quantum under.
+    below = _boundary_outcome("min_dscr", ebit="124990")
+    assert below.outcome == "fail" and below.severity == "blocker"
+    above = _boundary_outcome("min_dscr", ebit="125010")
+    assert above.outcome == "pass"
+
+
+def test_leverage_exactly_at_the_segment_ceiling_passes():
+    # Manufacturing ceiling 2.00: 2,000,000 / 1,000,000 = 2.0000.
+    at = _boundary_outcome(
+        "max_leverage_by_segment", ebit="125000", liab="2000000"
+    )
+    assert at.outcome == "pass" and at.threshold == D("2.00")
+    over = _boundary_outcome(
+        "max_leverage_by_segment", ebit="125000", liab="2000100"
+    )
+    assert over.outcome == "fail"  # 2.0001
+    under = _boundary_outcome(
+        "max_leverage_by_segment", ebit="125000", liab="1999900"
+    )
+    assert under.outcome == "pass"  # 1.9999
+
+
+def test_leverage_segment_ceiling_is_the_segment_own_number():
+    # Professional services carries a 3.00 ceiling: exactly 3.0000
+    # passes for that segment and 3.0001 fails.
+    pack = _boundary_pack(ebit="125000", liab="3000000")
+    report = evaluate_policy(
+        make_file(segment=BorrowerSegment.PROFESSIONAL_SERVICES),
+        pack, policy_version="v1", as_of=AS_OF,
+    )
+    assert report.outcome("max_leverage_by_segment").outcome == "pass"
+    pack = _boundary_pack(ebit="125000", liab="3000100")
+    report = evaluate_policy(
+        make_file(segment=BorrowerSegment.PROFESSIONAL_SERVICES),
+        pack, policy_version="v1", as_of=AS_OF,
+    )
+    assert report.outcome("max_leverage_by_segment").outcome == "fail"
+
+
+def test_fccr_exactly_at_the_floor_passes_and_one_quantum_below_fails():
+    # (160,000 EBITDA − 50,000 capex) / 100,000 = 1.1000, the floor.
+    at = _boundary_outcome(
+        "min_fixed_charge_coverage", ebit="160000", capex="50000"
+    )
+    assert at.outcome == "pass" and at.threshold == D("1.10")
+    below = _boundary_outcome(
+        "min_fixed_charge_coverage", ebit="159990", capex="50000"
+    )
+    assert below.outcome == "fail" and below.severity == "warning"
+
+
+def test_global_dscr_exactly_at_the_floor_passes():
+    # Borrower EBITDA 70,000 over debt service 50,000; guarantor
+    # 50,000 over 50,000: combined 120,000 / 100,000 = 1.2000.
+    def _global(guarantor_ebit):
+        borrower = _boundary_pack(
+            ebit="70000", interest="20000", prior_cpltd="30000",
+            credit_file_id="cf-boundary-g",
+        )
+        g_spread, g_extractions = build_fixture_spread(
+            "cf-boundary-g", "gbnd",
+            {
+                2023: {"current_portion_ltd": "30000"},
+                2024: {
+                    "ebit": guarantor_ebit,
+                    "depreciation_and_amortization": "0",
+                    "interest_expense": "20000",
+                },
+            },
+        )
+        g_pack = compute_entity_pack(
+            credit_file_id="cf-boundary-g", entity="Eval Guarantor",
+            spread=g_spread, extractions=g_extractions,
+        )
+        global_pack = compute_global_pack(
+            credit_file_id="cf-boundary-g", borrower_pack=borrower,
+            entity_packs={"Eval Guarantor": g_pack},
+            expected_guarantors=["Eval Guarantor"],
+        )
+        report = evaluate_policy(
+            make_file(guarantors=("Eval Guarantor",),
+                      credit_file_id="cf-boundary-g"),
+            borrower, policy_version="v1", global_pack=global_pack,
+            as_of=AS_OF,
+        )
+        return report.outcome("min_global_dscr")
+
+    assert _global("50000").outcome == "pass"   # 1.2000
+    assert _global("49990").outcome == "fail"   # 1.1999
+    assert _global("50010").outcome == "pass"   # 1.2001
+
+
+def test_concentration_exactly_at_the_limit_passes_and_a_dollar_over_fails():
+    # The capital base is 250,000,000 and the limit 10%: exactly
+    # 25,000,000 is 0.1000 and passes; one dollar more is over.
+    report = evaluate_policy(
+        make_file(amount="25000000"), coverage_pack(),
+        policy_version="v1", as_of=AS_OF,
+    )
+    outcome = report.outcome("max_single_borrower_concentration")
+    assert outcome.outcome == "pass"
+    share = next(
+        v for v in outcome.values_read
+        if v.input == "fact:concentration_share"
+    )
+    assert share.value == "0.1000"
+    report = evaluate_policy(
+        make_file(amount="25000001"), coverage_pack(),
+        policy_version="v1", as_of=AS_OF,
+    )
+    assert report.outcome(
+        "max_single_borrower_concentration"
+    ).outcome == "fail"
+
+
+def test_concentration_is_judged_on_the_unrounded_share():
+    # Regression (round 18): the test once compared the 4dp
+    # display figure, so every amount whose true share exceeded
+    # 10% by less than half a display quantum passed — up to
+    # $25,012,499. The display still reads 0.1000; the verdict
+    # must be fail, and the detail must say why.
+    for amount in ("25001000", "25010000", "25012499"):
+        report = evaluate_policy(
+            make_file(amount=amount), coverage_pack(),
+            policy_version="v1", as_of=AS_OF,
+        )
+        outcome = report.outcome("max_single_borrower_concentration")
+        assert outcome.outcome == "fail", amount
+        share = next(
+            v for v in outcome.values_read
+            if v.input == "fact:concentration_share"
+        )
+        assert share.value == "0.1000", amount
+        assert "unrounded share" in outcome.detail, amount
+    # Just under the limit the unrounded share is 0.099996: pass.
+    report = evaluate_policy(
+        make_file(amount="24999000"), coverage_pack(),
+        policy_version="v1", as_of=AS_OF,
+    )
+    assert report.outcome(
+        "max_single_borrower_concentration"
+    ).outcome == "pass"
+
+
+def test_statement_age_exactly_at_the_limit_passes():
+    # FY2024 year-end (2024-12-31) to 2026-07-01 is exactly 18
+    # complete months — the v1 limit. One month on it is 19.
+    report = evaluate_policy(
+        make_file(), coverage_pack(), policy_version="v1",
+        as_of=date(2026, 7, 1),
+    )
+    outcome = report.outcome("financial_statement_age")
+    assert outcome.outcome == "pass"
+    age = next(
+        v for v in outcome.values_read if v.input == "fact:age_months"
+    )
+    assert age.value == "18"
+    report = evaluate_policy(
+        make_file(), coverage_pack(), policy_version="v1",
+        as_of=date(2026, 7, 31),
+    )
+    assert report.outcome("financial_statement_age").outcome == "fail"
+    # Under v2 the limit is 15: 2026-04-01 is exactly 15, pass;
+    # 2026-05-01 is 16, fail.
+    report = evaluate_policy(
+        make_file(), coverage_pack(), policy_version="v2",
+        as_of=date(2026, 4, 1),
+    )
+    assert report.outcome("financial_statement_age").outcome == "pass"
+    report = evaluate_policy(
+        make_file(), coverage_pack(), policy_version="v2",
+        as_of=date(2026, 5, 1),
+    )
+    assert report.outcome("financial_statement_age").outcome == "fail"
+
+
+def test_appraisal_age_exactly_at_the_limit_passes():
+    # Received 2025-06-15; the limit is 12 complete months:
+    # 2026-06-15 is exactly 12 (pass), 2026-07-15 is 13 (fail).
+    doc = _appraisal_doc(datetime(2025, 6, 15, tzinfo=timezone.utc))
+    report = evaluate_policy(
+        make_file(facility_type=FacilityType.CRE_LOAN, documents=[doc]),
+        coverage_pack(), policy_version="v1", as_of=date(2026, 6, 15),
+    )
+    assert report.outcome("appraisal_age").outcome == "pass"
+    report = evaluate_policy(
+        make_file(facility_type=FacilityType.CRE_LOAN, documents=[doc]),
+        coverage_pack(), policy_version="v1", as_of=date(2026, 7, 15),
+    )
+    assert report.outcome("appraisal_age").outcome == "fail"

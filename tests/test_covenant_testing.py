@@ -766,3 +766,58 @@ def test_api_test_and_breach_surfaces(tmp_path, monkeypatch):
         "/applications/cf-nope/covenant-test-results"
     )
     assert missing.status_code == 404
+
+
+# ---------------------------------------------------------------------
+# Round 18: the cure clock's edge — a breach is overdue only
+# strictly AFTER its cure deadline; the deadline day itself is
+# the last day of the cure period.
+# ---------------------------------------------------------------------
+
+
+def test_cure_clock_overdue_only_strictly_after_the_deadline():
+    pipeline, cf = approved_with_fy2026()
+    pipeline.run_due_covenant_tests(cf, as_of=date(2027, 8, 1))
+    breach = dscr_breach(pipeline, cf)
+    bid = breach["breach_id"]
+    deadline = date.fromisoformat(breach["cure_deadline"])
+    test_date = date.fromisoformat(breach["test_date"])
+    assert deadline == test_date + timedelta(days=30)
+
+    day_before = pipeline.get_breach_case(
+        cf, bid, as_of=deadline - timedelta(days=1)
+    )
+    assert day_before["days_to_cure_deadline"] == 1
+    assert day_before["cure_overdue"] is False
+
+    on_the_day = pipeline.get_breach_case(cf, bid, as_of=deadline)
+    assert on_the_day["days_to_cure_deadline"] == 0
+    assert on_the_day["cure_overdue"] is False
+    assert on_the_day["days_in_breach"] == 30
+
+    day_after = pipeline.get_breach_case(
+        cf, bid, as_of=deadline + timedelta(days=1)
+    )
+    assert day_after["days_to_cure_deadline"] == -1
+    assert day_after["cure_overdue"] is True
+
+    # A terminal breach never reads overdue, however late it is
+    # viewed: the exemption is the state, not the date.
+    cured_pipeline, cf2 = approved_with_fy2026()
+    cured_pipeline.run_due_covenant_tests(cf2, as_of=date(2027, 8, 1))
+    breach2 = dscr_breach(cured_pipeline, cf2)
+    deliver_statements(cured_pipeline, cf2, 2027, FY2027_FIGURES)
+    cured_pipeline.run_due_covenant_tests(cf2, as_of=date(2028, 8, 1))
+    cure = next(
+        v for v in results_for(cured_pipeline, cf2, metric_key="dscr")
+        if v["fiscal_year"] == 2027 and v["outcome"] == "pass"
+    )
+    cured_pipeline.cure_breach(
+        cf2, breach2["breach_id"], actor_id=OFFICER,
+        actor_role=OFFICER_ROLE, cure_result_id=cure["result_id"],
+    )
+    late_view = cured_pipeline.get_breach_case(
+        cf2, breach2["breach_id"], as_of=date(2029, 1, 1)
+    )
+    assert late_view["state"] == "cured"
+    assert late_view["cure_overdue"] is False
