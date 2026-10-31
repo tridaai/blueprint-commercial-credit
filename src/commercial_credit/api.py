@@ -108,6 +108,7 @@ from .models import (
 )
 from .memo import render_memo
 from .pipeline import CreditPipeline
+from .portfolio import portfolio_view, withheld_sections
 from .policy import get_policy_pack, list_policy_packs
 from .seed import ReferenceLosFeed
 from .wiring import build_pipeline
@@ -1950,3 +1951,31 @@ def assign_file(credit_file_id: str, body: AssignFileRequest) -> dict:
 def list_access_denials(request: Request) -> list[dict]:
     _guard_global(request, FAMILY_AUDIT)
     return [d.model_dump(mode="json") for d in store.list_denials()]
+
+
+# ---------------------------------------------------------------------
+# Round 19: the portfolio view. One aggregate read over the
+# caller's visible book — the builder receives only the files
+# the scope filter passes, so a file the caller may not see
+# contributes nothing, not even to a count. Sections whose
+# artefact family the caller's role does not hold are withheld
+# in place under the policy's coded reason, and each withheld
+# section is recorded as a denial, like every refusal since
+# round 17.
+# ---------------------------------------------------------------------
+
+
+@app.get("/portfolio")
+def get_portfolio(request: Request, as_of: date) -> dict:
+    caller = _guard_list(request, FAMILY_FILES)
+    files = visible_files(caller, store.list_credit_files())
+    for withheld in withheld_sections(caller):
+        _record_denial(
+            credit_file_id=None,
+            caller=caller.caller_id,
+            role=caller.role,
+            family=withheld["family"],
+            reason_code=withheld["reason_code"],
+            surface=request.url.path,
+        )
+    return portfolio_view(pipeline, files, caller=caller, as_of=as_of)
