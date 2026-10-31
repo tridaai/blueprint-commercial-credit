@@ -986,6 +986,69 @@ disciplines, both enforced in code and graded end to end.
   one. Pattern packs are data: widening the vocabulary is a
   version bump, reviewed like a policy change.
 
+## What round 18 adds
+
+**Eval depth**: the gate stops grading only fixtures decided
+well inside the lines and walks the lines themselves. No new
+machinery — the round deepens what the eval suite proves, and
+fixes the one real defect the deeper grading exposed.
+
+- **Threshold boundaries, exactly on the line** — every figure
+  threshold in the policy pack is graded at exactly its value
+  and one figure quantum (0.0001) either side: the DSCR floor,
+  the leverage ceilings (including one segment's own ceiling),
+  fixed-charge coverage, and the global DSCR floor, with each
+  fixture's computed figure checked against the hand value
+  before its outcome is judged. The age limits are graded the
+  same way in their own unit: statements and appraisals at
+  exactly their month limit (pass) and one month past (fail),
+  under both pack versions where the limits differ.
+- **A defect found and fixed: the concentration limit was
+  judged on the rounded share.** The test quantized the
+  facility's share of the capital base to four places before
+  comparing it to the 10% limit, so any amount whose true
+  share exceeded the limit by less than half a display quantum
+  passed — at the stated capital base, up to $25,012,499. The
+  comparison now reads the unrounded share; the recorded
+  figure still displays at four places, and when rounding
+  would have hidden a difference the outcome's detail names
+  the unrounded share. Graded at $24,999,000 / $25,000,000 /
+  $25,000,001 / $25,010,000 / $25,012,499 / $25,012,500, and
+  pinned in the test suite.
+- **Staleness edges and the mixed file** — the insurance
+  certificate's receipt window and the statements' fiscal
+  window are graded at exactly their limits and one month
+  past. A file with exactly one stale input among fresh ones
+  is graded end to end: that input is the readiness report's
+  only blocker, the convene refusal names it, and refreshing
+  that input alone clears the convene.
+- **The cure clock at its deadline** — a breach reads overdue
+  only strictly after its cure deadline: the day before and
+  the deadline day itself are inside the cure period, the day
+  after is overdue, and the derived day counts are exact.
+- **Adverse-action depth and census** — decline probes tied
+  to a policy test the pinned report does not contain, to a
+  traced figure misstated by one cent, and to a reason code
+  paired with the wrong test are refused, as are deferrals
+  with no codes, codes without re-presentment requirements,
+  and an unknown code. A census then re-reads every committee
+  decision the eval run stored: each decline carries coded
+  reasons from the vocabulary and renders its adverse-action
+  notice; each deferral carries its codes and requirements.
+- **Disagreement provenance, re-performed** — every source of
+  every disagreement record on the round 8 fixture is checked
+  source by source: complete provenance (document, page,
+  line), the document present on the file by id *and* hash,
+  and both deltas recomputed from the record's own figures.
+  Completeness is 100% or the gate fails.
+- **Injection × disagreement, combined** — the round 17
+  planted instruction is placed inside the FY2024 audited
+  statement, itself a witness on the contested lines. The
+  note is recorded whole, the seven disagreements detect
+  exactly as on the clean run, the computation flags and the
+  memo's disagreement record are unchanged, and the dictated
+  figure grounds nothing.
+
 ## The laws (enforced in code, never in prompts)
 
 1. **No model-computed numbers.** Extraction returns values +
@@ -1062,6 +1125,11 @@ disciplines, both enforced in code and graded end to end.
   deployment still puts its own authentication in front of the
   service, and the caller headers the policy judges are the
   deployment's to assert.
+- Round 18's boundary grading covers the shipped policy
+  packs' thresholds and the shipped readiness windows at
+  their exact limits; a deployment that retunes a pack's
+  numbers inherits the boundary method, not the boundary
+  fixtures — the graded values are the shipped packs' own.
 - The sample borrower book is generated for this blueprint, with
   figures known by construction so extraction can be graded against
   ground truth; that is the repo's one data note.
